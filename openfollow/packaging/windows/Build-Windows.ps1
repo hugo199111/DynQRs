@@ -44,7 +44,15 @@ try {
         if (-not (Test-Path (Join-Path $MsysRoot "usr\bin\patch.exe"))) {
             throw "Install MSYS2 and its patch package, or provide -NativePrefix. See packaging/windows/README.md."
         }
+        $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+        if (-not (Test-Path $VsWhere)) { throw "Visual Studio Build Tools and MSBuild are required." }
+        $Msbuild = @(& $VsWhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe') | Select-Object -First 1
+        if (-not $Msbuild) { throw "MSBuild was not found in the Visual Studio installation." }
+        $env:OPENFOLLOW_MSBUILD = $Msbuild
+        $env:PATH = (Split-Path $Msbuild) + ";" + $env:PATH
+        Invoke-Checked $Msbuild @("-version")
         $NativeRoot = Join-Path $BuildRoot "native-build"
+        Write-Host "::notice title=OpenFollow build progress::Compiling native GTK and GStreamer libraries"
         Invoke-Checked $Python @(
             "$PSScriptRoot\build_native.py", "build", "--platform", "x64", "--configuration", "release",
             "--build-dir", $NativeRoot, "--msys-dir", $MsysRoot, "--enable-gi", "--py-wheel",
@@ -56,6 +64,7 @@ try {
         $NativePrefix = Join-Path $NativeRoot "gtk\x64\release"
     }
     $NativePrefix = (Resolve-Path $NativePrefix).Path
+    Write-Host "::notice title=OpenFollow build progress::Native libraries compiled; installing Python dependencies"
     $env:OPENFOLLOW_NATIVE_PREFIX = $NativePrefix
     $env:PATH = "$NativePrefix\bin;" + $env:PATH
     $env:GI_TYPELIB_PATH = "$NativePrefix\lib\girepository-1.0"
@@ -81,13 +90,22 @@ try {
     Invoke-Checked $Python @("-m", "pip", "install", "--no-deps", $Repo)
     Invoke-Checked $Python @("-m", "pip", "check")
     $Output = Join-Path $BuildRoot "dist"
+    Write-Host "::notice title=OpenFollow build progress::Creating the Windows executable"
     Invoke-Checked $Python @("-m", "PyInstaller", "--noconfirm", "--distpath", $Output,
         "--workpath", (Join-Path $BuildRoot "freeze"), "$PSScriptRoot\openfollow.spec")
     $Executable = Join-Path $Output "OpenFollow\OpenFollow.exe"
     $Report = Join-Path $BuildRoot "self-check.json"
-    $Process = Start-Process -FilePath $Executable -ArgumentList @("--self-check", ('"' + $Report + '"')) -Wait -PassThru
-    if ($Process.ExitCode -ne 0) { throw "The bundled self-check failed. Read $Report." }
-    if (-not (Get-Content -Raw $Report | ConvertFrom-Json).ok) { throw "Invalid self-check report." }
+    if (Test-Path $Report) { Remove-Item $Report }
+    Write-Host "::notice title=OpenFollow build progress::Checking the bundled executable"
+    $Process = Start-Process -FilePath $Executable -ArgumentList @("--self-check", ('"' + $Report + '"')) -PassThru
+    if (-not $Process.WaitForExit(90000)) {
+        $Process.Kill()
+        throw "The bundled self-check did not finish within 90 seconds."
+    }
+    if (-not (Test-Path $Report)) { throw "The executable did not produce a self-check report (exit $($Process.ExitCode))." }
+    $ReportText = Get-Content -Raw $Report
+    if ($Process.ExitCode -ne 0 -or -not ($ReportText | ConvertFrom-Json).ok) { throw "Bundled self-check failed: $ReportText" }
+    Write-Host "::notice title=OpenFollow build progress::Opening the application and capturing its window"
     Invoke-Checked $Python @("$PSScriptRoot\smoke_gui.py", $Executable, (Join-Path $Output "OpenFollow-running.png"))
     foreach ($Notice in @("LICENSE", "THIRD_PARTY_NOTICES.md", "WRITTEN_OFFER.md")) {
         Copy-Item (Join-Path $Repo $Notice) (Join-Path $Output "OpenFollow\$Notice")

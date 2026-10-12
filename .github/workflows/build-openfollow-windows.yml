@@ -24,11 +24,14 @@ jobs:
           python-version: '3.13'
           architecture: x64
       - name: Cache verified native dependency build
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: C:\of-build\native-build
-          key: windows-2022-py313-gvs2026.8-${{ hashFiles('openfollow/packaging/windows/build_native.py') }}
+          key: windows-2022-py313-gvs2026.8-${{ hashFiles('openfollow/packaging/windows/build_native.py', 'openfollow/packaging/windows/Build-Windows.ps1') }}-${{ github.run_id }}
+          restore-keys: |
+            windows-2022-py313-gvs2026.8-${{ hashFiles('openfollow/packaging/windows/build_native.py', 'openfollow/packaging/windows/Build-Windows.ps1') }}-
       - name: Build native Windows package
+        id: native_build
         shell: pwsh
         run: |
           try {
@@ -44,6 +47,12 @@ jobs:
             Write-Host "::error title=Windows compilation error::$Annotation"
             throw
           }
+      - name: Retain native dependencies after build attempts
+        if: ${{ always() && (steps.native_build.outcome == 'success' || steps.native_build.outcome == 'failure') }}
+        uses: actions/cache/save@v6
+        with:
+          path: C:\of-build\native-build
+          key: windows-2022-py313-gvs2026.8-${{ hashFiles('openfollow/packaging/windows/build_native.py', 'openfollow/packaging/windows/Build-Windows.ps1') }}-${{ github.run_id }}
       - name: Upload build and verification results
         uses: actions/upload-artifact@v7
         with:

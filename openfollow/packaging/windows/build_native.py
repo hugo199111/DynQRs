@@ -4,18 +4,40 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import ssl
 import sys
+from pathlib import Path
 
 
 def main() -> None:
     if sys.platform != "win32":
         raise SystemExit("This native build requires Windows.")
     from gvsbuild.main import run
+    from gvsbuild.projects.libvpx import Libvpx
     from gvsbuild.utils.base_builders import CmakeProject
     from gvsbuild.utils.base_expanders import Tarball
     from gvsbuild.utils.base_project import Project, project_add
     from gvsbuild.utils.builder import Builder
+
+    def install_vpx(self):
+        # libvpx's generated Makefile silently skips MSBuild when `which`
+        # cannot find it. Compile the generated project explicitly instead
+        # of accepting configure/make success as a compiled library.
+        architecture = "Win32" if self.builder.x86 else "x64"
+        debug = self.builder.opts.configuration == "debug"
+        configuration = "Debug" if debug else "Release"
+        filename = "vpxmdd.lib" if debug else "vpxmd.lib"
+        library = Path(self.build_dir) / architecture / configuration / filename
+        if not library.is_file():
+            msbuild_dir = Path(os.environ["OPENFOLLOW_MSBUILD"]).parent
+            self.exec_msbuild(["vpx.vcxproj", "/m"], configuration=configuration, add_path=str(msbuild_dir))
+        if not library.is_file():
+            raise RuntimeError(f"MSBuild did not produce the required libvpx library: {library}")
+        shutil.copy2(library, Path(self.builder.gtk_dir) / "lib" / "vpx.lib")
+
+    Libvpx.post_install = install_vpx
 
     @project_add
     class Srt(Tarball, CmakeProject):
