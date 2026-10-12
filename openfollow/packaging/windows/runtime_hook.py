@@ -15,7 +15,9 @@ _DLL_HANDLES = []
 def configure(root: Path, cache: Path) -> None:
     native = root / "native"
     binary_dir = native / "bin"
-    os.environ["PATH"] = str(binary_dir) + os.pathsep + os.environ.get("PATH", "")
+    # Native helper executables also need PyInstaller's collected runtime
+    # DLLs at the bundle root, especially on a machine without VC++ tools.
+    os.environ["PATH"] = os.pathsep.join((str(binary_dir), str(root), os.environ.get("PATH", "")))
     if hasattr(os, "add_dll_directory"):
         _DLL_HANDLES.append(os.add_dll_directory(str(binary_dir)))
     os.environ["GI_TYPELIB_PATH"] = str(native / "lib" / "girepository-1.0")

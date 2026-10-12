@@ -54,7 +54,7 @@ try {
         $NativeRoot = Join-Path $BuildRoot "native-build"
         Write-Host "::notice title=OpenFollow build progress::Compiling native GTK and GStreamer libraries"
         Invoke-Checked $Python @(
-            "$PSScriptRoot\build_native.py", "build", "--platform", "x64", "--configuration", "release",
+            "$PSScriptRoot\build_native.py", "build", "--capture-out", "--platform", "x64", "--configuration", "release",
             "--build-dir", $NativeRoot, "--msys-dir", $MsysRoot, "--enable-gi", "--py-wheel",
             "--extra-opts", "gst-plugins-good:-Dgtk3=enabled;-Djpeg=enabled;-Dpng=enabled",
             "--extra-opts", "gst-plugins-bad:-Dsrt=enabled",

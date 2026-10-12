@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import shutil
 import ssl
+import subprocess
 import sys
 from pathlib import Path
 
@@ -32,7 +33,15 @@ def main() -> None:
         library = Path(self.build_dir) / architecture / configuration / filename
         if not library.is_file():
             msbuild_dir = Path(os.environ["OPENFOLLOW_MSBUILD"]).parent
-            self.exec_msbuild(["vpx.vcxproj", "/m"], configuration=configuration, add_path=str(msbuild_dir))
+            try:
+                self.exec_msbuild(["vpx.vcxproj", "/m"], configuration=configuration, add_path=str(msbuild_dir))
+            except subprocess.CalledProcessError as exc:
+                output = exc.stdout or "MSBuild failed without captured output."
+                errors = [line for line in output.splitlines() if "error" in line.lower()]
+                detail = "\n".join(errors[-12:] or output.splitlines()[-20:])
+                annotation = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                print(f"::error title=libvpx compiler error::{annotation}", flush=True)
+                raise RuntimeError(f"libvpx compiler failed:\n{detail}") from None
         if not library.is_file():
             raise RuntimeError(f"MSBuild did not produce the required libvpx library: {library}")
         shutil.copy2(library, Path(self.builder.gtk_dir) / "lib" / "vpx.lib")
