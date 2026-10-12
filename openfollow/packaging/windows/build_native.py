@@ -42,7 +42,19 @@ def main() -> None:
 
     @msys_tools_first
     def build_vpx(self):
-        original_vpx_build(self)
+        # make's generated solution builds Debug before Release. NASM's
+        # CodeView debug assembly crashes in that unrelated configuration.
+        # Generate/install headers here; post_install builds only the actual
+        # requested configuration with MSBuild (Release for this package).
+        previous = self.builder.vs_env.get("NO_LAUNCH_DEVENV")
+        self.builder.vs_env["NO_LAUNCH_DEVENV"] = "1"
+        try:
+            original_vpx_build(self)
+        finally:
+            if previous is None:
+                self.builder.vs_env.pop("NO_LAUNCH_DEVENV", None)
+            else:
+                self.builder.vs_env["NO_LAUNCH_DEVENV"] = previous
 
     @msys_tools_first
     def install_vpx(self):
