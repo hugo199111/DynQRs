@@ -26,9 +26,19 @@ jobs:
       - name: Build native Windows package
         shell: pwsh
         run: |
-          C:\msys64\usr\bin\bash.exe -lc 'pacman -S --needed --noconfirm patch'
-          if ($LASTEXITCODE -ne 0) { throw 'MSYS2 dependency installation failed' }
-          & .\openfollow\packaging\windows\Build-Windows.ps1 -BuildRoot C:\of-build -PythonExecutable (Get-Command python).Source
+          try {
+            $MsysOutput = & C:\msys64\usr\bin\bash.exe -lc 'pacman -S --needed --noconfirm patch' 2>&1
+            $MsysStatus = $LASTEXITCODE
+            $MsysOutput | Write-Output
+            if ($MsysStatus -ne 0) { throw "MSYS2 dependency installation failed: $($MsysOutput | Out-String)" }
+            & .\openfollow\packaging\windows\Build-Windows.ps1 -BuildRoot C:\of-build -PythonExecutable (Get-Command python).Source
+          } catch {
+            $Summary = ($_ | Out-String).Trim()
+            if ($Summary.Length -gt 10000) { $Summary = $Summary.Substring($Summary.Length - 10000) }
+            $Annotation = $Summary.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows compilation error::$Annotation"
+            throw
+          }
       - name: Upload build and verification results
         uses: actions/upload-artifact@v7
         with:

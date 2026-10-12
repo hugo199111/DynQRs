@@ -19,8 +19,12 @@ $BuildRoot = (Resolve-Path $BuildRoot).Path
 
 function Invoke-Checked {
     param([string]$Program, [string[]]$Arguments)
-    & $Program @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
+    & $Program @Arguments 2>&1 | Tee-Object -Variable CommandOutput
+    $ExitStatus = $LASTEXITCODE
+    if ($ExitStatus -ne 0) {
+        $Details = ($CommandOutput | Select-Object -Last 35 | Out-String)
+        throw "$Program failed with exit code $ExitStatus`n$Details"
+    }
 }
 
 Push-Location $Repo
@@ -35,7 +39,7 @@ try {
     }
     $Python = Join-Path $Venv "Scripts\python.exe"
     Invoke-Checked $Python @("-c", "import sys,struct; assert sys.version_info[:2] == (3,13); assert struct.calcsize('P') == 8")
-    Invoke-Checked $Python @("-m", "pip", "install", "poetry==2.4.1", "poetry-plugin-export==1.9.0", "gvsbuild==2026.9.0", "pyinstaller==6.22.3", "pyinstaller-hooks-contrib==2026.8", "pillow==11.3.0")
+    Invoke-Checked $Python @("-m", "pip", "install", "poetry==2.4.1", "poetry-plugin-export==1.9.0", "gvsbuild==2026.8.0", "pyinstaller==6.22.3", "pyinstaller-hooks-contrib==2026.8", "pillow==11.3.0")
     if (-not $NativePrefix) {
         if (-not (Test-Path (Join-Path $MsysRoot "usr\bin\patch.exe"))) {
             throw "Install MSYS2 and its patch package, or provide -NativePrefix. See packaging/windows/README.md."
