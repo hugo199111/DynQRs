@@ -1,0 +1,3 @@
+# First-run defaults. Existing user configuration is never overwritten.
+web_port = 8080
+video_source_type = "testpattern"

@@ -1,0 +1,347 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+# CI pipeline: lint, bandit, unit/integration/smoke tests + coverage, build, weekly audit.
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  # ``audit-export`` is PR-skipped, so an edit to it lands on ``main`` untested.
+  # This makes a manual run of the branch possible beforehand.
+  workflow_dispatch:
+  schedule:
+    # Weekly supply-chain audit (Mondays 06:00 UTC) – drives the `audit` job so
+    # a newly-disclosed CVE is surfaced even when no code has changed.
+    - cron: "0 6 * * 1"
+
+# Cancel in-progress run when a newer commit is pushed to same ref.
+# Latest commit is the only one that matters; superseded runs just burn runner
+# minutes. ``main`` pushes are serialized per ref. The event name is part of the
+# key because a ``schedule`` run and a ``main`` push both resolve ``github.ref``
+# to ``refs/heads/main`` – without it, any Monday-morning merge cancels the
+# week's supply-chain audit and leaves no CVE report at all.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Weekly `schedule` trigger only drives the `audit` job below;
+    # full gate has no reason to re-run on a timer (runs on every main push
+    # and PR). Skip on schedule runs.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+
+    # Run hypothesis under derandomized ``ci`` profile (tests/conftest.py)
+    # so property-test inputs are identical every run – no flaky failures.
+    env:
+      HYPOTHESIS_PROFILE: ci
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install system dependencies
+        # ``libasound2-dev`` (ALSA development headers) is required by
+        # ``python-rtmidi``'s wheel build for Linux – only sdist ships
+        # for the runner's CPython/glibc combo, and meson build
+        # aborts with "Dependency 'alsa' not found" without headers.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-gi \
+            python3-gi-cairo \
+            gir1.2-gstreamer-1.0 \
+            gir1.2-gst-plugins-base-1.0 \
+            gir1.2-gtk-3.0 \
+            gir1.2-rsvg-2.0 \
+            libgirepository-2.0-dev \
+            libcairo2-dev \
+            libgstreamer1.0-0 \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            libasound2-dev
+
+      # Pinned to the version stamped in ``poetry.lock``'s header. Unpinned,
+      # ``snok/install-poetry@v1`` installs whatever resolves as latest at run
+      # time, and the audit job's ``poetry sync`` does not exist before 2.0 – a
+      # drift off that line breaks one job, on ``main``, where the PR that
+      # caused it ran no audit at all. Bump with the lock.
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: "2.4.1"
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+
+      # Cache in-project `.venv` keyed on lockfile so heavy detection extras
+      # (onnxruntime + opencv) aren't re-downloaded every run. Key changes only
+      # when `poetry.lock` does; Python-minor guards against env mismatches.
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v6
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py3.13-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            venv-${{ runner.os }}-py3.13-
+
+      - name: Install dependencies
+        # ``-E detection`` pulls in onnxruntime + opencv-python so the
+        # detection-backend code paths exercise on Linux CI the same way
+        # they do on macOS dev boxes (closes a ~0.6 pp Linux/macOS
+        # coverage gap on the optional-import branches).
+        # ``mido`` + ``python-rtmidi`` are base deps now, so a plain install
+        # builds them; the ``libasound2-dev`` step above provides the ALSA
+        # headers ``python-rtmidi`` needs to build its wheel on CI's Python
+        # 3.13 (which has no prebuilt rtmidi wheel).
+        run: poetry install --no-interaction -E detection
+
+      # Lint: `make lint` runs `ruff check` + `ruff format --check`.
+      # Single source of truth in `[tool.ruff]` block of pyproject.toml.
+      - name: Lint (ruff)
+        run: make lint
+
+      # Static security scan: bandit over openfollow package.
+      # Offline + deterministic, gates every PR.
+      # Supply-chain audit (pip-audit) is decoupled into the `audit` job
+      # below so a new CVE can't block unrelated PRs.
+      - name: Static security scan (bandit)
+        run: make security
+
+      - name: Run unit tests
+        run: make test-unit
+
+      - name: Run integration and smoke tests with combined coverage gate
+        run: make test-integration
+
+      - name: Export coverage XML
+        run: poetry run coverage xml -o coverage.xml
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
+
+      - name: Build package
+        run: poetry build --no-interaction
+
+      # End-to-end smoke test: real GStreamer pipeline + PSN→OTP/RTTrPM.
+      # Opt-in, kept out of coverage gate. Main pushes only (post-merge signal).
+      # GStreamer already installed above.
+      - name: E2E smoke test
+        if: github.event_name == 'push'
+        run: make test-smoke-e2e
+
+  # Whether a PR edits what the audit job runs: this workflow or the Makefile's
+  # ``audit`` target. The merge commit's first parent is the base branch head,
+  # so a two-commit fetch is enough to diff exactly the PR's changes.
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      audit: ${{ steps.diff.outputs.audit }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Detect audit-relevant edits
+        id: diff
+        run: |
+          changed="$(git diff --name-only HEAD^1 HEAD)"
+          if grep -qxE '\.github/workflows/ci\.yml|Makefile' <<< "$changed"; then
+            echo "audit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "audit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Supply-chain audit (pip-audit), decoupled from per-PR gate.
+  # Queries live PyPI advisory DB; newly-disclosed CVE must not block PRs.
+  # Runs on weekly schedule + main pushes. On a PR only when ``changes`` finds
+  # an edit to it, so the edit self-tests; there a broken install or audit run
+  # fails the job, the CVE verdict is advisory. Dependabot handles version bumps.
+  audit:
+    needs: changes
+    # ``!cancelled()`` because ``changes`` is skipped outside PRs, which would
+    # otherwise skip this job too.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.audit == 'true') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # PyGObject (a runtime dep) builds against these at install time.
+      # ``libasound2-dev`` (ALSA headers) is needed because ``python-rtmidi``
+      # is a base dep now and has no prebuilt wheel for CI's Python 3.13, so a
+      # plain ``poetry install`` builds it from sdist here too – without the
+      # headers the meson build aborts with "Dependency 'alsa' not found"
+      # (matches the ``test`` job's step).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-gi \
+            python3-gi-cairo \
+            gir1.2-gstreamer-1.0 \
+            gir1.2-gst-plugins-base-1.0 \
+            gir1.2-gtk-3.0 \
+            gir1.2-rsvg-2.0 \
+            libgirepository-2.0-dev \
+            libcairo2-dev \
+            libgstreamer1.0-0 \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            libasound2-dev
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: "2.4.1"
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+
+      # Own key prefix. Both jobs cache ``.venv``, and on a ``poetry.lock``
+      # change both miss and both save concurrently – with one shared key
+      # whichever post-step wins the race decides what the other job starts
+      # from, and ``test`` installs with ``poetry install``, which computes no
+      # uninstalls and would carry the surplus forward on every later run.
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v6
+        with:
+          path: .venv
+          key: venv-audit-${{ runner.os }}-py3.13-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            venv-audit-${{ runner.os }}-py3.13-
+
+      # ``-E detection`` so onnxruntime + opencv are in the audited closure;
+      # ``mido`` + ``python-rtmidi`` come in as base deps. ``sync`` (not
+      # ``install``) so a fuzzy restore-key hit can only ever shrink back to the
+      # lock's closure. The ``dev`` group is deliberately inside that closure:
+      # ruff, pytest and bandit run inside this pipeline, so a CVE there is in
+      # scope for the gate in a way one in the export toolchain is not.
+      - name: Install dependencies
+        run: poetry sync --no-interaction -E detection
+
+      # pip is installed inside the venv being audited, so a vulnerable pip
+      # fails this job even when every project dependency is clean. Keep it
+      # current rather than ignoring the advisory - PIP_AUDIT_IGNORE is for
+      # findings with no fix available yet, and this one has one.
+      - name: Upgrade pip in the audited venv
+        run: poetry run python -m pip install --upgrade pip
+
+      # On a PR only a completed audit that found vulnerabilities is let through.
+      # pip-audit exits 1 for findings and for its own errors alike, and make
+      # turns both into 2, so its summary line is what tells them apart.
+      - name: pip-audit (supply-chain)
+        run: |
+          set +e
+          report="$(make audit 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$report"
+          if [ "$status" -ne 0 ] && [ "$GITHUB_EVENT_NAME" = pull_request ] \
+              && grep -qE '^Found [0-9]+ known vulnerabilit' <<< "$report"; then
+            echo "::warning::pip-audit reported vulnerabilities (advisory on pull requests)"
+            exit 0
+          fi
+          exit "$status"
+
+  # The export toolchain (ultralytics + torch) is workstation-only: the .deb
+  # build refuses to bundle it and no show device ever loads it, so a CVE there
+  # must not block a release. It must not be invisible either – an extra outside
+  # the audited closure drifts silently, with both pip-audit and Dependabot
+  # reporting nothing. Hence its own job with its own throwaway venv: ~6 GB of
+  # torch + CUDA wheels must never reach the `.venv` cache the gating jobs
+  # restore from, and caching it here would put a ~3 GB entry in a 10 GB
+  # per-repository budget and evict every other job's venv by LRU.
+  audit-export:
+    if: github.event_name != 'pull_request'
+    # Report-only down to the install: a PyPI hiccup, a hash mismatch or a full
+    # disk while unpacking the CUDA wheels must not make the supply-chain audit
+    # read red for a reason that is not a CVE.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-gi \
+            python3-gi-cairo \
+            gir1.2-gstreamer-1.0 \
+            gir1.2-gst-plugins-base-1.0 \
+            gir1.2-gtk-3.0 \
+            gir1.2-rsvg-2.0 \
+            libgirepository-2.0-dev \
+            libcairo2-dev \
+            libgstreamer1.0-0 \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            libasound2-dev
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: "2.4.1"
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+
+      # Deliberately uncached – see the job comment. pip lives inside the venv
+      # being audited, so it is upgraded here too rather than reported on.
+      - name: Install export toolchain
+        run: |
+          poetry sync --no-interaction -E detection -E export
+          poetry run python -m pip install --upgrade pip
+
+      # The report goes to the step summary instead of being left to an exit
+      # code. This closure carries known advisories today, so a pass/fail signal
+      # here would be permanently red, and the next genuinely new finding would
+      # read exactly like the noise it was buried in. The listing is the signal:
+      # a row that was not there last week is the drift this job exists to show.
+      - name: pip-audit (export toolchain, report-only)
+        run: |
+          set +e
+          report="$(make audit 2>&1)"
+          set -e
+          {
+            echo "## Export toolchain audit (report-only, non-gating)"
+            echo
+            echo '```'
+            echo "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,290 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""Mutable state wrapper for a single PSN marker, and the shared freshness rule
+every output protocol maps onto its own idiom."""
+
+from __future__ import annotations
+
+import math
+import threading
+from collections.abc import Callable
+from typing import Any
+
+import pypsn
+
+from openfollow.psn.clock import psn_timestamp_usec
+
+Vec3 = tuple[float, float, float]
+_ZERO: Vec3 = (0.0, 0.0, 0.0)
+# PSN_DATA_TRACKER_STATUS: 1.0 for a marker the operator drives, less where detection
+# only partly vouches for it. Unwritten is None in memory and 0.0 on the wire.
+_VALID = 1.0
+_INVALID = 0.0
+
+# The per-frame write in ``build_marker_visual_state`` is what stamps a marker,
+# so its age doubles as a "the frame loop ran" signal. ~60 missed frames.
+MARKER_STALE_AFTER_S = 1.0
+
+
+def _clamped_status(status: Any) -> float:
+    """Coerce a status into the spec's 0.0-1.0 range.
+
+    A non-numeric or NaN value falls back to the declared default rather than
+    raising: callers derive this from tracking confidence on the frame path and
+    from untrusted wire data on the receive path, where an exception would take
+    the frame (or the rest of the packet) down.
+    """
+    try:
+        value = float(status)
+    except (TypeError, ValueError, OverflowError):
+        return _INVALID
+    if value != value:  # NaN would reach struct.pack and ship a NaN status.
+        return _INVALID
+    return min(1.0, max(0.0, value))
+
+
+def _clamped_timestamp(timestamp: Any) -> int:
+    """Coerce a tracker timestamp into a non-negative microsecond count."""
+    try:
+        value = int(timestamp)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, value)
+
+
+class Marker:
+    """Mutable state wrapper for a single PSN marker.
+
+    Stores position, speed, orientation, and other PSN marker fields.
+    Provides conversion methods to ``pypsn`` data types for network transmission.
+
+    Thread-safety: Position/speed/orientation reads and writes are protected
+    by an internal lock to prevent torn reads when background PSN threads
+    read state while the main thread updates it.
+
+    Every position or speed write stamps ``timestamp`` and marks an untouched
+    marker valid, so a receiver can tell a marker that is still being updated
+    from a stale one. A status set explicitly stands, 0.0 included, until the
+    next ``set_status``. ``set_status`` and ``set_name`` do not stamp.
+
+    A marker built from received data (``remote=True``, written via
+    ``apply_remote``) instead holds what its sender published, timed from that
+    sender's start: never comparable to ours, never re-broadcast as ours.
+    """
+
+    __slots__ = (
+        "marker_id",
+        "name",
+        "_pos",
+        "_speed",
+        "_ori",
+        "_accel",
+        "_trgtpos",
+        "_status",
+        "_timestamp",
+        "_remote",
+        "_clock",
+        "_lock",
+    )
+
+    def __init__(
+        self,
+        marker_id: int,
+        name: str,
+        *,
+        remote: bool = False,
+        clock: Callable[[], int] = psn_timestamp_usec,
+    ) -> None:
+        # Marker id 0 reserved on PSN wire; validate early.
+        if not isinstance(marker_id, int) or isinstance(marker_id, bool):
+            raise ValueError("marker_id must be int")
+        if marker_id < 1:
+            raise ValueError("marker_id must be >= 1")
+        self.marker_id: int = marker_id
+        self.name: str = name
+        self._pos: Vec3 = _ZERO
+        self._speed: Vec3 = _ZERO
+        self._ori: Vec3 = _ZERO
+        self._accel: Vec3 = _ZERO
+        self._trgtpos: Vec3 = _ZERO
+        # None until the first data write or an explicit set_status: an
+        # explicit 0.0 must not read as "nothing written yet".
+        self._status: float | None = None
+        self._timestamp: int = 0
+        self._remote: bool = bool(remote)
+        self._clock = clock
+        self._lock = threading.Lock()
+
+    @property
+    def pos(self) -> Vec3:
+        with self._lock:
+            return self._pos
+
+    @property
+    def speed(self) -> Vec3:
+        with self._lock:
+            return self._speed
+
+    @property
+    def ori(self) -> Vec3:
+        with self._lock:
+            return self._ori
+
+    @property
+    def accel(self) -> Vec3:
+        with self._lock:
+            return self._accel
+
+    @property
+    def trgtpos(self) -> Vec3:
+        with self._lock:
+            return self._trgtpos
+
+    @property
+    def status(self) -> float:
+        with self._lock:
+            return _INVALID if self._status is None else self._status
+
+    @property
+    def timestamp(self) -> int:
+        with self._lock:
+            return self._timestamp
+
+    @property
+    def is_remote(self) -> bool:
+        """True when this marker mirrors a sender on the network."""
+        return self._remote
+
+    @property
+    def clock_now_us(self) -> int:
+        """Now, on the clock this marker's timestamps are stamped from."""
+        return self._clock()
+
+    def set_pos(self, x: float, y: float, z: float, *, status: float | None = None) -> None:
+        """Set the marker position in PSN coordinates.
+
+        ``status`` lands with the position under the one lock, so a reader never
+        pairs this position with the previous frame's validity.
+        """
+        value = None if status is None else _clamped_status(status)
+        with self._lock:
+            self._pos = (x, y, z)
+            self._stamp_locked()
+            if value is not None:
+                self._status = value
+
+    def set_name(self, name: str) -> None:
+        """Update the marker name (used by live catalog rename)."""
+        with self._lock:
+            self.name = name
+
+    def set_speed(self, x: float, y: float, z: float) -> None:
+        """Set the marker speed vector."""
+        with self._lock:
+            self._speed = (x, y, z)
+            self._stamp_locked()
+
+    def set_status(self, status: float) -> None:
+        """Set the tracker validity, clamped to the 0.0-1.0 range."""
+        value = _clamped_status(status)
+        with self._lock:
+            self._status = value
+
+    def apply_remote(
+        self,
+        pos: Vec3,
+        speed: Vec3 | None = None,
+        *,
+        timestamp: int,
+        status: float,
+    ) -> None:
+        """Write one received tracker: the sender's values, never a local stamp.
+
+        *speed* of ``None`` keeps the previous vector, so a sender that stops
+        publishing speed does not zero the last known one. ``timestamp`` and
+        ``status`` are clamped to the spec's ranges, never fabricated. The
+        whole tracker lands under a single lock acquisition.
+        """
+        remote_status = _clamped_status(status)
+        remote_timestamp = _clamped_timestamp(timestamp)
+        with self._lock:
+            self._pos = (pos[0], pos[1], pos[2])
+            if speed is not None:
+                self._speed = (speed[0], speed[1], speed[2])
+            self._status = remote_status
+            self._timestamp = remote_timestamp
+
+    def _stamp_locked(self) -> None:
+        """Record the time of this data write. Caller holds ``_lock``.
+
+        ``set_name`` deliberately does not stamp - a rename is metadata, not
+        tracker data, and must not make a stale marker look fresh. The first
+        data write promotes an untouched marker to valid; an explicit
+        ``set_status`` stands, so a caller deriving validity from tracking
+        confidence is not overwritten on the next write, and a 0.0 it set is
+        not promoted either.
+        """
+        self._timestamp = self._clock()
+        if self._status is None:
+            self._status = _VALID
+
+    def to_psn_marker(self, *, stale: bool = False) -> pypsn.PsnTracker:
+        """Convert to pypsn.PsnTracker with all fields under lock.
+
+        *stale* publishes STATUS as invalid for this packet only - the stored
+        status is left alone, so the marker reports its real validity again the
+        moment it is written. The caller decides staleness (see
+        :func:`is_marker_stale`): computing it here would re-enter ``_lock``.
+        """
+        with self._lock:
+            # pypsn uses tracker_id (wire protocol); we translate at boundary.
+            return pypsn.PsnTracker(
+                tracker_id=self.marker_id,
+                pos=pypsn.PsnVector3(*self._pos),
+                speed=pypsn.PsnVector3(*self._speed),
+                ori=pypsn.PsnVector3(*self._ori),
+                accel=pypsn.PsnVector3(*self._accel),
+                trgtpos=pypsn.PsnVector3(*self._trgtpos),
+                status=_INVALID if stale or self._status is None else self._status,
+                timestamp=self._timestamp,
+            )
+
+    def to_psn_marker_info(self) -> pypsn.PsnTrackerInfo:
+        """Convert to pypsn.PsnTrackerInfo (wire-protocol names)."""
+        return pypsn.PsnTrackerInfo(
+            tracker_id=self.marker_id,
+            tracker_name=self.name,
+        )
+
+
+def marker_age_s(marker: Marker, *, now_us: int | None = None) -> float:
+    """Seconds since *marker* was last written, or ``inf`` when unknowable.
+
+    Only meaningful for a marker this process drives. A received marker holds
+    its sender's timestamp, in that sender's epoch, which is not comparable to
+    ours - and one that has never been written has no stamp at all. Both report
+    ``inf`` so a caller that treats "old" as "do not publish" fails safe.
+
+    *now_us* pins the reference instant, and must come from the same clock the
+    marker was built with (:attr:`Marker.clock_now_us`). Pass one sample when
+    ageing several markers for one packet so they share a snapshot.
+    """
+    if marker.is_remote:
+        return math.inf
+    timestamp = marker.timestamp
+    if timestamp <= 0:
+        return math.inf
+    # The marker's own clock, not the module one: ``PsnServer`` passes its
+    # ``clock=`` down to every marker it creates, and mixing the two epochs
+    # ages a freshly-written marker against an unrelated origin.
+    reference = marker.clock_now_us if now_us is None else now_us
+    return (reference - timestamp) / 1_000_000.0
+
+
+def is_marker_stale(marker: Marker, *, now_us: int | None = None) -> bool:
+    """True when *marker* has gone unwritten long enough to stop trusting it.
+
+    The single rule behind every output protocol's staleness handling, so PSN,
+    OTP, RTTrPM, and OSC can't drift apart on when a position stops counting.
+    """
+    return marker_age_s(marker, now_us=now_us) >= MARKER_STALE_AFTER_S

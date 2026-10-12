@@ -1,0 +1,1872 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""Game controller input handler with hotplug support."""
+
+from __future__ import annotations
+
+import ctypes
+import functools
+import logging
+import math
+import os
+import sys
+import threading
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, cast
+
+import pygame
+
+try:
+    from pygame._sdl2 import controller as sdl2_controller
+except ImportError:  # pragma: no cover - depends on runtime pygame build
+    sdl2_controller = None  # type: ignore[assignment]
+
+from openfollow.input._joystick_protocol import ControllerProtocol, JoystickProtocol
+from openfollow.input.controller_identity import resolve_key
+from openfollow.input.controller_slots import (
+    NOTE_BUTTON_MAP_OTHER_MODEL,
+    NOTE_BUTTONS_UNRECOGNISED,
+    NOTE_CANNOT_IDENTIFY,
+)
+from openfollow.input.shaping import apply_curve, shape_axis
+
+if TYPE_CHECKING:
+    from openfollow.app import OpenFollowApp
+    from openfollow.input.events import InputEventBus
+    from openfollow.input.faders import VirtualFaderBus
+
+logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def _sdl_device_fn(symbol: str, restype: Any, argtype: Any = ctypes.c_int) -> Callable[[Any], Any] | None:
+    """A one-argument SDL query, from the SDL pygame itself loaded.
+
+    Resolved through pygame's joystick module so the symbol comes from pygame's
+    own SDL rather than another copy in the process (OpenCV bundles one). None
+    of these queries opens the device.
+    """
+    module_path = getattr(pygame.joystick, "__file__", None)
+    if not isinstance(module_path, str):
+        return None
+    try:
+        fn = getattr(ctypes.CDLL(module_path), symbol)
+    except (OSError, AttributeError):
+        return None
+    fn.restype = restype
+    fn.argtypes = [argtype]
+    return cast(Callable[[Any], Any], fn)
+
+
+def _sdl_device_instance_id_fn() -> Callable[[int], int] | None:
+    """SDL's device-index to instance-id lookup, or ``None`` if unreachable."""
+    return _sdl_device_fn("SDL_JoystickGetDeviceInstanceID", ctypes.c_int32)
+
+
+def _device_instance_id(device_index: int) -> int | None:
+    """Instance id SDL has assigned to ``device_index``, read without opening it."""
+    fn = _sdl_device_instance_id_fn()
+    if fn is None:
+        return None
+    instance_id = int(fn(device_index))
+    return instance_id if instance_id >= 0 else None
+
+
+def _can_rumble(instance_id: int) -> bool | None:
+    """Whether SDL can rumble the open pad ``instance_id``; ``None`` if it can't be asked."""
+    joystick_for = _sdl_device_fn("SDL_JoystickFromInstanceID", ctypes.c_void_p, ctypes.c_int32)
+    has_rumble = _sdl_device_fn("SDL_JoystickHasRumble", ctypes.c_int, ctypes.c_void_p)
+    if joystick_for is None or has_rumble is None:
+        return None
+    joystick = joystick_for(instance_id)
+    return bool(has_rumble(joystick)) if joystick else None
+
+
+def _device_path(device_index: int) -> str | None:
+    """Device node SDL reads ``device_index`` from, read without opening it.
+
+    ``/dev/input/event*`` or ``/dev/hidraw*`` on Linux; nothing on macOS.
+    """
+    fn = _sdl_device_fn("SDL_JoystickPathForIndex", ctypes.c_char_p)
+    if fn is None:
+        return None
+    raw = fn(device_index)
+    return os.fsdecode(raw) if raw else None
+
+
+# 3Dconnexion pucks as (vendor, product), kept out of SDL's joystick API: the
+# 3D Mouse subsystem drives them, and SDL would otherwise bind one as a gamepad.
+# SDL's blacklist takes exact pairs only, and Logitech's 0x046d also covers its
+# gamepads, so that vendor's puck range is listed model by model.
+_SPACEMOUSE_IDS: frozenset[tuple[int, int]] = frozenset(
+    {
+        # Logitech-era 3Dconnexion
+        (0x046D, 0xC603),  # SpaceMouse Plus XT
+        (0x046D, 0xC605),  # CADman
+        (0x046D, 0xC606),  # SpaceMouse Classic
+        (0x046D, 0xC621),  # Spaceball 5000
+        (0x046D, 0xC623),  # SpaceTraveler
+        (0x046D, 0xC625),  # SpacePilot
+        (0x046D, 0xC626),  # SpaceNavigator
+        (0x046D, 0xC627),  # SpaceExplorer
+        (0x046D, 0xC628),  # SpaceNavigator for Notebooks
+        (0x046D, 0xC629),  # SpacePilot Pro
+        (0x046D, 0xC62B),  # SpaceMouse Pro
+        (0x046D, 0xC640),  # NuLOOQ navigator
+        # 3Dconnexion
+        (0x256F, 0xC62E),  # SpaceMouse Wireless, cabled
+        (0x256F, 0xC62F),  # SpaceMouse Wireless receiver
+        (0x256F, 0xC631),  # SpaceMouse Pro Wireless, cabled
+        (0x256F, 0xC632),  # SpaceMouse Pro Wireless receiver
+        (0x256F, 0xC633),  # SpaceMouse Enterprise
+        (0x256F, 0xC635),  # SpaceMouse Compact
+        (0x256F, 0xC636),  # SpaceMouse Module
+        (0x256F, 0xC638),  # SpaceMouse Pro Wireless BT, cabled
+        (0x256F, 0xC63A),  # SpaceMouse Wireless BT
+        (0x256F, 0xC641),  # sources disagree whether a puck; harmless if not
+        (0x256F, 0xC652),  # Universal Receiver
+        (0x256F, 0xC658),  # sources disagree whether a puck; harmless if not
+    }
+)
+
+
+def _is_spacemouse(device_index: int) -> bool:
+    """Whether SDL lists ``device_index`` as a 3Dconnexion puck, read without opening it.
+
+    Backs up the blacklist on an SDL that ignores it (older than 2.30, as a
+    stray classic pygame loads).
+    """
+    vendor = _sdl_device_fn("SDL_JoystickGetDeviceVendor", ctypes.c_uint16)
+    product = _sdl_device_fn("SDL_JoystickGetDeviceProduct", ctypes.c_uint16)
+    if vendor is None or product is None:
+        return False
+    return (vendor(device_index), product(device_index)) in _SPACEMOUSE_IDS
+
+
+# Identify: a rumble long and strong enough to feel in a hand or on a desk.
+_IDENTIFY_STRENGTH = 0.7
+_IDENTIFY_MS = 900
+
+
+def _spacemouse_blacklist() -> str:
+    """``SDL_JOYSTICK_BLACKLIST_DEVICES`` value naming every known puck."""
+    return ",".join(f"0x{vid:04x}/0x{pid:04x}" for vid, pid in sorted(_SPACEMOUSE_IDS))
+
+
+def _instance_id_lookup_available() -> bool:
+    """Whether ``_device_instance_id`` can answer, so hotplug can match by id."""
+    return _sdl_device_instance_id_fn() is not None
+
+
+def _quit_quietly(device: Any) -> None:
+    """Close a joystick or controller; one that is already gone raises nothing."""
+    if device is None:
+        return
+    try:
+        device.quit()
+    except pygame.error:
+        pass
+
+
+def _safe_call(fn: Callable[[], Any], default: Any) -> Any:
+    """Call a pygame driver getter, degrading to ``default`` on any error.
+
+    pygame joystick getters (``get_guid``/``get_name``/…) occasionally raise
+    beyond ``pygame.error`` on flaky drivers; a single bad read must not abort
+    controller detection or escape into the per-frame update loop.
+    """
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 - never let a driver getter break detection
+        return default
+
+
+# Raw joystick fallback mapping: triggers (LT/RT) and bumpers.
+LT_AXIS_INDICES: tuple[int, ...] = (4, 6)
+RT_AXIS_INDICES: tuple[int, ...] = (5, 7)
+BUMPER_LEFT_BUTTON_INDICES: tuple[int, ...] = (4, 9)
+BUMPER_RIGHT_BUTTON_INDICES: tuple[int, ...] = (5, 10)
+# L2/R2 button fallback for controllers where SDL2 misroutes trigger axes.
+# On most PS-style budget controllers with 13 buttons: L2=6, R2=7.
+# Note: do NOT include index 9 here – CONTROLLER_BUTTON_LEFTSHOULDER defaults to 9,
+# so button 9 is the LB shoulder button. Including it in RT would cause LB to
+# simultaneously trigger height-up and speed-decrease.
+LT_DIGITAL_BUTTON_INDICES: tuple[int, ...] = (6, 8)
+RT_DIGITAL_BUTTON_INDICES: tuple[int, ...] = (7,)
+
+# Trigger deadzone for analog height control
+TRIGGER_DEADZONE = 0.05
+
+CONTROLLER_AXIS_LEFTX = getattr(pygame, "CONTROLLER_AXIS_LEFTX", 0)
+CONTROLLER_AXIS_LEFTY = getattr(pygame, "CONTROLLER_AXIS_LEFTY", 1)
+CONTROLLER_AXIS_RIGHTX = getattr(pygame, "CONTROLLER_AXIS_RIGHTX", 2)
+CONTROLLER_AXIS_RIGHTY = getattr(pygame, "CONTROLLER_AXIS_RIGHTY", 3)
+CONTROLLER_AXIS_TRIGGERLEFT = getattr(pygame, "CONTROLLER_AXIS_TRIGGERLEFT", 4)
+CONTROLLER_AXIS_TRIGGERRIGHT = getattr(pygame, "CONTROLLER_AXIS_TRIGGERRIGHT", 5)
+CONTROLLER_BUTTON_A = getattr(pygame, "CONTROLLER_BUTTON_A", 0)
+CONTROLLER_BUTTON_B = getattr(pygame, "CONTROLLER_BUTTON_B", 1)
+CONTROLLER_BUTTON_X = getattr(pygame, "CONTROLLER_BUTTON_X", 2)
+CONTROLLER_BUTTON_Y = getattr(pygame, "CONTROLLER_BUTTON_Y", 3)
+CONTROLLER_BUTTON_BACK = getattr(pygame, "CONTROLLER_BUTTON_BACK", 4)
+CONTROLLER_BUTTON_START = getattr(pygame, "CONTROLLER_BUTTON_START", 6)
+CONTROLLER_BUTTON_LEFTSHOULDER = getattr(pygame, "CONTROLLER_BUTTON_LEFTSHOULDER", 9)
+CONTROLLER_BUTTON_RIGHTSHOULDER = getattr(pygame, "CONTROLLER_BUTTON_RIGHTSHOULDER", 10)
+CONTROLLER_BUTTON_DPAD_UP = getattr(pygame, "CONTROLLER_BUTTON_DPAD_UP", 11)
+CONTROLLER_BUTTON_DPAD_DOWN = getattr(pygame, "CONTROLLER_BUTTON_DPAD_DOWN", 12)
+CONTROLLER_BUTTON_DPAD_LEFT = getattr(pygame, "CONTROLLER_BUTTON_DPAD_LEFT", 13)
+CONTROLLER_BUTTON_DPAD_RIGHT = getattr(pygame, "CONTROLLER_BUTTON_DPAD_RIGHT", 14)
+
+# Sentinel button IDs for analog triggers treated as digital buttons.
+# Negative so they never collide with real SDL2 button indices.
+BUTTON_ID_LT = -10
+BUTTON_ID_RT = -11
+BUTTON_ID_UNBOUND = -20  # sentinel: user cleared this binding via Web UI "–"
+
+# Sentinel button IDs for hat (D-Pad) directions on raw joysticks.
+# Used when the button detection wizard detects D-Pad as hat inputs
+# rather than discrete buttons.  Stored in button_raw_indices and
+# resolved to joystick.get_hat() reads in _get_button().
+HAT_UP = -1
+HAT_DOWN = -2
+HAT_LEFT = -3
+HAT_RIGHT = -4
+
+# String name → SDL2 button ID, used by configurable mappings.
+BUTTON_NAME_TO_ID: dict[str, int] = {
+    "A": CONTROLLER_BUTTON_A,
+    "B": CONTROLLER_BUTTON_B,
+    "X": CONTROLLER_BUTTON_X,
+    "Y": CONTROLLER_BUTTON_Y,
+    "BACK": CONTROLLER_BUTTON_BACK,
+    "START": CONTROLLER_BUTTON_START,
+    "LB": CONTROLLER_BUTTON_LEFTSHOULDER,
+    "RB": CONTROLLER_BUTTON_RIGHTSHOULDER,
+    "LT": BUTTON_ID_LT,
+    "RT": BUTTON_ID_RT,
+    "DPAD_UP": CONTROLLER_BUTTON_DPAD_UP,
+    "DPAD_DOWN": CONTROLLER_BUTTON_DPAD_DOWN,
+    "DPAD_LEFT": CONTROLLER_BUTTON_DPAD_LEFT,
+    "DPAD_RIGHT": CONTROLLER_BUTTON_DPAD_RIGHT,
+}
+
+CONTROLLER_EVENT_TYPES = tuple(
+    event_type
+    for event_type in (
+        getattr(pygame, "CONTROLLERAXISMOTION", None),
+        getattr(pygame, "CONTROLLERBUTTONDOWN", None),
+        getattr(pygame, "CONTROLLERBUTTONUP", None),
+        getattr(pygame, "CONTROLLERDEVICEADDED", None),
+        getattr(pygame, "CONTROLLERDEVICEREMOVED", None),
+        getattr(pygame, "CONTROLLERDEVICEREMAPPED", None),
+    )
+    if event_type is not None
+)
+
+
+@dataclass
+class ControllerCapabilities:
+    backend: str
+    name: str = ""
+    guid: str = ""
+    num_axes: int = 0
+    num_buttons: int = 0
+    num_hats: int = 0
+    # The socket the pad is plugged into (see controller_identity), or None.
+    port_key: str | None = None
+    # SDL's answer when the pad opened; None when it couldn't be asked.
+    can_rumble: bool | None = None
+
+
+@dataclass
+class ControllerRuntimeInfo:
+    """Live snapshot of one connected controller, for diagnostics and the
+    calibration-mismatch check. Distinct from :class:`ControllerCapabilities`
+    (the stored per-pad facts) in that it also carries the derived flags the
+    bundle renders: whether SDL recognises the pad as a game controller
+    (i.e. it's in X-input mode), and whether its identity matches the saved
+    calibration."""
+
+    index: int  # SDL instance id (the handler key), not the controller slot
+    backend: str
+    name: str
+    guid: str
+    num_axes: int
+    num_buttons: int
+    num_hats: int
+    # backend == "sdl2_controller": SDL has a game-controller mapping, which
+    # for an Xbox-style pad means it's in X-input mode (the preferred path).
+    is_game_controller: bool
+    # True when a calibration is stored and this pad's identity matches it,
+    # or when no calibration is stored at all (nothing to mismatch).
+    matches_calibration: bool
+    # True when any calibration (name / guid / raw indices) is on file.
+    calibration_stored: bool
+    port_key: str | None = None
+
+
+@dataclass
+class SourceSelectionInput:
+    """Gamepad input relevant to NDI source selection mode."""
+
+    up_pressed: bool = False
+    down_pressed: bool = False
+    confirm_pressed: bool = False
+    cancel_pressed: bool = False
+
+
+@dataclass
+class SettingsMenuInput:
+    """Gamepad input relevant to the Settings menu overlay."""
+
+    up_pressed: bool = False
+    down_pressed: bool = False
+    # Left/right move the cursor in the network field editor's digit grid; the
+    # menus themselves are a single column and ignore them.
+    left_pressed: bool = False
+    right_pressed: bool = False
+    confirm_pressed: bool = False
+    cancel_pressed: bool = False
+
+
+@dataclass(frozen=True)
+class _OpenedDevice:
+    """A device opened by ``_open_device`` and not yet registered."""
+
+    key: int
+    joy: JoystickProtocol
+    ctrl: ControllerProtocol | None
+    cap: ControllerCapabilities
+    baseline: dict[int, float]
+
+
+@dataclass
+class GamepadUpdate:
+    """Result of a gamepad update cycle."""
+
+    movements: dict[int, tuple[float, float, float]] = field(default_factory=dict)
+    resets: set[int] = field(default_factory=set)
+    toggle_help_pressed: bool = False  # Y button to toggle HUD help panel
+    toggle_zones_pressed: bool = False  # Optional button to toggle zone overlay
+    next_marker_pressed: bool = False  # Cycle to next controlled marker
+    prev_marker_pressed: bool = False  # Cycle to previous controlled marker
+    settings_open_pressed: bool = False  # btn_settings edge – open Settings menu
+    clear_messages_pressed: bool = False  # btn_clear_messages edge
+
+
+class GamepadHandler:
+    """Handles game controller input with hotplug detection."""
+
+    # Startup retry settings: if no controllers found, retry for this duration
+    _STARTUP_RETRY_DURATION = 15.0  # seconds
+    _STARTUP_RETRY_INTERVAL = 2.0  # seconds between retries
+
+    def __init__(
+        self,
+        app: OpenFollowApp,
+        *,
+        event_bus: InputEventBus | None = None,
+        virtual_faders: VirtualFaderBus | None = None,
+        marker_resolver: Callable[[int], int | None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.app = app
+        self._clock = clock
+        # Instance id -> when the pad last moved or had a button held.
+        self._last_input: dict[int, float] = {}
+        self.deadzone = 0.15
+        self.enabled = True
+        self.invert_y = False
+        # Virtual Fader 1 integrator. Direct reference (not via app._runtime_services)
+        # for performance on the hot loop. None means disabled; apply_config tolerates it.
+        self._virtual_faders: VirtualFaderBus | None = virtual_faders
+        self._marker_fader_stick: str = ""
+        self._marker_fader_max_speed_s: float = 1.0
+        # Maps controller_idx → marker_id so bumper-speed and effective-speed paths
+        # target the marker routed to that controller (single-gamepad via selected_id,
+        # multi-gamepad via fixed slot). None in tests/isolated construction; bumper
+        # presses fall back to app._selected_id and speed falls back to config.move_speed.
+        self._marker_resolver = marker_resolver
+        self.joysticks: dict[int, JoystickProtocol] = {}
+        # Value is structurally a ControllerProtocol (SDL2's
+        # higher-level wrapper), but pygame's stubs don't expose the
+        # concrete class – see ``_joystick_protocol.py`` for context.
+        self.controllers: dict[int, ControllerProtocol] = {}
+        self.capabilities: dict[int, ControllerCapabilities] = {}
+        self._bumper_state: dict[int, tuple[bool, bool]] = {}
+        self._shoulder_axis_baselines: dict[int, dict[int, float]] = {}
+        # Pads whose movement stick hasn't been seen at rest yet. A pad opened
+        # after a restart can report a stale axis value before the OS delivers
+        # its first centering event; stick deflection is discarded until the
+        # stick reads inside the deadzone once (see _update_stick_priming).
+        self._stick_unprimed: set[int] = set()
+        self._button_prev: dict[int, dict[int, bool]] = {}
+        # Per-controller, per-button previous state for the bus-emission edge detector.
+        # Separate from _button_prev so existing edge-detectors and the emit loop
+        # don't race on shared state.
+        self._button_bus_prev: dict[int, dict[int, bool]] = {}
+        # Per-frame button-state snapshot. None means no frame in progress (direct
+        # callers read live). update() populates per-frame and resets in finally block,
+        # so each (controller_idx, button_id) is read once and shared, not re-read.
+        self._frame_button_states: dict[tuple[int, int], bool] | None = None
+        self._event_bus = event_bus
+        self._startup_retry_remaining = 0.0  # seconds remaining for startup retries
+        self._startup_retry_timer = 0.0  # time since last retry
+        self._axes_logged: set[int] = set()  # controllers whose raw axes have been dumped
+        # GUIDs we've already logged a calibration-mismatch warning for, so a
+        # hotplug re-detect doesn't re-warn on every cycle. Cleared in
+        # ``apply_config`` when the calibration identity changes.
+        self._calibration_warned: set[str] = set()
+        # Threading: the main loop is the only writer, and every reader that
+        # combines maps (get_controller_info, the HUD, the button wizard) runs
+        # there too. Off the main loop each reader takes one map: the OSC thread
+        # reads ``joysticks`` keys, the web thread reads ``capabilities`` under
+        # this lock (runtime_snapshot). The maps are replaced, never mutated in
+        # place, so a single-map reader always holds a complete one.
+        self._capabilities_lock = threading.Lock()
+
+        # pygame.init() requires video subsystem; it also initializes SDL audio/mixer
+        # which OpenFollow doesn't use. On Linux, SDL audio opens the default ALSA
+        # device and floods the log. Point SDL audio at the dummy driver before init.
+        os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+        # The video subsystem is what pygame's event API needs, not joystick
+        # init, and SDL's real backend pumps the same run loop GTK drives.
+        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+        # SDL before 2.32.6 left its macOS HIDAPI input-report callback on a
+        # closed device, so a reopen turned HID traffic into a use-after-free.
+        # pygame-ce bundles a fixed SDL; the backend stays off until pads are
+        # verified on it.
+        if sys.platform == "darwin":
+            os.environ.setdefault("SDL_JOYSTICK_HIDAPI", "0")
+        os.environ.setdefault("SDL_JOYSTICK_BLACKLIST_DEVICES", _spacemouse_blacklist())
+        # SDL's own SIGINT/SIGTERM handler turns a stop into a quit event nothing
+        # reads, until the GLib main loop takes the signals over.
+        os.environ.setdefault("SDL_NO_SIGNAL_HANDLERS", "1")
+        if not pygame.get_init():
+            pygame.init()
+        if not getattr(pygame, "IS_CE", False):
+            logger.warning(
+                "Gamepad input is running on classic pygame %s (SDL %s), not pygame-ce: "
+                "remove the 'pygame' package from this Python environment so pygame-ce loads.",
+                pygame.version.ver,
+                ".".join(str(part) for part in pygame.get_sdl_version()),
+            )
+
+        if not pygame.joystick.get_init():
+            pygame.joystick.init()
+
+        if sdl2_controller is not None and not sdl2_controller.get_init():
+            sdl2_controller.init()
+
+        self.apply_config()
+        logger.info(
+            "GamepadHandler initialized (enabled=%s, deadzone=%.3f, sdl2_controller=%s)",
+            self.enabled,
+            self.deadzone,
+            bool(sdl2_controller is not None),
+        )
+        self._detect_controllers()
+
+        # If no controllers found at startup, enable retry mechanism
+        if not self.joysticks:
+            self._startup_retry_remaining = self._STARTUP_RETRY_DURATION
+            logger.warning(
+                "No controllers detected at startup. Will retry for %.0f seconds.",
+                self._STARTUP_RETRY_DURATION,
+            )
+
+    def apply_config(self) -> None:
+        """Refresh runtime controller settings from app config."""
+        cfg = self.app._config.controller
+        self.deadzone = cfg.deadzone
+        self.enabled = cfg.enabled
+        self.invert_y = cfg.invert_y
+        self.curve = cfg.curve
+
+        def _resolve(cfg_value: str, default_id: int) -> int:
+            """Map a config binding to an SDL2 ID, or BUTTON_ID_UNBOUND.
+
+            An explicit empty string (the Web UI's "–" option) means the
+            user intentionally disabled the binding; ``_get_button`` treats
+            ``BUTTON_ID_UNBOUND`` as always-released so dispatch never fires.
+            """
+            if not cfg_value:
+                return BUTTON_ID_UNBOUND
+            return BUTTON_NAME_TO_ID.get(cfg_value, default_id)
+
+        # Resolve configurable button mappings to SDL2 IDs.
+        # BUTTON_ID_UNBOUND means the user cleared the binding via the Web UI;
+        # other negative IDs are reserved for virtual/sentinel inputs such as
+        # LT/RT trigger buttons and raw-joystick hat directions.
+        self._btn_reset_id = _resolve(cfg.btn_reset, CONTROLLER_BUTTON_X)
+        self._btn_toggle_help_id = _resolve(cfg.btn_toggle_help, CONTROLLER_BUTTON_Y)
+        self._btn_toggle_zones_id = _resolve(cfg.btn_toggle_zones, -1)
+        # Clear operator-message cards; default unbound.
+        self._btn_clear_messages_id = _resolve(cfg.btn_clear_messages, BUTTON_ID_UNBOUND)
+        # Unified menu confirm/cancel – shared by source / interface
+        # selection and the Settings menu.
+        self._btn_menu_confirm_id = _resolve(cfg.btn_menu_confirm, CONTROLLER_BUTTON_A)
+        self._btn_menu_cancel_id = _resolve(cfg.btn_menu_cancel, CONTROLLER_BUTTON_B)
+        self._btn_speed_down_id = _resolve(cfg.btn_speed_down, CONTROLLER_BUTTON_LEFTSHOULDER)
+        self._btn_speed_up_id = _resolve(cfg.btn_speed_up, CONTROLLER_BUTTON_RIGHTSHOULDER)
+        self._btn_move_z_down_id = _resolve(cfg.btn_move_z_down, BUTTON_ID_LT)
+        self._btn_move_z_up_id = _resolve(cfg.btn_move_z_up, BUTTON_ID_RT)
+        self._btn_next_marker_id = _resolve(cfg.btn_next_marker, CONTROLLER_BUTTON_DPAD_RIGHT)
+        self._btn_prev_marker_id = _resolve(cfg.btn_prev_marker, CONTROLLER_BUTTON_DPAD_LEFT)
+        self._btn_settings_id = _resolve(cfg.btn_settings, CONTROLLER_BUTTON_BACK)
+        self._move_xy_stick = cfg.move_xy_stick
+        self._swap_triggers = cfg.swap_triggers
+        # Marker-fader integrator settings. Cached at config-apply time
+        # so the per-tick ``update`` loop does one attribute read each
+        # instead of dereferencing the full config every animation frame.
+        self._marker_fader_stick = cfg.marker_fader_stick
+        self._marker_fader_max_speed_s = cfg.marker_fader_max_speed_s
+        # Stored controller identity from the last wizard run, for the
+        # connected-vs-calibrated mismatch check. A calibration is considered
+        # "on file" if any of name / guid / raw indices is set.
+        _prev_identity = (
+            getattr(self, "_mapped_controller_name", None),
+            getattr(self, "_mapped_controller_guid", None),
+        )
+        self._mapped_controller_name = cfg.mapped_controller_name
+        self._mapped_controller_guid = cfg.mapped_controller_guid
+        self._is_calibrated = bool(cfg.mapped_controller_name or cfg.mapped_controller_guid or cfg.button_raw_indices)
+        # The calibration target changed (wizard re-run / config hot-reload),
+        # so drop the warned-GUID cache – a still-mismatched pad must be able
+        # to warn again against the new identity instead of staying suppressed
+        # until restart.
+        if (self._mapped_controller_name, self._mapped_controller_guid) != _prev_identity:
+            self._calibration_warned.clear()
+        # Button-detection remap. Two parallel maps because the wizard
+        # captures the same physical truth twice in different units:
+        #
+        # * ``_button_remap`` – SDL2 logical ID → SDL2 logical ID. Built
+        #   from the ``map_*`` config fields (SDL2-logical names). Only
+        #   the SDL2 controller path consults this; the SDL2 driver
+        #   already maps raw hardware buttons to SDL2 logical IDs, so
+        #   any correction at the app layer is also expressed in SDL2
+        #   logical IDs.
+        #
+        # * ``_raw_button_remap`` – SDL2 logical ID → raw hardware
+        #   index. Built from ``button_raw_indices`` (hardware indices
+        #   from the wizard). Only the raw joystick path consults this;
+        #   raw indices are meaningless to SDL2 controllers (e.g. a raw
+        #   ``LB=4`` would be misread as SDL2 logical BACK there).
+        #
+        # They stay separate so the SDL2 path never applies raw indices
+        # as if they were SDL2 IDs. On a pad whose SDL2 mapping has LB
+        # → logical BACK, the wizard's "LB lives at raw 4" is correct,
+        # but ``controller.get_button(4)`` reads logical BACK on SDL2,
+        # not LB.
+        self._button_remap: dict[int, int] = {}
+        self._raw_button_remap: dict[int, int] = {}
+        # Label -> SDL2 logical ID for remap building
+        _LABEL_TO_LOGICAL: dict[str, int] = {
+            "A": CONTROLLER_BUTTON_A,
+            "B": CONTROLLER_BUTTON_B,
+            "X": CONTROLLER_BUTTON_X,
+            "Y": CONTROLLER_BUTTON_Y,
+            "BACK": CONTROLLER_BUTTON_BACK,
+            "START": CONTROLLER_BUTTON_START,
+            "LB": CONTROLLER_BUTTON_LEFTSHOULDER,
+            "RB": CONTROLLER_BUTTON_RIGHTSHOULDER,
+            "DPAD_UP": CONTROLLER_BUTTON_DPAD_UP,
+            "DPAD_DOWN": CONTROLLER_BUTTON_DPAD_DOWN,
+            "DPAD_LEFT": CONTROLLER_BUTTON_DPAD_LEFT,
+            "DPAD_RIGHT": CONTROLLER_BUTTON_DPAD_RIGHT,
+        }
+        raw_indices = cfg.button_raw_indices
+        if raw_indices:
+            # Wizard captured hardware indices – feeds the joystick path.
+            for label, raw_idx in raw_indices.items():
+                logical_id = _LABEL_TO_LOGICAL.get(label)
+                if logical_id is not None and raw_idx != logical_id:
+                    self._raw_button_remap[logical_id] = raw_idx
+        # SDL2-logical remap is built unconditionally – both wizard-run
+        # and non-wizard installs benefit, and it coexists with the
+        # raw-index map for backends that need each.
+        _MAP_FIELDS = (
+            ("map_a", CONTROLLER_BUTTON_A),
+            ("map_b", CONTROLLER_BUTTON_B),
+            ("map_x", CONTROLLER_BUTTON_X),
+            ("map_y", CONTROLLER_BUTTON_Y),
+            ("map_back", CONTROLLER_BUTTON_BACK),
+            ("map_start", CONTROLLER_BUTTON_START),
+            ("map_lb", CONTROLLER_BUTTON_LEFTSHOULDER),
+            ("map_rb", CONTROLLER_BUTTON_RIGHTSHOULDER),
+            ("map_dpad_up", CONTROLLER_BUTTON_DPAD_UP),
+            ("map_dpad_down", CONTROLLER_BUTTON_DPAD_DOWN),
+            ("map_dpad_left", CONTROLLER_BUTTON_DPAD_LEFT),
+            ("map_dpad_right", CONTROLLER_BUTTON_DPAD_RIGHT),
+        )
+        for field_name, logical_id in _MAP_FIELDS:
+            detected_name = getattr(cfg, field_name)
+            detected_id = BUTTON_NAME_TO_ID.get(
+                detected_name,
+                logical_id,
+            )
+            if detected_id != logical_id:
+                self._button_remap[logical_id] = detected_id
+        if self._button_remap or self._raw_button_remap:
+            id_to_name = {v: k for k, v in BUTTON_NAME_TO_ID.items()}
+            sdl_readable = {id_to_name.get(k, str(k)): id_to_name.get(v, str(v)) for k, v in self._button_remap.items()}
+            raw_readable = {id_to_name.get(k, str(k)): v for k, v in self._raw_button_remap.items()}
+            logger.info(
+                "Button detection remap active: sdl=%s raw=%s",
+                sdl_readable,
+                raw_readable,
+            )
+        # Clear edge-detection state to prevent false triggers
+        # when mappings change at runtime. ``_button_bus_prev``
+        # rides the same ``_get_button`` reads as ``_button_prev``,
+        # so a button-remap change can swap the underlying physical
+        # button behind a logical id mid-frame – leaving stale bus-
+        # prev state would emit a spurious press / release the very
+        # next tick. Cleared together so both edge detectors restart
+        # from the fresh post-config baseline.
+        self._button_prev.clear()
+        self._button_bus_prev.clear()
+
+    def _detect_controllers(self, force: bool = False) -> None:
+        """Open every attached controller from scratch.
+
+        Runs for the first enumeration, the no-controllers retry, and a hotplug
+        when the instance-id lookup is unavailable. A device that reopens keeps
+        its per-device state (its instance id survives the reopen), a device
+        that did not is pruned, and the new maps are published in one swap.
+        """
+        try:
+            count = pygame.joystick.get_count()
+
+            if not force and count == len(self.joysticks):
+                return
+
+            old_count = len(self.joysticks)
+            previously_connected = set(self.joysticks)
+            for device in (*self.controllers.values(), *self.joysticks.values()):
+                _quit_quietly(device)
+
+            opened: dict[int, _OpenedDevice] = {}
+            for i in range(count):
+                device = self._open_device(i, held=opened)
+                if device is not None:
+                    opened[device.key] = device
+
+            self.joysticks = {key: d.joy for key, d in opened.items()}
+            self.controllers = {key: d.ctrl for key, d in opened.items() if d.ctrl is not None}
+            with self._capabilities_lock:
+                self.capabilities = {key: d.cap for key, d in opened.items()}
+            self._prune_device_state(keep=set(opened))
+            for key, d in opened.items():
+                if key in previously_connected:
+                    # Kept rest values win; axes it never had are filled in.
+                    self._shoulder_axis_baselines[key] = {**d.baseline, **self._shoulder_axis_baselines.get(key, {})}
+                else:
+                    self._init_device_state(d)
+                self._warn_if_calibration_mismatch(key)
+
+            new_count = len(self.joysticks)
+            if new_count > old_count:
+                logger.info("Controllers connected: %s -> %s", old_count, new_count)
+            elif new_count < old_count:
+                logger.info("Controllers disconnected: %s -> %s", old_count, new_count)
+            # pragma: no branch – exhaustive log-level dispatch over the
+            # connect / disconnect / force-refresh axes; the no-log
+            # branch (count unchanged AND not forced) fires silently
+            # via the same code path coverage already exercises.
+            elif force:  # pragma: no branch
+                logger.info("Controller map refreshed: %s devices", new_count)
+
+        except pygame.error as e:
+            logger.error("Error detecting controllers: %s", e)
+
+    def _open_device(self, device_index: int, *, held: Mapping[int, object]) -> _OpenedDevice | None:
+        """Open one SDL device without registering it; ``None`` if it is in ``held`` or fails.
+
+        The key is the SDL instance id: it stays the same for as long as the
+        device is attached, so state never has to follow a renumbering. Callers
+        must not pass the index of a device that is already open: pygame opens
+        it again inside SDL before returning its cached object, so each such
+        call leaks an SDL reference. ``_apply_hotplug`` matches by instance id
+        first, and a rescan closes everything before it opens.
+        """
+        if _is_spacemouse(device_index):
+            logger.debug("Device %s is a 3Dconnexion puck; the 3D Mouse drives it", device_index)
+            return None
+        pygame_joy: Any = None
+        ctrl_obj: ControllerProtocol | None = None
+        try:
+            # The constructor opens the device; the cast retypes pygame's
+            # function-typed stub to the protocol used everywhere downstream.
+            pygame_joy = pygame.joystick.Joystick(device_index)
+            joy = cast(JoystickProtocol, pygame_joy)
+            key = joy.get_instance_id()
+            # SDL changes its device list only while events are pumped, so the
+            # ids listed before this open can't go stale. If that ever changed,
+            # this keeps the maps sound, at the cost of the extra SDL reference
+            # pygame took for its cached object.
+            if key in held:
+                return None
+
+            backend = "joystick"
+            if sdl2_controller is not None and sdl2_controller.is_controller(device_index):
+                try:
+                    ctrl_obj = cast(ControllerProtocol, sdl2_controller.Controller(device_index))
+                    backend = "sdl2_controller"
+                except pygame.error as e:
+                    logger.warning("Gamepad instance %s SDL2 open failed, fallback to joystick: %s", key, e)
+            baseline = {
+                axis_idx: joy.get_axis(axis_idx)
+                for axis_idx in {*LT_AXIS_INDICES, *RT_AXIS_INDICES}
+                if axis_idx < joy.get_numaxes()
+            }
+        except pygame.error as e:
+            logger.error("Failed to open gamepad at SDL device index %s: %s", device_index, e)
+            self._release_unregistered(pygame_joy, ctrl_obj)
+            return None
+
+        # Driver getters can raise beyond pygame.error on flaky pads; degrade
+        # per-field so one bad read still connects.
+        cap = ControllerCapabilities(
+            backend=backend,
+            name=_safe_call(joy.get_name, ""),
+            guid=_safe_call(joy.get_guid, ""),
+            num_axes=_safe_call(joy.get_numaxes, 0),
+            num_buttons=_safe_call(joy.get_numbuttons, 0),
+            num_hats=_safe_call(joy.get_numhats, 0),
+            port_key=resolve_key(_device_path(device_index)),
+            can_rumble=_can_rumble(key),
+        )
+        logger.info(
+            "Gamepad instance %s connected via %s: %s (GUID: %s, port: %s, axes=%s, buttons=%s, rumble=%s)",
+            key,
+            backend,
+            cap.name,
+            cap.guid,
+            cap.port_key or "none",
+            cap.num_axes,
+            cap.num_buttons,
+            {True: "yes", False: "no", None: "unknown"}[cap.can_rumble],
+        )
+        return _OpenedDevice(key=key, joy=joy, ctrl=ctrl_obj, cap=cap, baseline=baseline)
+
+    def _adopt(self, devices: list[_OpenedDevice]) -> None:
+        """Register newly opened devices with fresh state, each shared map replaced once."""
+        if not devices:
+            return
+        self.joysticks = {**self.joysticks, **{d.key: d.joy for d in devices}}
+        self.controllers = {**self.controllers, **{d.key: d.ctrl for d in devices if d.ctrl is not None}}
+        with self._capabilities_lock:
+            self.capabilities = {**self.capabilities, **{d.key: d.cap for d in devices}}
+        for d in devices:
+            self._init_device_state(d)
+            self._warn_if_calibration_mismatch(d.key)
+
+    def _init_device_state(self, device: _OpenedDevice) -> None:
+        """Fresh edge state for a newly connected pad, its stick not yet seen at rest."""
+        self._bumper_state[device.key] = (False, False)
+        self._shoulder_axis_baselines[device.key] = dict(device.baseline)
+        self._button_prev[device.key] = {}
+        self._button_bus_prev[device.key] = {}
+        self._stick_unprimed.add(device.key)
+
+    def _prune_device_state(self, *, keep: set[int]) -> None:
+        """Drop per-device state for every key not in ``keep``."""
+        for state in (
+            self._bumper_state,
+            self._shoulder_axis_baselines,
+            self._button_prev,
+            self._button_bus_prev,
+            self._last_input,
+        ):
+            for key in [k for k in state if k not in keep]:
+                del state[key]
+        self._stick_unprimed &= keep
+        self._axes_logged &= keep
+
+    def _release_unregistered(self, joy: Any, ctrl: ControllerProtocol | None) -> None:
+        """Close what a failed open created, never an object already registered.
+
+        pygame returns its cached object for a device that is already open, so
+        identity, not equality, decides whether the object is ours to close.
+        """
+        registered = [*self.joysticks.values(), *self.controllers.values()]
+        for device in (ctrl, joy):
+            if device is not None and not any(device is held for held in registered):
+                _quit_quietly(device)
+
+    def _close_device(self, key: int) -> None:
+        """Close one device and drop all of its per-device state."""
+        _quit_quietly(self.controllers.get(key))
+        _quit_quietly(self.joysticks.get(key))
+        self.joysticks = {k: v for k, v in self.joysticks.items() if k != key}
+        self.controllers = {k: v for k, v in self.controllers.items() if k != key}
+        with self._capabilities_lock:
+            self.capabilities = {k: v for k, v in self.capabilities.items() if k != key}
+        self._prune_device_state(keep=set(self.joysticks))
+
+    def _apply_hotplug(self) -> None:
+        """Match the open devices to SDL's device list by instance id.
+
+        A device SDL no longer lists is closed, a listed id not yet open is
+        opened, and a device that stayed attached is left alone. That also makes
+        SDL's announcement of the devices attached at startup a no-op. Without
+        the instance-id lookup the open set can't be matched, so it is rebuilt.
+        """
+        try:
+            if not _instance_id_lookup_available():
+                self._detect_controllers(force=True)
+                return
+            old_count = len(self.joysticks)
+            listed = {i: _device_instance_id(i) for i in range(pygame.joystick.get_count())}
+            for key in [k for k in self.joysticks if k not in listed.values()]:
+                self._close_device(key)
+            opened = []
+            for device_index, instance_id in listed.items():
+                if instance_id is None or instance_id in self.joysticks:
+                    continue
+                device = self._open_device(device_index, held=self.joysticks)
+                if device is not None:
+                    opened.append(device)
+            self._adopt(opened)
+            new_count = len(self.joysticks)
+            if new_count > old_count:
+                logger.info("Controllers connected: %s -> %s", old_count, new_count)
+            elif new_count < old_count:
+                logger.info("Controllers disconnected: %s -> %s", old_count, new_count)
+        except pygame.error as e:
+            logger.error("Error applying controller hotplug: %s", e)
+
+    def _apply_deadzone(self, value: float) -> float:
+        """Deadzone + response curve for a raw stick value (shared with the 3D mouse)."""
+        return shape_axis(value, self.deadzone, self.curve)
+
+    def _apply_curve(self, value: float) -> float:
+        """Response curve for a normalised magnitude in [0, 1] (shared helper)."""
+        return apply_curve(value, self.curve)
+
+    @staticmethod
+    def _normalize_controller_axis(value: int, *, trigger: bool = False) -> float:
+        """Normalize SDL controller axis values to [-1, 1] or [0, 1] for triggers."""
+        if trigger:
+            return max(0.0, min(1.0, float(value) / 32768.0))
+        return max(-1.0, min(1.0, float(value) / 32768.0))
+
+    def _read_axes_from_controller(self, controller: ControllerProtocol) -> tuple[float, float, float]:
+        """
+        Read standardized SDL controller axes and return (dx, dy, dz) movement deltas.
+
+        Configurable stick (left or right) controls X/Y. Z comes from triggers separately.
+        """
+        if self._move_xy_stick == "right":
+            ax_x, ax_y = CONTROLLER_AXIS_RIGHTX, CONTROLLER_AXIS_RIGHTY
+        else:
+            ax_x, ax_y = CONTROLLER_AXIS_LEFTX, CONTROLLER_AXIS_LEFTY
+        stick_x = self._apply_deadzone(self._normalize_controller_axis(controller.get_axis(ax_x)))
+        stick_y = self._apply_deadzone(self._normalize_controller_axis(controller.get_axis(ax_y)))
+
+        if self.invert_y:
+            return (stick_x, stick_y, 0.0)
+        return (stick_x, -stick_y, 0.0)
+
+    def _read_axes_from_joystick(self, joystick: JoystickProtocol) -> tuple[float, float, float]:
+        """
+        Read raw joystick axes and return (dx, dy, dz) movement deltas.
+
+        Configurable stick (left or right) controls X/Y. Z comes from triggers separately.
+        """
+        num_axes = joystick.get_numaxes()
+        if self._move_xy_stick == "right":
+            x_idx, y_idx = 2, 3
+        else:
+            x_idx, y_idx = 0, 1
+        if num_axes <= max(x_idx, y_idx):
+            return (0.0, 0.0, 0.0)
+
+        stick_x = self._apply_deadzone(joystick.get_axis(x_idx))
+        stick_y = self._apply_deadzone(joystick.get_axis(y_idx))
+
+        if self.invert_y:
+            return (stick_x, stick_y, 0.0)
+        return (stick_x, -stick_y, 0.0)
+
+    def _read_axes(self, controller_idx: int, joystick: JoystickProtocol) -> tuple[float, float, float]:
+        """Read movement axes from the best available backend for a controller."""
+        try:
+            controller = self.controllers.get(controller_idx)
+            if controller is not None:
+                return self._read_axes_from_controller(controller)
+            return self._read_axes_from_joystick(joystick)
+        except pygame.error as e:
+            logger.warning("Error reading axes from gamepad instance %s: %s", controller_idx, e)
+            return (0.0, 0.0, 0.0)
+
+    def _update_stick_priming(self, controller_idx: int, dx: float, dy: float, fader: float = 0.0) -> bool:
+        """Return whether this pad's stick deflection is trustworthy yet.
+
+        A pad opened after a restart can report a stale axis value before the OS
+        delivers its first centering event; without a rest reference that phantom
+        slides the marker into a corner. The first in-deadzone reading proves the
+        axis is live and centered, so deflection before that is discarded. A
+        trigger-style ``current - baseline`` delta is unsuitable here because a
+        spring-centered stick would then mis-zero a held position. Pads injected
+        directly (no ``_detect_controllers``) default to primed. ``fader`` is the
+        marker-fader stick, which is never the movement stick.
+        """
+        if controller_idx not in self._stick_unprimed:
+            return True
+        if dx == 0.0 and dy == 0.0 and fader == 0.0:
+            self._stick_unprimed.discard(controller_idx)
+            return True
+        return False
+
+    def _read_marker_fader_deflection(
+        self,
+        controller_idx: int,
+        joystick: JoystickProtocol,
+    ) -> float:
+        """Read the configured marker-fader stick Y axis.
+
+        Returns the deflection in the range ``[-1, 1]`` where ``+1`` means
+        "stick pushed up" – the operator's intuitive direction for raising
+        a fader. Stick Y is conventionally ``+1 = down`` on every backend
+        we support, so the raw value is negated before returning.
+
+        ``invert_y`` is *not* applied here. ``invert_y`` flips the stick's Y
+        axis only (not X, and not Z – height comes from the triggers) for
+        operators who prefer flight-style camera control; that preference
+        doesn't naturally map to fader semantics, where "stick up = fader up"
+        is universal regardless of how the operator's brain models marker
+        movement.
+
+        Returns ``0.0`` when no stick is configured, when the chosen
+        axis index is past the joystick's reported axis count (raw
+        joystick path only – SDL2 controllers always have all four),
+        or when the deflection lands inside the deadzone.
+        """
+        if not self._marker_fader_stick:
+            return 0.0
+        try:
+            controller = self.controllers.get(controller_idx)
+            if controller is not None:
+                ax = CONTROLLER_AXIS_LEFTY if self._marker_fader_stick == "left_y" else CONTROLLER_AXIS_RIGHTY
+                raw = self._normalize_controller_axis(controller.get_axis(ax))
+            else:
+                idx = 1 if self._marker_fader_stick == "left_y" else 3
+                if joystick.get_numaxes() <= idx:
+                    return 0.0
+                raw = joystick.get_axis(idx)
+        except pygame.error as e:
+            logger.warning(
+                "Error reading marker-fader axis from gamepad instance %s: %s",
+                controller_idx,
+                e,
+            )
+            return 0.0
+        return -self._apply_deadzone(raw)
+
+    @staticmethod
+    def _read_button_state(joystick: JoystickProtocol, button_idx: int) -> bool:
+        """Safely read a digital button state."""
+        if button_idx < 0 or button_idx >= joystick.get_numbuttons():
+            return False
+        return bool(joystick.get_button(button_idx))
+
+    def _read_any_button_state(
+        self,
+        joystick: JoystickProtocol,
+        button_indices: tuple[int, ...],
+    ) -> bool:
+        """Return True if any candidate button index is currently pressed."""
+        return any(self._read_button_state(joystick, idx) for idx in button_indices)
+
+    def _update_speed_from_bumpers(
+        self,
+        controller_idx: int,
+        joystick: JoystickProtocol,
+    ) -> None:
+        """
+        Detect speed button press edges and adjust move speed.
+
+        Uses configurable btn_speed_down / btn_speed_up buttons
+        (default LB/RB). Triggers are used for height.
+        """
+        down_pressed = self._get_button(controller_idx, self._btn_speed_down_id)
+        up_pressed = self._get_button(controller_idx, self._btn_speed_up_id)
+        # Raw joystick fallback: when no detection remap exists for the
+        # shoulder buttons, the SDL2 default IDs (9/10) won't match
+        # the raw joystick layout (typically 4/5).  Only apply this
+        # fallback when using the default LB/RB buttons AND no remap
+        # has been set for them (i.e. wizard hasn't been run).
+        is_raw = self.controllers.get(controller_idx) is None
+        if is_raw and not down_pressed:
+            if (
+                self._btn_speed_down_id == CONTROLLER_BUTTON_LEFTSHOULDER
+                and CONTROLLER_BUTTON_LEFTSHOULDER not in self._button_remap
+                and CONTROLLER_BUTTON_LEFTSHOULDER not in self._raw_button_remap
+            ):
+                down_pressed = self._read_any_button_state(joystick, BUMPER_LEFT_BUTTON_INDICES)
+        # pragma: no branch – symmetrical to the down-pressed bumper
+        # fallback above; both arms are exercised by the down-bumper
+        # tests (raw vs SDL2 controller path) and a controller layout
+        # where ``btn_speed_up_id`` differs from RIGHTSHOULDER would
+        # bypass this block entirely.
+        if is_raw and not up_pressed:  # pragma: no branch
+            if (
+                self._btn_speed_up_id == CONTROLLER_BUTTON_RIGHTSHOULDER
+                and CONTROLLER_BUTTON_RIGHTSHOULDER not in self._button_remap
+                and CONTROLLER_BUTTON_RIGHTSHOULDER not in self._raw_button_remap
+            ):
+                up_pressed = self._read_any_button_state(joystick, BUMPER_RIGHT_BUTTON_INDICES)
+
+        prev_down, prev_up = self._bumper_state.get(controller_idx, (False, False))
+
+        # Route speed adjustment to the marker this pad controls via resolver; None = unbound/no-op.
+        if self._marker_resolver is None:
+            marker_id: int | None = None
+            is_explicitly_unbound = False
+        else:
+            marker_id = self._marker_resolver(controller_idx)
+            is_explicitly_unbound = marker_id is None
+        if not is_explicitly_unbound:
+            if down_pressed and not prev_down:
+                self.app.adjust_move_speed(-1, marker_id=marker_id)
+            if up_pressed and not prev_up:
+                self.app.adjust_move_speed(+1, marker_id=marker_id)
+
+        self._bumper_state[controller_idx] = (down_pressed, up_pressed)
+
+    def _read_trigger_height(
+        self,
+        controller_idx: int,
+        joystick: JoystickProtocol,
+    ) -> float:
+        """
+        Read Z movement buttons/triggers and return a velocity component in [-1, 1].
+
+        btn_move_z_down = down (negative Z), btn_move_z_up = up (positive Z).
+        When mapped to LT/RT (default), reads analog triggers proportionally.
+        When mapped to a regular button, returns digital 0.0 or 1.0.
+        """
+        z_down = self._read_z_input(controller_idx, joystick, self._btn_move_z_down_id, is_lt=True)
+        z_up = self._read_z_input(controller_idx, joystick, self._btn_move_z_up_id, is_lt=False)
+
+        # Apply deadzone
+        if z_down < TRIGGER_DEADZONE:
+            z_down = 0.0
+        if z_up < TRIGGER_DEADZONE:
+            z_up = 0.0
+
+        return z_up - z_down
+
+    def _read_z_input(
+        self,
+        controller_idx: int,
+        joystick: JoystickProtocol,
+        button_id: int,
+        is_lt: bool,
+    ) -> float:
+        """Read a Z axis input as analog [0, 1] for triggers or digital for buttons."""
+        if button_id in (BUTTON_ID_LT, BUTTON_ID_RT):
+            # Analog trigger – read proportional value
+            use_lt = button_id == BUTTON_ID_LT
+            if self._swap_triggers:
+                use_lt = not use_lt
+            controller = self.controllers.get(controller_idx)
+            if controller is not None:
+                if joystick.get_numaxes() > 4:
+                    axis = CONTROLLER_AXIS_TRIGGERLEFT if use_lt else CONTROLLER_AXIS_TRIGGERRIGHT
+                    return self._normalize_controller_axis(controller.get_axis(axis), trigger=True)
+                else:
+                    indices = LT_DIGITAL_BUTTON_INDICES if use_lt else RT_DIGITAL_BUTTON_INDICES
+                    return 1.0 if self._read_any_button_state(joystick, indices) else 0.0
+            else:
+                indices = LT_AXIS_INDICES if use_lt else RT_AXIS_INDICES
+                return self._read_trigger_axis_value(controller_idx, joystick, indices)
+        # Regular button – digital on/off
+        return 1.0 if self._get_button(controller_idx, button_id) else 0.0
+
+    def _read_trigger_axis_value(
+        self,
+        controller_idx: int,
+        joystick: JoystickProtocol,
+        axis_indices: tuple[int, ...],
+    ) -> float:
+        """Read trigger axis value [0, 1] from raw joystick fallback, using baseline delta."""
+        best = 0.0
+        per_controller = self._shoulder_axis_baselines.setdefault(controller_idx, {})
+        for axis_idx in axis_indices:
+            if axis_idx < 0 or axis_idx >= joystick.get_numaxes():
+                continue
+            baseline = per_controller.get(axis_idx)
+            current = joystick.get_axis(axis_idx)
+            if baseline is None:
+                per_controller[axis_idx] = current
+                continue
+            delta = current - baseline
+            value = max(0.0, min(1.0, delta))
+            if value > best:
+                best = value
+        return best
+
+    def _get_button(self, controller_idx: int, button_id: int) -> bool:
+        """Read a button state from SDL controller or raw joystick.
+
+        Applies the detection remap so mislabeled controllers
+        report the correct logical button.
+
+        Unbound actions (``BUTTON_ID_UNBOUND`` or other non-LT/RT negative
+        ids – e.g. the legacy ``-1`` used for ``btn_toggle_zones``) always
+        read as released so dispatch code can stay oblivious to whether the
+        user cleared the binding.
+
+        Sentinel IDs BUTTON_ID_LT / BUTTON_ID_RT are handled by
+        reading the trigger axis and treating deflection past the
+        deadzone as a digital press.
+
+        Hat sentinel IDs (HAT_UP/DOWN/LEFT/RIGHT) are handled by
+        reading ``joystick.get_hat()`` – used when the button
+        detection wizard found D-Pad on a hat rather than buttons.
+        Hat sentinels only appear after the remap lookup below.
+
+        When frame snapshot is active, reads are memoised to share one hardware read per button/frame.
+        """
+        states = self._frame_button_states
+        if states is not None:
+            cached = states.get((controller_idx, button_id))
+            if cached is not None:
+                return cached
+            value = self._read_button_uncached(controller_idx, button_id)
+            states[(controller_idx, button_id)] = value
+            return value
+        return self._read_button_uncached(controller_idx, button_id)
+
+    def _read_button_uncached(self, controller_idx: int, button_id: int) -> bool:
+        """Live button read, bypassing the per-frame snapshot. See
+        :meth:`_get_button` for the remap / trigger / hat semantics."""
+        if button_id < 0 and button_id not in (BUTTON_ID_LT, BUTTON_ID_RT):
+            return False
+        if button_id in (BUTTON_ID_LT, BUTTON_ID_RT):
+            return self._get_trigger_as_button(controller_idx, button_id)
+        controller = self.controllers.get(controller_idx)
+        if controller is not None:
+            # SDL2 controller path: use the SDL2-logical remap (built
+            # from ``map_*`` fields). The raw-index remap MUST NOT
+            # apply here – SDL2 expects logical IDs, and feeding it a
+            # raw hardware index would silently misread.
+            sdl_id = self._button_remap.get(button_id, button_id)
+            if sdl_id in (HAT_UP, HAT_DOWN, HAT_LEFT, HAT_RIGHT):
+                joystick = self.joysticks.get(controller_idx)
+                if joystick is not None:
+                    return self._read_hat_direction(joystick, sdl_id)
+                return False
+            return bool(controller.get_button(sdl_id))
+        # Raw joystick path: use the raw-index remap (built from
+        # ``button_raw_indices``). The SDL2-logical remap is also
+        # consulted as a fallback for hosts that don't have wizard
+        # raw_indices captured (older configs).
+        raw_id = self._raw_button_remap.get(button_id)
+        if raw_id is None:
+            raw_id = self._button_remap.get(button_id, button_id)
+        if raw_id in (HAT_UP, HAT_DOWN, HAT_LEFT, HAT_RIGHT):
+            joystick = self.joysticks.get(controller_idx)
+            if joystick is not None:
+                return self._read_hat_direction(joystick, raw_id)
+            return False
+        joystick = self.joysticks.get(controller_idx)
+        if joystick is not None:
+            return self._read_button_state(joystick, raw_id)
+        return False
+
+    @staticmethod
+    def _read_hat_direction(
+        joystick: JoystickProtocol,
+        hat_sentinel: int,
+    ) -> bool:
+        """Return True if the hat direction indicated by *hat_sentinel* is active."""
+        for hat_idx in range(joystick.get_numhats()):
+            hx, hy = joystick.get_hat(hat_idx)
+            if hat_sentinel == HAT_UP and hy > 0:
+                return True
+            if hat_sentinel == HAT_DOWN and hy < 0:
+                return True
+            if hat_sentinel == HAT_LEFT and hx < 0:
+                return True
+            if hat_sentinel == HAT_RIGHT and hx > 0:
+                return True
+        return False
+
+    def _get_trigger_as_button(self, controller_idx: int, button_id: int) -> bool:
+        """Read an analog trigger axis and return True if past threshold."""
+        joystick = self.joysticks.get(controller_idx)
+        if joystick is None:
+            return False
+        is_left = button_id == BUTTON_ID_LT
+        controller = self.controllers.get(controller_idx)
+        if controller is not None:
+            axis = CONTROLLER_AXIS_TRIGGERLEFT if is_left else CONTROLLER_AXIS_TRIGGERRIGHT
+            if self._swap_triggers:
+                axis = CONTROLLER_AXIS_TRIGGERRIGHT if is_left else CONTROLLER_AXIS_TRIGGERLEFT
+            val = self._normalize_controller_axis(controller.get_axis(axis), trigger=True)
+        else:
+            indices = LT_AXIS_INDICES if is_left else RT_AXIS_INDICES
+            # pragma: no branch – swap_triggers is a config-driven
+            # flag that the existing trigger-swap tests cover at the
+            # SDL2 path one branch up; the raw-axis path's swap arm
+            # is symmetrical and hit only when SDL2 isn't initialised.
+            if self._swap_triggers:  # pragma: no branch
+                indices = RT_AXIS_INDICES if is_left else LT_AXIS_INDICES
+            val = self._read_trigger_axis_value(controller_idx, joystick, indices)
+        return val > TRIGGER_DEADZONE
+
+    def _detect_button_edge(self, controller_idx: int, button_id: int) -> bool:
+        """Return True on rising edge (was released, now pressed)."""
+        current = self._get_button(controller_idx, button_id)
+        prev_map = self._button_prev.setdefault(controller_idx, {})
+        was_pressed = prev_map.get(button_id, False)
+        prev_map[button_id] = current
+        return current and not was_pressed
+
+    def get_effective_speed(self, controller_idx: int) -> float:
+        """Get effective gamepad move speed in m/s; resolves routed marker's override or default."""
+        if self._marker_resolver is None:
+            return self.app._config.marker.move_speed
+        marker_id = self._marker_resolver(controller_idx)
+        return self.app.get_marker_move_speed(marker_id)
+
+    def get_controller_effective_speeds(self) -> dict[int, float]:
+        """Get effective move speed in m/s for currently connected controllers."""
+        return {idx: self.get_effective_speed(idx) for idx in self.joysticks}
+
+    def _identity_matches_calibration(self, cap: ControllerCapabilities) -> bool:
+        """Whether ``cap`` matches the stored calibration identity.
+
+        GUID is the strong signal: it identifies the model and its hardware
+        mode, not the unit, so two pads of one model match alike. The name is
+        the fallback for calibrations saved before a GUID was recorded. With no
+        calibration on file there's nothing to mismatch, so everything matches.
+        """
+        if not self._is_calibrated:
+            return True
+        if self._mapped_controller_guid:
+            return cap.guid == self._mapped_controller_guid
+        if self._mapped_controller_name:
+            return cap.name == self._mapped_controller_name
+        # Calibrated via raw indices only (no identity recorded) – can't
+        # tell whether the pad matches, so don't cry mismatch.
+        return True
+
+    def controller_notes(self, cap: ControllerCapabilities) -> tuple[str, ...]:
+        """What the Controller Slots row says this pad can't do, in display order."""
+        notes: list[str] = []
+        if not self._is_calibrated and cap.backend == "joystick":
+            notes.append(NOTE_BUTTONS_UNRECOGNISED)
+        elif not self._identity_matches_calibration(cap):
+            notes.append(NOTE_BUTTON_MAP_OTHER_MODEL)
+        # Rumble is the only thing Identify can pulse on a pad.
+        if cap.can_rumble is False:
+            notes.append(NOTE_CANNOT_IDENTIFY)
+        return tuple(notes)
+
+    def runtime_snapshot(self) -> list[ControllerRuntimeInfo]:
+        """Live per-controller snapshot for the diagnostics bundle and the
+        calibration-mismatch check. Ordered by controller index for stable
+        bundle output."""
+        # Copy under the lock so we never iterate while the main thread
+        # rebuilds/cleans up ``capabilities`` (RuntimeError: dict changed size).
+        with self._capabilities_lock:
+            caps = dict(self.capabilities)
+        snapshot: list[ControllerRuntimeInfo] = []
+        for idx in sorted(caps):
+            cap = caps[idx]
+            snapshot.append(
+                ControllerRuntimeInfo(
+                    index=idx,
+                    backend=cap.backend,
+                    name=cap.name,
+                    guid=cap.guid,
+                    num_axes=cap.num_axes,
+                    num_buttons=cap.num_buttons,
+                    num_hats=cap.num_hats,
+                    is_game_controller=(cap.backend == "sdl2_controller"),
+                    matches_calibration=self._identity_matches_calibration(cap),
+                    calibration_stored=self._is_calibrated,
+                    port_key=cap.port_key,
+                )
+            )
+        return snapshot
+
+    def _warn_if_calibration_mismatch(self, idx: int) -> None:
+        """Log once per controller GUID when a connected pad doesn't match the
+        stored calibration – the signal behind the diagnostics-bundle flag and
+        the most common cause of "a button won't bind" reports."""
+        cap = self.capabilities.get(idx)
+        if cap is None or self._identity_matches_calibration(cap):
+            return
+        # De-dup per controller model. GUID is the natural key; fall back to the
+        # name when it's empty. Not the key: the instance id changes on every
+        # reconnect, so it would re-warn on each replug.
+        warn_key = cap.guid or f"name:{cap.name}"
+        if warn_key in self._calibration_warned:
+            return
+        self._calibration_warned.add(warn_key)
+        logger.warning(
+            "Gamepad instance %s (%r, GUID %s) does not match the saved button "
+            "mapping (%r, GUID %s). The stored calibration may misbehave – "
+            "re-run the button-detection wizard. If this is an Xbox-style "
+            "pad on the raw-joystick backend (%s), switch it to X-input mode "
+            "first.",
+            idx,
+            cap.name,
+            cap.guid,
+            self._mapped_controller_name,
+            self._mapped_controller_guid,
+            cap.backend,
+        )
+
+    def _pump_events(self) -> None:
+        """Process pygame events; consume joystick events and re-post others."""
+        hotplug = False
+        for event in pygame.event.get():
+            if event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
+                hotplug = True
+            # SDL posts the game-controller hotplug events alongside the
+            # joystick ones for the same device, so they are consumed, not
+            # acted on.
+            elif event.type not in (
+                pygame.JOYAXISMOTION,
+                pygame.JOYBUTTONDOWN,
+                pygame.JOYBUTTONUP,
+                pygame.JOYHATMOTION,
+                *CONTROLLER_EVENT_TYPES,
+            ):
+                pygame.event.post(event)
+        if hotplug:
+            self._apply_hotplug()
+
+    def _cleanup_failed(self, to_remove: list[int]) -> None:
+        """Close controllers that errored during polling."""
+        for key in to_remove:
+            self._close_device(key)
+
+    def update(self, dt: float) -> GamepadUpdate:
+        """
+        Update controller state and return movements + reset signals.
+
+        Returns:
+            GamepadUpdate with movements (controller_index -> (dx, dy, dz) in m/s)
+            and resets (set of controller indices that pressed X).
+        """
+        if not self.enabled:
+            return GamepadUpdate()
+
+        # Startup retry: if no controllers and retry time remaining, periodically re-scan
+        # pragma: no branch – the False-arm of the retry-active guard
+        # is the steady-state hot loop that the existing update tests
+        # cover; the True arm is exercised by the explicit
+        # ``test_update_startup_retry_*`` cases.
+        if self._startup_retry_remaining > 0 and not self.joysticks:  # pragma: no branch
+            self._startup_retry_timer += dt
+            if self._startup_retry_timer >= self._STARTUP_RETRY_INTERVAL:
+                self._startup_retry_timer = 0.0
+                self._startup_retry_remaining -= self._STARTUP_RETRY_INTERVAL
+                logger.info(
+                    "Retrying controller detection (%.0fs remaining)...",
+                    max(0, self._startup_retry_remaining),
+                )
+                # Re-init pygame joystick subsystem to pick up devices that appeared late
+                pygame.joystick.quit()
+                pygame.joystick.init()
+                if sdl2_controller is not None:
+                    try:
+                        sdl2_controller.quit()
+                        # pragma: no cover – both ``quit()`` AND
+                        # ``init()`` succeeding inside the retry tick
+                        # is unreachable: the existing test forces ``quit``
+                        # to raise so the init is never reached; reaching it
+                        # requires both calls to succeed inside the retry tick,
+                        # a state the SDL2 reset doesn't reliably produce.
+                        sdl2_controller.init()  # pragma: no cover
+                    except pygame.error:
+                        pass
+                self._detect_controllers(force=True)
+                if self.joysticks:
+                    logger.info("Controller(s) detected after retry!")
+                    self._startup_retry_remaining = 0.0  # Stop retrying
+                elif self._startup_retry_remaining <= 0:
+                    logger.warning(
+                        "No controllers found after startup retry period. "
+                        "Connect a controller and it will be detected via hotplug."
+                    )
+
+        self._pump_events()
+
+        # Activate the per-frame button snapshot: the action edge-detectors
+        # and the bus emitter below then share one hardware read per
+        # ``(controller, button)`` instead of each re-reading every
+        # button. Reset in ``finally`` so a partially-built frame never leaks
+        # cached reads into the next poll (a menu poller, or a later frame).
+        self._frame_button_states = {}
+        try:
+            result = self._poll_and_emit(dt)
+            self._note_held_buttons(self._frame_button_states)
+            return result
+        finally:
+            self._frame_button_states = None
+
+    def _note_held_buttons(self, frame_buttons: Mapping[tuple[int, int], bool]) -> None:
+        """A button held this frame counts as use, taken from the frame's own reads."""
+        now = self._clock()
+        for (controller_idx, _button_id), pressed in frame_buttons.items():
+            if pressed and controller_idx in self.joysticks:
+                self._last_input[controller_idx] = now
+
+    def _poll_and_emit(self, dt: float) -> GamepadUpdate:
+        """Poll movement + action edges for every controller and emit bus
+        button events for one frame. Runs with ``_frame_button_states``
+        active (see :meth:`update`), so every ``_get_button`` read this frame
+        is memoised and shared across the action and bus edge-detectors.
+
+        ``dt`` is the frame delta, used by the marker-fader integrator."""
+        result = GamepadUpdate()
+        to_remove: list[int] = []
+
+        for controller_idx, joystick in self.joysticks.items():
+            try:
+                # One-time axis dump to diagnose controller mapping
+                if controller_idx not in self._axes_logged:
+                    self._axes_logged.add(controller_idx)
+                    num_axes = joystick.get_numaxes()
+                    raw = {i: round(joystick.get_axis(i), 3) for i in range(num_axes)}
+                    ctrl = self.controllers.get(controller_idx)
+                    # Diagnostic dump only – values are either the rounded
+                    # axis float or the literal string "err" when the
+                    # SDL2 controller raised. Mixed-type dict.
+                    sdl_axes: dict[str, float | str] = {}
+                    if ctrl is not None:
+                        for name, idx in (
+                            ("LEFTX", CONTROLLER_AXIS_LEFTX),
+                            ("LEFTY", CONTROLLER_AXIS_LEFTY),
+                            ("RIGHTX", CONTROLLER_AXIS_RIGHTX),
+                            ("RIGHTY", CONTROLLER_AXIS_RIGHTY),
+                            ("TRIG_L", CONTROLLER_AXIS_TRIGGERLEFT),
+                            ("TRIG_R", CONTROLLER_AXIS_TRIGGERRIGHT),
+                        ):
+                            try:
+                                sdl_axes[name] = round(self._normalize_controller_axis(ctrl.get_axis(idx)), 3)
+                            except pygame.error:
+                                sdl_axes[name] = "err"
+                    num_buttons = joystick.get_numbuttons()
+                    buttons = {i: joystick.get_button(i) for i in range(num_buttons)}
+                    logger.info(
+                        "Gamepad instance %s axis dump – raw axes: %s | SDL2 logical: %s | buttons: %s",
+                        controller_idx,
+                        raw,
+                        sdl_axes,
+                        buttons,
+                    )
+
+                self._update_speed_from_bumpers(controller_idx, joystick)
+
+                # Read left stick for X/Y
+                dx, dy, _ = self._read_axes(controller_idx, joystick)
+
+                # Discard a stale stick reading from a pad that hasn't centered
+                # since (re)detection, so a restart can't fling the marker.
+                fader_deflection = self._read_marker_fader_deflection(controller_idx, joystick)
+                stick_primed = self._update_stick_priming(controller_idx, dx, dy, fader_deflection)
+                if not stick_primed:
+                    dx = dy = 0.0
+                # Counted as use only once it can reach the marker.
+                if dx or dy:
+                    self._last_input[controller_idx] = self._clock()
+
+                # Normalize diagonal stick input to prevent faster diagonal movement
+                mag_xy = math.sqrt(dx * dx + dy * dy)
+                if mag_xy > 1.0:
+                    dx /= mag_xy
+                    dy /= mag_xy
+
+                # Read analog triggers for Z (height); disabled for controllers without them
+                dz = self._read_trigger_height(controller_idx, joystick)
+                if dz:
+                    self._last_input[controller_idx] = self._clock()
+
+                if dx != 0.0 or dy != 0.0 or dz != 0.0:
+                    move_speed = self.get_effective_speed(controller_idx)
+                    result.movements[controller_idx] = (
+                        dx * move_speed,
+                        dy * move_speed,
+                        dz * move_speed,
+                    )
+
+                # Marker-fader integrator. Push this controller's
+                # chosen-stick Y deflection into the fader of the marker
+                # this controller currently controls (resolved the same
+                # way movement/reset/speed are – single-gamepad via
+                # ``_selected_id``, multi-gamepad via fixed slot). The
+                # store is keyed by marker id, so multiple controllers
+                # never clobber each other and a single controller that
+                # switches its marker switches which fader it drives. A
+                # marker with no provisioned fader (resolver -> None, or
+                # not in controlled_marker_ids) is a clean no-op.
+                if (
+                    stick_primed
+                    and self._virtual_faders is not None
+                    and self._marker_fader_stick
+                    and self._marker_resolver is not None
+                ):
+                    if fader_deflection != 0.0:
+                        marker_id = self._marker_resolver(controller_idx)
+                        if marker_id is not None:
+                            delta = fader_deflection * dt / self._marker_fader_max_speed_s
+                            self._virtual_faders.set_marker_fader_from_velocity_delta(
+                                marker_id,
+                                delta,
+                            )
+
+                # Configurable button actions
+                if self._detect_button_edge(
+                    controller_idx,
+                    self._btn_reset_id,
+                ):
+                    result.resets.add(controller_idx)
+                if self._detect_button_edge(
+                    controller_idx,
+                    self._btn_toggle_help_id,
+                ):
+                    result.toggle_help_pressed = True
+                if self._detect_button_edge(controller_idx, self._btn_toggle_zones_id):
+                    result.toggle_zones_pressed = True
+                # Station-wide clear: any pad's edge fires it. No >= 0 guard –
+                # _get_button reads LT/RT as triggers and unbound as released.
+                if self._detect_button_edge(controller_idx, self._btn_clear_messages_id):
+                    result.clear_messages_pressed = True
+                # Multi-pad: suppress DPAD next/prev to avoid rotating shared
+                # _selected_id. Gamepad-scoped inner guard; the authoritative
+                # cross-device gate is InputManager.marker_cycle_active (which
+                # also catches a gamepad paired with a 3D mouse).
+                multi_pad = len(self.joysticks) > 1
+                if (
+                    self._detect_button_edge(
+                        controller_idx,
+                        self._btn_next_marker_id,
+                    )
+                    and not multi_pad
+                ):
+                    result.next_marker_pressed = True
+                if (
+                    self._detect_button_edge(
+                        controller_idx,
+                        self._btn_prev_marker_id,
+                    )
+                    and not multi_pad
+                ):
+                    result.prev_marker_pressed = True
+                if self._detect_button_edge(
+                    controller_idx,
+                    self._btn_settings_id,
+                ):
+                    result.settings_open_pressed = True
+
+            except pygame.error as e:
+                logger.warning(
+                    "Error reading gamepad instance %s, possibly disconnected: %s",
+                    controller_idx,
+                    e,
+                )
+                to_remove.append(controller_idx)
+
+        self._cleanup_failed(to_remove)
+        if self._event_bus is not None:
+            emit_to_remove = self._emit_button_events()
+            if emit_to_remove:
+                self._cleanup_failed(emit_to_remove)
+        return result
+
+    def _emit_button_events(self) -> list[int]:
+        """Walk every connected controller × every named button and
+        emit press / release :class:`ButtonEvent`s on edge transitions.
+
+        Uses a separate ``_button_bus_prev`` map so the existing
+        ``_detect_button_edge`` callers (speed bumpers, etc.) keep
+        their own state independent of the bus's edge detector – no
+        shared-state race between the two consumers.
+
+        Trigger axes (LT / RT) are exposed through ``_get_button``'s
+        synthetic IDs and emit alongside the digital buttons; the
+        deadzone in ``_get_button`` already handles axis-as-button
+        debouncing, so a slight analog flutter near the threshold
+        won't spam the bus.
+
+        Returns a list of controller indices that raised
+        :class:`pygame.error` mid-emission so the caller can route
+        them through the same ``_cleanup_failed`` path the main
+        ``update()`` loop uses. Without this guard a controller
+        that disconnects between the ``update()`` poll and the
+        emission walk would let the exception propagate up and break
+        the input loop.
+        """
+        from openfollow.input.events import ButtonEvent
+
+        # ``self._event_bus`` is narrowed by the caller; capture once
+        # so the loop body doesn't need to re-narrow on every emit.
+        bus = self._event_bus
+        if bus is None:  # pragma: no cover - defensive
+            return []
+        failed: list[int] = []
+        for controller_idx in tuple(self.joysticks):
+            prev = self._button_bus_prev.setdefault(controller_idx, {})
+            try:
+                for name, button_id in BUTTON_NAME_TO_ID.items():
+                    current = self._get_button(controller_idx, button_id)
+                    was_pressed = prev.get(button_id, False)
+                    if current and not was_pressed:
+                        bus.emit_button(
+                            ButtonEvent(
+                                button=name,
+                                controller_index=controller_idx,
+                                edge="press",
+                            )
+                        )
+                    elif not current and was_pressed:
+                        bus.emit_button(
+                            ButtonEvent(
+                                button=name,
+                                controller_index=controller_idx,
+                                edge="release",
+                            )
+                        )
+                    prev[button_id] = current
+            except pygame.error as e:
+                # Mid-frame disconnect during emission. Route the
+                # offender through the standard cleanup path so the
+                # input loop keeps running for the surviving
+                # controllers.
+                logger.warning(
+                    "Error emitting button events for gamepad instance %s, marking for cleanup: %s",
+                    controller_idx,
+                    e,
+                )
+                failed.append(controller_idx)
+        return failed
+
+    def read_source_selection_input(self) -> SourceSelectionInput:
+        """
+        Read gamepad input relevant to NDI source selection mode.
+
+        Pumps events, reads D-pad and buttons from all connected controllers.
+        Returns a SourceSelectionInput with edge-detected navigation inputs.
+        """
+        self._pump_events()
+
+        inp = SourceSelectionInput()
+        if not self.joysticks:
+            return inp
+
+        to_remove: list[int] = []
+        for controller_idx in tuple(self.joysticks):
+            try:
+                # Read every edge before folding any in - see
+                # ``read_settings_menu_input`` for what ``or`` costs here.
+                edges = {
+                    "up": self._detect_button_edge(controller_idx, CONTROLLER_BUTTON_DPAD_UP),
+                    "down": self._detect_button_edge(controller_idx, CONTROLLER_BUTTON_DPAD_DOWN),
+                    "confirm": self._detect_button_edge(controller_idx, self._btn_menu_confirm_id),
+                    "cancel": self._detect_button_edge(controller_idx, self._btn_menu_cancel_id),
+                }
+                inp.up_pressed = inp.up_pressed or edges["up"]
+                inp.down_pressed = inp.down_pressed or edges["down"]
+                inp.confirm_pressed = inp.confirm_pressed or edges["confirm"]
+                inp.cancel_pressed = inp.cancel_pressed or edges["cancel"]
+                # Refresh normal-mode button/bumper prev-state (update() is
+                # skipped while the picker is open) so closing it doesn't fire a
+                # spurious reset / settings-open / speed change.
+                self._sync_normal_mode_button_prev(controller_idx)
+            except pygame.error as e:
+                logger.warning("Error reading source selection input from gamepad instance %s: %s", controller_idx, e)
+                to_remove.append(controller_idx)
+
+        self._cleanup_failed(to_remove)
+
+        return inp
+
+    def read_settings_menu_input(self) -> SettingsMenuInput:
+        """Read gamepad input for the Settings menu overlay."""
+        self._pump_events()
+
+        inp = SettingsMenuInput()
+        if not self.joysticks:
+            return inp
+
+        to_remove: list[int] = []
+        for controller_idx in tuple(self.joysticks):
+            try:
+                # Every edge is read before any is folded in. Folding with
+                # ``or`` in place short-circuits past _detect_button_edge for
+                # the remaining controllers once one of them reports an edge,
+                # and that call is what advances the prev-state: a second pad
+                # holding the same button keeps a stale "was released" and
+                # fires the press a second time on the next frame, moving the
+                # cursor or editing the digit twice. The horizontals happen to
+                # escape it, because the sync below covers whatever
+                # btn_prev/next_marker are bound to - which is not a guarantee
+                # and never covered up, down or confirm.
+                edges = {
+                    "up": self._detect_button_edge(controller_idx, CONTROLLER_BUTTON_DPAD_UP),
+                    "down": self._detect_button_edge(controller_idx, CONTROLLER_BUTTON_DPAD_DOWN),
+                    "left": self._detect_button_edge(controller_idx, CONTROLLER_BUTTON_DPAD_LEFT),
+                    "right": self._detect_button_edge(controller_idx, CONTROLLER_BUTTON_DPAD_RIGHT),
+                    "confirm": self._detect_button_edge(controller_idx, self._btn_menu_confirm_id),
+                    "cancel": self._detect_button_edge(controller_idx, self._btn_menu_cancel_id),
+                }
+                inp.up_pressed = inp.up_pressed or edges["up"]
+                inp.down_pressed = inp.down_pressed or edges["down"]
+                inp.left_pressed = inp.left_pressed or edges["left"]
+                inp.right_pressed = inp.right_pressed or edges["right"]
+                inp.confirm_pressed = inp.confirm_pressed or edges["confirm"]
+                inp.cancel_pressed = inp.cancel_pressed or edges["cancel"]
+                self._sync_normal_mode_button_prev(controller_idx)
+            except pygame.error as e:
+                logger.warning("Error reading settings menu input from gamepad instance %s: %s", controller_idx, e)
+                to_remove.append(controller_idx)
+
+        self._cleanup_failed(to_remove)
+
+        return inp
+
+    def read_settings_toggle(self) -> bool:
+        """Edge on the Settings button, for closing an open screen.
+
+        Separate from ``settings_open_pressed`` in :meth:`update`, which only
+        runs on the HUD: while a screen is up, ``update()`` is skipped, so the
+        open path never sees this press. Reading it here consumes the edge,
+        which is also what stops the same press re-opening what it closed - the
+        prev-state is current by the time the operator is back on the HUD.
+
+        Reads every pad before returning rather than short-circuiting on the
+        first edge: ``_detect_button_edge`` is what advances prev-state, and a
+        pad skipped here keeps a stale "was released" that fires again next
+        frame.
+        """
+        self._pump_events()
+        if not self.joysticks:
+            return False
+        pressed = False
+        to_remove: list[int] = []
+        for controller_idx in tuple(self.joysticks):
+            try:
+                if self._detect_button_edge(controller_idx, self._btn_settings_id):
+                    pressed = True
+            except pygame.error as e:
+                logger.warning("Error reading settings toggle from gamepad instance %s: %s", controller_idx, e)
+                to_remove.append(controller_idx)
+        self._cleanup_failed(to_remove)
+        return pressed
+
+    def _sync_normal_mode_button_prev(self, controller_idx: int) -> None:
+        """Refresh edge-tracked state for normal-mode action buttons without dispatching.
+
+        While the Settings menu is open, ``update()`` is skipped, so these
+        buttons' prev-state would otherwise go stale and produce a spurious
+        rising edge on the first frame after the menu closes. Covers both
+        ``_button_prev`` (for `_detect_button_edge` actions) and
+        ``_bumper_state`` (for `_update_speed_from_bumpers`).
+        """
+        prev_map = self._button_prev.setdefault(controller_idx, {})
+        for btn_id in (
+            self._btn_reset_id,
+            self._btn_toggle_help_id,
+            self._btn_toggle_zones_id,
+            self._btn_clear_messages_id,
+            self._btn_next_marker_id,
+            self._btn_prev_marker_id,
+            self._btn_settings_id,
+        ):
+            prev_map[btn_id] = self._get_button(controller_idx, btn_id)
+        self._bumper_state[controller_idx] = (
+            self._get_button(controller_idx, self._btn_speed_down_id),
+            self._get_button(controller_idx, self._btn_speed_up_id),
+        )
+
+    def last_input(self) -> dict[int, float]:
+        """Instance id -> clock time of that pad's latest movement or held button."""
+        return dict(self._last_input)
+
+    def device_identities(self) -> dict[int, tuple[str | None, str, tuple[str, ...]]]:
+        """Instance id -> (port key, name, notes) of every open pad."""
+        with self._capabilities_lock:
+            caps = dict(self.capabilities)
+        return {
+            idx: (caps[idx].port_key, caps[idx].name, self.controller_notes(caps[idx]))
+            for idx in self.joysticks
+            if idx in caps
+        }
+
+    def identify(self, instance_id: int) -> bool:
+        """Rumble one pad so it can be picked out by hand; False if it can't rumble."""
+        joystick = self.joysticks.get(instance_id)
+        if joystick is None:
+            return False
+        try:
+            return bool(joystick.rumble(_IDENTIFY_STRENGTH, _IDENTIFY_STRENGTH, _IDENTIFY_MS))
+        except Exception:  # noqa: BLE001 - Identify is best-effort; any backend failure means "no pulse"
+            return False
+
+    def get_controller_info(self) -> list[dict[str, Any]]:
+        """Get info about connected controllers for HUD display.
+
+        Returns:
+            List of dicts with controller_index, name, connected,
+            marker_id (None, filled by InputManager), effective_speed, backend.
+        """
+        info: list[dict[str, Any]] = []
+        # Copied under the lock like every capabilities read; this runs on the
+        # main loop, which is also the only writer.
+        with self._capabilities_lock:
+            caps_by_idx = dict(self.capabilities)
+        for idx, joystick in self.joysticks.items():
+            caps = caps_by_idx.get(
+                idx,
+                ControllerCapabilities(backend="joystick"),
+            )
+            try:
+                name = joystick.get_name()
+                connected = True
+            except pygame.error:
+                name = "Unknown"
+                connected = False
+            info.append(
+                {
+                    "controller_index": idx,
+                    "name": name,
+                    "connected": connected,
+                    "marker_id": None,
+                    "effective_speed": self.get_effective_speed(idx),
+                    "backend": caps.backend,
+                }
+            )
+        return info
+
+    def stop(self) -> None:
+        """Release controller resources and pygame subsystems used by this handler."""
+        self.enabled = False
+        for device in (*self.controllers.values(), *self.joysticks.values()):
+            _quit_quietly(device)
+        self.controllers = {}
+        self.joysticks = {}
+        self._axes_logged.clear()
+        self._stick_unprimed.clear()
+        with self._capabilities_lock:
+            self.capabilities = {}
+        if sdl2_controller is not None and sdl2_controller.get_init():
+            sdl2_controller.quit()
+        # pragma: no branch – the False arms only fire when the
+        # subsystems were never initialised, which the existing stop
+        # tests cover via the SDL2-not-initialised path. The True
+        # arms are the normal teardown the rest of the suite exercises.
+        if pygame.joystick.get_init():  # pragma: no branch
+            pygame.joystick.quit()
+        if pygame.get_init():  # pragma: no branch
+            pygame.quit()

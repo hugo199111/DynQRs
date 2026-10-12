@@ -1,0 +1,248 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""Backend-agnostic network adapter trait + value types."""
+
+from __future__ import annotations
+
+import logging
+from abc import ABC, abstractmethod
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Literal
+
+logger = logging.getLogger(__name__)
+
+
+class Ipv4Method(str, Enum):
+    DHCP = "dhcp"
+    DHCP_WITH_MANUAL_ADDRESS = "dhcp_manual"
+    STATIC = "static"
+
+
+@dataclass(frozen=True)
+class NetworkInterface:
+    name: str
+    mac: str | None
+    kind: str | None
+    is_up: bool
+
+
+LOOPBACK_NAMES = frozenset({"lo", "lo0"})
+
+
+def is_loopback(iface: NetworkInterface) -> bool:
+    """Return True if interface is loopback (matches kind or well-known names)."""
+    if (iface.kind or "").lower() == "loopback":
+        return True
+    return iface.name in LOOPBACK_NAMES
+
+
+@dataclass(frozen=True)
+class Ipv4Config:
+    method: Ipv4Method
+    address: str | None = None
+    prefix: int | None = None
+    router: str | None = None
+    dns: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LeaseInfo:
+    address: str | None
+    prefix: int | None
+    router: str | None
+    dns: tuple[str, ...]
+    lease_seconds_remaining: int | None
+
+
+AddressSource = Literal["dhcp", "static", "link-local", "none"]
+
+
+def address_source_of(address: str | None, method: Ipv4Method) -> AddressSource:
+    """Where an address configured with *method* came from.
+
+    Derived rather than stored so the backends can't disagree about it.
+    ``link-local`` outranks the configured method: NM's DHCP fallback hands out
+    a 169.254 address while the profile still reads ``auto``, and that address
+    is the thing an operator needs told about.
+    """
+    from openfollow.network.validate import is_link_local
+
+    if not address:
+        return "none"
+    if is_link_local(address):
+        return "link-local"
+    # DHCP-with-manual-address counts as static: the address the operator
+    # sees is the one they typed, not one a server handed out.
+    if method in (Ipv4Method.STATIC, Ipv4Method.DHCP_WITH_MANUAL_ADDRESS):
+        return "static"
+    return "dhcp"
+
+
+class BackendReadError(RuntimeError):
+    """A read of the network backend failed; the message names the read and why."""
+
+
+@dataclass(frozen=True)
+class AddressSourceReading:
+    """One interface's IPv4 address and where it came from, as the backend reports it now.
+
+    ``unknown``: the backend read fine but did not set this address, so it
+    cannot say. ``unreadable``: a backend read failed. Both carry ``reason``.
+    """
+
+    name: str
+    address: str = ""
+    source: AddressSource | Literal["unknown", "unreadable"] = "none"
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class NetworkState:
+    interface: NetworkInterface
+    ipv4: Ipv4Config
+    lease: LeaseInfo | None
+
+    @property
+    def address_source(self) -> AddressSource:
+        """Where this interface's address came from, for operator display."""
+        return address_source_of(self.ipv4.address, self.ipv4.method)
+
+
+@dataclass(frozen=True)
+class VlanInterface:
+    name: str
+    parent: str
+    vlan_id: int
+
+
+@dataclass(frozen=True)
+class NetworkReading:
+    """Every interface but loopback, its state, and the VLAN links, read together.
+
+    An interface whose state could not be read is listed without one.
+    """
+
+    interfaces: tuple[NetworkInterface, ...] = ()
+    states: Mapping[str, NetworkState] = field(default_factory=dict)
+    vlans: tuple[VlanInterface, ...] = ()
+
+
+@dataclass(frozen=True)
+class ApplyResult:
+    ok: bool
+    message: str = ""
+    partial_failures: tuple[str, ...] = field(default_factory=tuple)
+
+    pending: bool = False
+    """The settings were saved but the interface never came up.
+
+    Distinct from ``partial_failures``, which means "activated, with caveats".
+    Callers must not treat a pending apply as reachable: there is no address
+    serving anything yet, so redirecting a browser at it lands on nothing.
+    Every backend that can persist settings without activating them has to set
+    this - the web layer keys the redirect and the banner on it."""
+
+
+VLAN_UNSUPPORTED_MESSAGE = "This network backend cannot create VLAN interfaces."
+DHCP_FQDN_UNSUPPORTED_MESSAGE = "This network backend cannot register a name by DHCP."
+
+
+class NetworkAdapter(ABC):
+    """Abstract adapter for reading/writing host network config."""
+
+    backend_name: str = "unknown"
+
+    @abstractmethod
+    def list_interfaces(self) -> list[NetworkInterface]:
+        """Return all physical/virtual network interfaces."""
+
+    @abstractmethod
+    def get_state(self, iface: str) -> NetworkState | None:
+        """Return current state for ``iface`` or ``None`` if unknown."""
+
+    def read_network(self) -> NetworkReading:
+        """Every interface, its state and the VLAN links, for a view listing them all.
+
+        Falls back quietly like ``list_interfaces`` / ``get_state``. This default
+        asks ``get_state`` per interface; a backend that can read them all at once
+        overrides it, so the view costs the same however many interfaces the
+        station has. A backend whose ``get_state`` reads through this must override it.
+        """
+        interfaces = tuple(i for i in self.list_interfaces() if not is_loopback(i))
+        states: dict[str, NetworkState] = {}
+        for iface in interfaces:
+            # One interface vanishing mid-read must not cost the rest of the list.
+            try:
+                state = self.get_state(iface.name)
+            except Exception:  # noqa: BLE001
+                logger.exception("Network state read failed for %s", iface.name)
+                continue
+            if state is not None:
+                states[iface.name] = state
+        try:
+            vlans = tuple(self.list_vlans())
+        except Exception:  # noqa: BLE001
+            logger.exception("VLAN list read failed")
+            vlans = ()
+        return NetworkReading(interfaces, states, vlans)
+
+    @abstractmethod
+    def apply_ipv4(self, iface: str, config: Ipv4Config) -> ApplyResult:
+        """Persist ``config`` to ``iface`` and bring the interface up."""
+
+    @abstractmethod
+    def renew_lease(self, iface: str) -> ApplyResult:
+        """Release + re-acquire the DHCP lease for ``iface``."""
+
+    def is_writable(self) -> bool:
+        """Return True if this adapter can mutate host state."""
+        return True
+
+    def set_dhcp_fqdn(self, fqdn: str, *, reconnect: bool = True) -> ApplyResult:
+        """Send ``fqdn`` as the DHCP client FQDN (option 81) on every interface, or the
+        hostname again when blank, and reconnect each one so its DHCP server sees it now.
+
+        Without ``reconnect`` only what differs is written, and each interface picks it
+        up at its next connect. Never prompts for a password: it runs in the background.
+        """
+        return ApplyResult(ok=False, message=DHCP_FQDN_UNSUPPORTED_MESSAGE)
+
+    def read_address_sources(self) -> list[AddressSourceReading] | None:
+        """Every non-loopback interface's address and its source, for diagnostics.
+
+        Unlike ``list_interfaces`` / ``get_state``, which fall back to a quiet
+        default so the network card keeps working, this keeps what failed:
+        raises :class:`BackendReadError` when the interface list cannot be
+        read, and reports an interface it could not read as ``unreadable``.
+        ``None``: this backend cannot say where an address came from.
+        """
+        return None
+
+    # ---- VLAN sub-interfaces --------------------------------------------
+    #
+    # Creating the link is the whole of the new work: once ``eth0.10`` exists
+    # it is an ordinary netdev, so listing, addressing and pinning it all run
+    # through the paths above unchanged. Backends that do not own links report
+    # unsupported here and the UI omits the controls entirely.
+
+    def supports_vlans(self) -> bool:
+        """Return True if this backend can create and remove VLAN links."""
+        return False
+
+    def list_vlans(self) -> list[VlanInterface]:
+        """Return the VLAN sub-interfaces this backend knows about."""
+        return []
+
+    def create_vlan(self, parent: str, vlan_id: int) -> ApplyResult:
+        """Create a ``<parent>.<vlan_id>`` VLAN link."""
+        return ApplyResult(ok=False, message=VLAN_UNSUPPORTED_MESSAGE)
+
+    def delete_vlan(self, name: str) -> ApplyResult:
+        """Remove the VLAN link named ``name``."""
+        return ApplyResult(ok=False, message=VLAN_UNSUPPORTED_MESSAGE)
+
+    def get_ipv6_state(self, iface: str) -> None:
+        """Stub for future IPv6 support."""
+        return None

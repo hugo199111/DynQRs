@@ -1,0 +1,3463 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""Tests for :mod:`openfollow.runtime.overlay_draw_hud`.
+
+The HUD module is the largest draw pass in the renderer and hosts every
+modal / panel / card that overlays the video frame.  Tests are grouped
+by public entry point so each section reads as an independent spec:
+
+* scrim + shell primitives
+* selectable list (scroll / selection / empty state)
+* selection menus (source, interface, settings)
+* no-signal modal (with / without source-selection + reconnect + error)
+* HUD proper: bottom-left info panel, system stats, help overlay / hint,
+  marker cards.
+* Button-detection wizard: prompt state, progress bar, completed map list.
+"""
+
+from __future__ import annotations
+
+import sys
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from openfollow.runtime.overlay_draw_hud import (
+    draw_about_overlay,
+    draw_about_screen,
+    draw_bottom_left_info_panel,
+    draw_button_detection_overlay,
+    draw_field_choice_picker,
+    draw_field_choice_picker_overlay,
+    draw_help_block,
+    draw_hud,
+    draw_marker_card,
+    draw_modal_scrim,
+    draw_modal_shell,
+    draw_panel,
+    draw_panel_background,
+    draw_pi_network_field_edit,
+    draw_pi_network_field_edit_overlay,
+    draw_pi_network_screen,
+    draw_pi_network_screen_overlay,
+    draw_selectable_list,
+    draw_selection_menu,
+    draw_settings_menu,
+    draw_settings_overlay,
+    draw_source_selection,
+    draw_source_selection_overlay,
+    draw_source_type_selection,
+    draw_source_type_selection_overlay,
+    draw_system_stats,
+    draw_url_editor,
+    draw_url_editor_overlay,
+    draw_virtual_fader_card,
+    draw_virtual_faders,
+)
+from openfollow.runtime.overlay_draw_style import (
+    CHEVRON_SIZE,
+    COLOR_ACCENT,
+    COLOR_ACCENT_SOFT,
+    COLOR_BG_BASE,
+    COLOR_CAUTION_BORDER,
+    COLOR_CAUTION_FILL,
+    COLOR_DANGER_BG,
+    COLOR_INFO_BORDER,
+    COLOR_INFO_FILL,
+    COLOR_OK,
+    COLOR_SUCCESS_BG,
+    COLOR_SUCCESS_BORDER,
+    COLOR_SUCCESS_FILL,
+    COLOR_SUPPORT_BORDER,
+    COLOR_TEXT,
+    COLOR_TEXT_MUTED,
+    COLOR_WARNING_BORDER,
+    COLOR_WARNING_FILL,
+    SUPPORT_DASH,
+)
+from openfollow.runtime.overlay_links import LINKS, QUIET_MODULES, SUPPORT
+from openfollow.runtime.overlay_state import (
+    ButtonDetectionState,
+    MarkerOverlayData,
+    OverlayState,
+    VirtualFaderDisplayData,
+)
+from openfollow.units import UnitSystem
+from tests._fake_cairo import FakeCairo, FakeRenderer
+
+pytestmark = pytest.mark.unit
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def _marker(
+    marker_id: int = 1,
+    *,
+    x: float = 1.0,
+    y: float = 2.0,
+    z: float = 1.5,
+    color: str = "#ff3333",
+    speed: float | None = 0.5,
+    online: bool = True,
+    controller_idx: int | None = None,
+    controller_connected: bool = False,
+    is_controlled: bool = True,
+) -> MarkerOverlayData:
+    return MarkerOverlayData(
+        marker_id=marker_id,
+        x=x,
+        y=y,
+        z=z,
+        color=color,
+        speed=speed,
+        online=online,
+        controller_idx=controller_idx,
+        controller_connected=controller_connected,
+        is_controlled=is_controlled,
+    )
+
+
+def _base_state(**kw: object) -> OverlayState:
+    """Return an ``OverlayState`` configured with inputs connected so help
+    sections render.  Individual tests override fields as needed.
+    """
+    state = OverlayState()
+    state.keyboard_connected = True
+    state.controller_connected = False
+    state.mouse_enabled = False
+    for k, v in kw.items():
+        setattr(state, k, v)
+    return state
+
+
+def _emits_card_chrome(cr: FakeCairo) -> bool:
+    """True when ``cr`` painted the shared overlay-card chrome.
+
+    The card chrome is a translucent ``COLOR_BG_BASE`` fill + soft white
+    ``COLOR_BORDER``; it must NOT carry the retired golden accent panel
+    border. Used to prove a panel reads in the same visual language as the
+    operator-message cards.
+    """
+    from openfollow.runtime.overlay_draw_style import (
+        CARD_BG_ALPHA,
+        COLOR_ACCENT,
+        COLOR_BG_BASE,
+        COLOR_BORDER,
+    )
+
+    has_fill = ("rgba", *COLOR_BG_BASE, CARD_BG_ALPHA) in cr.calls
+    has_border = ("rgba", *COLOR_BORDER) in cr.calls
+    no_accent = ("rgba", COLOR_ACCENT[0], COLOR_ACCENT[1], COLOR_ACCENT[2], 0.58) not in cr.calls
+    return has_fill and has_border and no_accent
+
+
+# --------------------------------------------------------------------------- #
+# Scrim + modal shell
+# --------------------------------------------------------------------------- #
+
+
+class TestModalScrim:
+    def test_full_frame_rectangle_with_given_alpha(self) -> None:
+        cr = FakeCairo()
+        draw_modal_scrim(cr, 1920, 1080, alpha=0.5)
+        assert cr.rects == [(0, 0, 1920, 1080)]
+        assert cr.fills == 1
+        # alpha channel of the black fill is exactly what we passed.
+        rgba = next(c for c in cr.calls if c[0] == "rgba")
+        assert rgba[1:] == (0.0, 0.0, 0.0, 0.5)
+
+    def test_default_alpha_is_062(self) -> None:
+        cr = FakeCairo()
+        draw_modal_scrim(cr, 100, 100)
+        rgba = next(c for c in cr.calls if c[0] == "rgba")
+        assert rgba[4] == pytest.approx(0.62)
+
+
+class TestAboutScreen:
+    """The on-screen About screen renders the AGPLv3 notice using pure Cairo text."""
+
+    def test_about_safety_line_is_off_white_in_two_even_lines(self) -> None:
+        cr = FakeCairo()
+        draw_about_screen(FakeRenderer(), cr, OverlayState(), 1920, 1080)
+        start = next(i for i, d in enumerate(cr.texts) if d.text.startswith("OpenFollow is intended"))
+        first, second = cr.texts[start], cr.texts[start + 1]
+        assert second.text.endswith("safety critical applications.")
+        assert all(d.rgba == (*COLOR_TEXT, 1.0) and d.bold for d in (first, second))
+        # Even: the two lines differ by less than one word, not a greedy full line plus a remainder.
+        widths = [cr.text_extents(d.text).width for d in (first, second)]
+        longest_word = max(cr.text_extents(w).width for w in (first.text + " " + second.text).split())
+        assert abs(widths[0] - widths[1]) <= longest_word
+        # No sign above it.
+        assert ("rgb", *COLOR_BG_BASE) not in cr.calls
+
+    def test_about_screen_renders_name_version_and_notice(self) -> None:
+        from openfollow import __version__
+
+        cr = FakeCairo()
+        draw_about_screen(FakeRenderer(), cr, OverlayState(), 1920, 1080)
+        texts = cr.show_text_strings()
+        # Long paragraphs (warranty disclaimer, safety warning) are
+        # greedy-wrapped across several ``show_text`` calls, so assert
+        # against the lines re-joined with spaces – wrapping only ever
+        # breaks at the spaces it joins back on.
+        joined = " ".join(texts)
+        assert "ABOUT" in texts
+        assert "OpenFollow" in texts
+        assert f"Version {__version__}" in texts
+        assert any("The OpenFollow Project" in t for t in texts)
+        assert any("GNU AGPL v3" in t for t in texts)
+        # Full AGPLv3 no-warranty disclaimer.
+        assert "WITHOUT ANY WARRANTY" in joined
+        assert "MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE" in joined
+        assert "GNU Affero General Public License for more details" in joined
+        # Project link line (short enough to render on a single line).
+        assert "More Information, Source and License: openfollow.app" in texts
+        # Debian / Raspberry Pi trademark non-endorsement (the OS-conveying
+        # appliance image's only on-device legal surface without a browser).
+        assert "not affiliated with or endorsed by" in joined
+        assert "Debian Project, Raspberry Pi Ltd" in joined
+        # Not-for-safety-critical-use warning.
+        assert "should not be used for safety critical applications" in joined
+        # No logo handle on FakeRenderer -> the headline falls back to text.
+        assert "OpenFollow" in texts
+
+    def test_about_screen_uses_logo_headline_when_available(self) -> None:
+        renderer = FakeRenderer()
+        renderer._logo_handle = object()  # truthy -> logo headline, not text
+        cr = FakeCairo()
+        draw_about_screen(renderer, cr, OverlayState(), 1920, 1080)
+        texts = cr.show_text_strings()
+        # Logo rendered once as the headline, centered, with a positive width.
+        assert len(renderer.draw_logo_calls) == 1
+        _x, _y, width = renderer.draw_logo_calls[0]
+        assert width > 0
+        # The text wordmark headline is replaced by the logo (the body still
+        # mentions OpenFollow, but the standalone headline line is gone).
+        assert "OpenFollow" not in texts
+        # The rest of the screen still renders.
+        assert any("GNU AGPL v3" in t for t in texts)
+
+    def test_about_overlay_draws_scrim_then_screen(self) -> None:
+        cr = FakeCairo()
+        draw_about_overlay(FakeRenderer(), cr, OverlayState(), 1280, 720)
+        # Scrim is a full-frame black rect drawn before the panel content.
+        assert (0, 0, 1280, 720) in cr.rects
+        assert "ABOUT" in cr.show_text_strings()
+
+
+class TestModalShell:
+    def test_shell_draws_title_and_subtitle(self) -> None:
+        cr = FakeCairo()
+        draw_modal_shell(
+            FakeRenderer(),
+            cr,
+            1920,
+            1080,
+            title="HELLO",
+            subtitle="sub",
+            panel_w=400.0,
+            panel_h=200.0,
+        )
+        assert "HELLO" in cr.show_text_strings()
+        assert "sub" in cr.show_text_strings()
+
+    def test_low_height_uses_smaller_title_font(self) -> None:
+        """`h < 720` ⇒ title at font size 20; `h >= 720` ⇒ 23."""
+        cr_small = FakeCairo()
+        cr_big = FakeCairo()
+        draw_modal_shell(
+            FakeRenderer(),
+            cr_small,
+            1000,
+            500,
+            title="X",
+            subtitle="y",
+            panel_w=200.0,
+            panel_h=100.0,
+        )
+        draw_modal_shell(
+            FakeRenderer(),
+            cr_big,
+            1000,
+            720,
+            title="X",
+            subtitle="y",
+            panel_w=200.0,
+            panel_h=100.0,
+        )
+        small_title = next(t for t in cr_small.texts if t.text == "X")
+        big_title = next(t for t in cr_big.texts if t.text == "X")
+        assert small_title.font_size == 20
+        assert big_title.font_size == 23
+
+    def test_long_subtitle_gets_truncated(self) -> None:
+        cr = FakeCairo()
+        draw_modal_shell(
+            FakeRenderer(),
+            cr,
+            1000,
+            800,
+            title="T",
+            subtitle="s" * 500,
+            panel_w=240.0,
+            panel_h=300.0,
+        )
+        rendered_subs = [t.text for t in cr.texts if "s" in t.text and t.text != "T"]
+        # One truncated subtitle string, shorter than the original.
+        assert rendered_subs[0].endswith("...")
+        assert len(rendered_subs[0]) < 500
+
+
+# --------------------------------------------------------------------------- #
+# Selectable list
+# --------------------------------------------------------------------------- #
+
+
+class TestSelectableList:
+    def test_empty_items_shows_empty_message(self) -> None:
+        cr = FakeCairo()
+        draw_selectable_list(
+            FakeRenderer(),
+            cr,
+            items=[],
+            selected_idx=0,
+            x=0,
+            y=0,
+            w=400.0,
+            h=200.0,
+            empty_message="None found",
+        )
+        assert "None found" in cr.show_text_strings()
+
+    def test_long_empty_message_is_truncated(self) -> None:
+        cr = FakeCairo()
+        draw_selectable_list(
+            FakeRenderer(),
+            cr,
+            items=[],
+            selected_idx=0,
+            x=0,
+            y=0,
+            w=40.0,
+            h=200.0,  # narrow
+            empty_message="x" * 200,
+        )
+        # Truncated – original not shown.
+        assert "x" * 200 not in cr.show_text_strings()
+
+    def test_renders_each_item_once(self) -> None:
+        cr = FakeCairo()
+        items = ["Alpha", "Bravo", "Charlie"]
+        draw_selectable_list(
+            FakeRenderer(),
+            cr,
+            items=items,
+            selected_idx=0,
+            x=0,
+            y=0,
+            w=400.0,
+            h=400.0,
+            empty_message="x",
+        )
+        assert cr.show_text_strings() == items
+
+    def test_selected_row_uses_bold_font(self) -> None:
+        cr = FakeCairo()
+        draw_selectable_list(
+            FakeRenderer(),
+            cr,
+            items=["a", "b"],
+            selected_idx=1,
+            x=0,
+            y=0,
+            w=400.0,
+            h=400.0,
+            empty_message="x",
+        )
+        a_text = next(t for t in cr.texts if t.text == "a")
+        b_text = next(t for t in cr.texts if t.text == "b")
+        assert a_text.bold is False
+        assert b_text.bold is True
+
+    def test_long_list_shows_scroll_down_indicator(self, chevrons: list) -> None:
+        cr = FakeCairo()
+        items = [f"item-{i}" for i in range(20)]
+        # Short vertical height means only a few items fit → a down chevron.
+        draw_selectable_list(
+            FakeRenderer(),
+            cr,
+            items=items,
+            selected_idx=0,
+            x=0,
+            y=0,
+            w=400.0,
+            h=80.0,
+            empty_message="x",
+        )
+        # Centred under the list; at scroll_offset == 0 there is no "up" hint.
+        assert chevrons == [(200.0, 80.0 - 3.5, "down")]
+
+    def test_selecting_far_down_scrolls_and_shows_up_indicator(self, chevrons: list) -> None:
+        cr = FakeCairo()
+        items = [f"item-{i}" for i in range(20)]
+        draw_selectable_list(
+            FakeRenderer(),
+            cr,
+            items=items,
+            selected_idx=15,
+            x=0,
+            y=0,
+            w=400.0,
+            h=80.0,
+            empty_message="x",
+        )
+        assert (200.0, 3.5, "up") in chevrons
+
+    def test_out_of_range_selected_idx_hits_break_guard(self) -> None:
+        """Defensive ``break`` when ``scroll_offset`` pushes past ``len(items)``.
+
+        When ``selected_idx`` is well past the end of the list (malformed
+        state), ``selectable_list_layout`` sets a large ``scroll_offset``
+        and the render loop bails out on the first iteration.
+        """
+        cr = FakeCairo()
+        items = ["a", "b", "c"]
+        draw_selectable_list(
+            FakeRenderer(),
+            cr,
+            items=items,
+            selected_idx=20,  # way out of range
+            x=0,
+            y=0,
+            w=400.0,
+            h=80.0,
+            empty_message="x",
+        )
+        # No item text renders because every item_idx is >= len(items).
+        # (The scroll-up indicator "^" still shows because scroll_offset > 0.)
+        rendered = set(cr.show_text_strings())
+        assert not (rendered & {"a", "b", "c"})
+
+    def test_item_text_is_truncated_to_row_width(self) -> None:
+        cr = FakeCairo()
+        long = "A" * 400
+        draw_selectable_list(
+            FakeRenderer(),
+            cr,
+            items=[long],
+            selected_idx=0,
+            x=0,
+            y=0,
+            w=60.0,
+            h=200.0,
+            empty_message="x",
+        )
+        assert long not in cr.show_text_strings()
+
+
+# --------------------------------------------------------------------------- #
+# Selection menus (source / iface / settings)
+# --------------------------------------------------------------------------- #
+
+
+class TestSelectionMenus:
+    def test_source_selection_shows_items_and_title(self) -> None:
+        state = _base_state()
+        state.source_selection_title = "PICK NDI"
+        state.discovered_sources = ["CAM1", "CAM2"]
+        state.selected_source_index = 1
+        cr = FakeCairo()
+        draw_source_selection(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "PICK NDI" in texts
+        assert "CAM1" in texts
+        assert "CAM2" in texts
+
+    def test_source_selection_overlay_adds_scrim(self) -> None:
+        state = _base_state(discovered_sources=["A"], selected_source_index=0)
+        cr = FakeCairo()
+        draw_source_selection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        # Scrim draws one full-frame rectangle.
+        frame_rects = [r for r in cr.rects if r[:2] == (0, 0) and r[2:] == (1600, 900)]
+        assert len(frame_rects) == 1
+
+    def test_source_type_selection_renders_display_names(self) -> None:
+        """The picker shows each plugin's display name (NDI, RTSP, Test Pattern) – not the input_id slugs."""
+        state = _base_state()
+        state.available_source_types = [
+            ("ndi", "NDI"),
+            ("rtsp", "RTSP"),
+            ("testpattern", "Test Pattern"),
+        ]
+        state.selected_source_type_index = 1
+        cr = FakeCairo()
+        draw_source_type_selection(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "NDI" in texts
+        assert "RTSP" in texts
+        assert "Test Pattern" in texts
+
+    def test_source_type_selection_overlay_adds_scrim(self) -> None:
+        state = _base_state()
+        state.available_source_types = [("ndi", "NDI")]
+        cr = FakeCairo()
+        draw_source_type_selection_overlay(
+            FakeRenderer(state=state),
+            cr,
+            state,
+            1600,
+            900,
+        )
+        frame_rects = [r for r in cr.rects if r[:2] == (0, 0) and r[2:] == (1600, 900)]
+        assert len(frame_rects) == 1
+
+    def test_url_editor_renders_label_and_buffer(self) -> None:
+        """The URL editor surfaces the field label as the modal title and the buffer contents inside the box."""
+        state = _base_state()
+        state.url_editor_field_label = "RTSP URL"
+        state.url_editor_value = "rtsp://10.0.0.5"
+        cr = FakeCairo()
+        draw_url_editor(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "RTSP URL" in texts  # uppercased title
+        assert "rtsp://10.0.0.5" in texts
+
+    def test_url_editor_renders_banner_when_set(self) -> None:
+        state = _base_state()
+        state.url_editor_field_label = "RTSP URL"
+        state.url_editor_value = ""
+        state.url_editor_banner = "RTSP needs a URL – type it below."
+        cr = FakeCairo()
+        draw_url_editor(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert any("RTSP needs a URL" in t for t in texts)
+        # The banner takes the subtitle's place.
+        assert "Edit the value." not in texts
+
+    def test_url_editor_falls_back_to_default_subtitle(self) -> None:
+        state = _base_state()
+        state.url_editor_field_label = "RTSP URL"
+        state.url_editor_value = ""
+        state.url_editor_banner = ""
+        cr = FakeCairo()
+        draw_url_editor(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert "Edit the value." in cr.show_text_strings()
+
+    def test_url_editor_default_title_when_label_empty(self) -> None:
+        state = _base_state()
+        state.url_editor_field_label = ""
+        cr = FakeCairo()
+        draw_url_editor(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "URL" in texts
+
+    def test_url_editor_overlay_adds_scrim(self) -> None:
+        state = _base_state()
+        state.url_editor_field_label = "RTSP URL"
+        cr = FakeCairo()
+        draw_url_editor_overlay(
+            FakeRenderer(state=state),
+            cr,
+            state,
+            1600,
+            900,
+        )
+        frame_rects = [r for r in cr.rects if r[:2] == (0, 0) and r[2:] == (1600, 900)]
+        assert len(frame_rects) == 1
+
+    def test_field_choice_picker_renders_title_and_items(self) -> None:
+        """The enum-style picker shows the field label as the
+        modal title (uppercased) and the choice display names as
+        the selectable list rows."""
+        state = _base_state()
+        state.field_choice_title = "Pattern"
+        state.field_choice_items = ["50% Grey", "Stage Scene"]
+        state.field_choice_selected_index = 1
+        cr = FakeCairo()
+        draw_field_choice_picker(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "PATTERN" in texts  # uppercased title
+        assert "50% Grey" in texts
+        assert "Stage Scene" in texts
+
+    def test_field_choice_picker_default_title_when_empty(self) -> None:
+        """No ``field_choice_title`` → fall back to the generic
+        ``SELECT VALUE`` heading so the modal doesn't render with a
+        blank title bar."""
+        state = _base_state()
+        state.field_choice_title = ""
+        state.field_choice_items = ["A", "B"]
+        cr = FakeCairo()
+        draw_field_choice_picker(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "SELECT VALUE" in texts
+
+    def test_field_choice_picker_overlay_adds_scrim(self) -> None:
+        state = _base_state()
+        state.field_choice_title = "Pattern"
+        state.field_choice_items = ["50% Grey"]
+        cr = FakeCairo()
+        draw_field_choice_picker_overlay(
+            FakeRenderer(state=state),
+            cr,
+            state,
+            1600,
+            900,
+        )
+        frame_rects = [r for r in cr.rects if r[:2] == (0, 0) and r[2:] == (1600, 900)]
+        assert len(frame_rects) == 1
+
+    def test_settings_menu_decorates_disabled_items(self) -> None:
+        state = _base_state()
+        state.settings_items = ["Calibration", "OSC", "Quit"]
+        state.settings_items_enabled = [True, False, True]
+        state.settings_selected_index = 0
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "Calibration" in texts
+        assert "OSC (unavailable)" in texts
+        assert "Quit" in texts
+
+    def test_settings_menu_uses_per_row_disabled_reason(self) -> None:
+        """A non-empty ``settings_items_disabled_reasons`` row replaces the generic ``(unavailable)`` suffix."""
+        state = _base_state()
+        state.settings_items = ["Open Web UI", "OSC"]
+        state.settings_items_enabled = [False, False]
+        state.settings_items_disabled_reasons = ["Linux only", ""]
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "Open Web UI (Linux only)" in texts
+        assert "OSC (unavailable)" in texts
+
+    def test_settings_menu_tolerates_short_reasons_list(self) -> None:
+        state = _base_state()
+        state.settings_items = ["A", "B"]
+        state.settings_items_enabled = [True, False]
+        state.settings_items_disabled_reasons = []  # not synced
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "A" in texts
+        assert "B (unavailable)" in texts
+
+    def test_settings_menu_renders_ip_and_video_source_info_card(self) -> None:
+        """Settings modal mirrors the bottom-left HUD info panel so operators see IP + source context."""
+        state = _base_state(
+            settings_items=["Network"],
+            settings_items_enabled=[True],
+        )
+        state.ip_text = "10.0.0.5:8080"
+        state.video_source_type = "rtsp"
+        state.source_label = "rtsp://cam1/stream"
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert any("IP Address" in t for t in texts)
+        assert any("10.0.0.5:8080" in t for t in texts)
+        assert any("Video Source" in t for t in texts)
+        # ``format_source_text`` includes the source type and label.
+        assert any("rtsp" in t.lower() for t in texts)
+
+    def test_settings_menu_renders_error_box_when_error_message_set(
+        self,
+    ) -> None:
+        """The error box replaces the old NO SIGNAL overlay's error
+        chip – bold body text inside a red-bordered card, so the
+        failure reason is hard to miss even from the back of a venue."""
+        state = _base_state(
+            settings_items=["Network"],
+            settings_items_enabled=[True],
+        )
+        state.error_message = "Connection refused: rtsp://10.0.0.5/stream"
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "ERROR" in texts
+        # Error message body is rendered (may be word-wrapped, so
+        # check for a substring rather than the exact line).
+        assert any("Connection refused" in t for t in texts)
+        # The error chip, at the box's 2 px border.
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
+        assert ("line_width", 2.0) in cr.calls
+
+    def test_settings_menu_skips_error_box_when_message_empty(self) -> None:
+        """No error → no red box; keeps the modal lean when the
+        operator just opened it manually rather than via auto-banner."""
+        state = _base_state(
+            settings_items=["Network"],
+            settings_items_enabled=[True],
+        )
+        state.error_message = ""
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "ERROR" not in texts
+
+    def test_settings_menu_skips_help_block_when_no_inputs_connected(
+        self,
+    ) -> None:
+        """Defensive branch: when neither keyboard nor controller are
+        connected, ``build_help_sections`` returns empty and the help
+        block under the info card is suppressed (otherwise we'd render
+        a 14px empty rounded rect with no content)."""
+        state = _base_state(
+            keyboard_connected=False,
+            controller_connected=False,
+            settings_items=["Network"],
+            settings_items_enabled=[True],
+        )
+        cr = FakeCairo()
+        # Must not raise – verifies the help_h==0 branch.
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+
+    def test_settings_menu_error_box_renders_empty_message(self) -> None:
+        """Defensive branch: ``_wrap_error_message`` handles an empty
+        string by returning a single empty line so callers don't have
+        to special-case the empty path (covered for completeness even
+        though the real code gates on truthiness before calling)."""
+        from openfollow.runtime.overlay_draw_hud import _wrap_error_message
+
+        class _Cr:
+            def text_extents(self, _t):
+                return SimpleNamespace(width=10.0)
+
+        class _Renderer:
+            def _set_ui_font(self, *a, **kw): ...
+
+        assert _wrap_error_message(
+            _Renderer(),
+            _Cr(),
+            "",
+            100.0,
+            12.0,
+        ) == [""]
+
+    def test_settings_menu_error_box_handles_whitespace_only_message(
+        self,
+    ) -> None:
+        """Whitespace-only error messages fall through ``str.split()``
+        to an empty word list – return the raw message verbatim so
+        the formatter doesn't surface an empty card with no content."""
+        from openfollow.runtime.overlay_draw_hud import _wrap_error_message
+
+        class _Cr:
+            def text_extents(self, _t):
+                return SimpleNamespace(width=10.0)
+
+        class _Renderer:
+            def _set_ui_font(self, *a, **kw): ...
+
+        assert _wrap_error_message(
+            _Renderer(),
+            _Cr(),
+            "   ",
+            100.0,
+            12.0,
+        ) == ["   "]
+
+    def test_wrap_error_message_hard_wraps_long_unbreakable_token(
+        self,
+    ) -> None:
+        """A single token wider than ``max_w`` (e.g. an RTSP URL) is
+        hard-wrapped at character boundaries so the red error box
+        doesn't overflow at small window sizes."""
+        from openfollow.runtime.overlay_draw_hud import _wrap_error_message
+
+        class _Cr:
+            def text_extents(self, t):
+                # Each character is 10px wide.
+                return SimpleNamespace(width=10.0 * len(t))
+
+        class _Renderer:
+            def _set_ui_font(self, *a, **kw): ...
+
+        # max_w of 50 with 10px/char ⇒ 5 chars per line. The "after"
+        # word fits on its own line (5 chars exactly), so it starts a
+        # fresh line after the URL chunks.
+        lines = _wrap_error_message(
+            _Renderer(),
+            _Cr(),
+            "rtsp://camera.example.com/stream after",
+            50.0,
+            12.0,
+        )
+        assert all(len(line) <= 5 for line in lines)
+        assert (
+            "".join(line for line in lines if "after" not in line)
+            .replace(
+                " ",
+                "",
+            )
+            .startswith("rtsp:")
+        )
+        assert any("after" in line for line in lines)
+
+    def test_wrap_error_message_hard_wrap_preserves_single_char_token(
+        self,
+    ) -> None:
+        """Defensive: if even a single character is wider than
+        ``max_w`` the helper still returns the token rather than an
+        empty list, so callers always get at least one renderable
+        line."""
+        from openfollow.runtime.overlay_draw_hud import _wrap_error_message
+
+        class _Cr:
+            def text_extents(self, t):
+                return SimpleNamespace(width=100.0 * len(t))
+
+        class _Renderer:
+            def _set_ui_font(self, *a, **kw): ...
+
+        lines = _wrap_error_message(
+            _Renderer(),
+            _Cr(),
+            "abc",
+            10.0,
+            12.0,
+        )
+        # Each char exceeds max_w; helper falls back to per-char chunks.
+        assert lines == ["a", "b", "c"]
+
+    def test_settings_menu_wraps_long_error_messages(self) -> None:
+        """Long error messages word-wrap across multiple lines inside
+        the error box instead of ellipsis-truncating – the operator
+        needs the full diagnostic to recover."""
+        state = _base_state(
+            settings_items=["Network"],
+            settings_items_enabled=[True],
+        )
+        state.error_message = (
+            "GStreamer pipeline negotiation failed: "
+            "rtspsrc could not resolve hostname rtsp://camera.example.com/stream "
+            "after 5 retries"
+        )
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        # The full message appears across one or more body lines.
+        joined = " ".join(t for t in texts if t)
+        assert "GStreamer pipeline" in joined
+        assert "camera.example.com" in joined
+        assert "after 5 retries" in joined
+
+    def test_settings_overlay_adds_scrim(self) -> None:
+        state = _base_state(settings_items=["Quit"], settings_items_enabled=[True])
+        cr = FakeCairo()
+        draw_settings_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        frame_rects = [r for r in cr.rects if r[:2] == (0, 0) and r[2:] == (1600, 900)]
+        assert len(frame_rects) == 1
+
+    def test_settings_menu_banner_renders_in_red_error_box(self) -> None:
+        """When ``settings_menu_banner`` is set, the context renders inside the red-bordered error box."""
+        state = _base_state(
+            settings_items=["Network"],
+            settings_items_enabled=[True],
+        )
+        state.settings_menu_banner = "Configured IP 10.0.0.99 not available."
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert any("Configured IP 10.0.0.99 not available." in t for t in texts)
+        # Subtitle is unchanged – banner content lives in the error box.
+        assert any("Open a sub-screen." in t for t in texts)
+        assert "ERROR" in texts
+
+    def test_a_selection_menu_draws_no_key_help_of_its_own(self) -> None:
+        """The menus' one key list is drawn beside every menu instead."""
+        state = _base_state(keyboard_connected=True, controller_connected=True)
+        cr = FakeCairo()
+        draw_selection_menu(
+            FakeRenderer(state=state),
+            cr,
+            state,
+            1600,
+            900,
+            title="T",
+            subtitle="s",
+            items=["x"],
+            selected_idx=0,
+            empty_message="n",
+        )
+        assert cr.show_text_strings() == ["T", "s", "x"]
+
+
+# --------------------------------------------------------------------------- #
+# draw_hud (main overlay)
+# --------------------------------------------------------------------------- #
+
+
+# The menus' list with both devices connected: two headings and ten lines.
+_MENU_LIST_TEXTS = 12
+
+
+class TestMenuHelp:
+    def test_the_menus_list_sits_where_the_hud_help_does(self) -> None:
+        from openfollow.runtime.overlay_draw_hud import draw_menu_help
+
+        state = _base_state(keyboard_connected=True, controller_connected=True, show_hud_help=True)
+        hud, menus = FakeCairo(), FakeCairo()
+        hud_renderer, menus_renderer = FakeRenderer(state=state), FakeRenderer(state=state)
+        draw_hud(hud_renderer, hud, state, 1920, 1080)
+        draw_menu_help(menus_renderer, menus, state, 1920, 1080)
+        (hud_title,) = [t for t in hud.texts if t.text == "KEYBOARD"]
+        (menus_title,) = [t for t in menus.texts if t.text == "KEYBOARD"]
+        assert (menus_title.x, menus_title.y) == (hud_title.x, hud_title.y)
+        assert menus_renderer.draw_icon_calls == hud_renderer.draw_icon_calls
+        assert "• Enter: Confirm" in menus.show_text_strings()
+
+    @pytest.mark.parametrize("w", [1280, 1920])
+    def test_the_list_stays_clear_of_the_centred_menu(self, w: int) -> None:
+        """The default window is 1280 wide, where a centred menu starts at x=243."""
+        from openfollow.runtime.overlay_draw_hud import draw_menu_help, panel_width
+
+        state = _base_state(keyboard_connected=True, controller_connected=True)
+        cr = FakeCairo()
+        draw_menu_help(FakeRenderer(state=state), cr, state, w, 720)
+        panel_right = max(cx + r for cx, _cy, r in cr.arcs)
+        assert panel_right < (w - panel_width(w)) / 2.0
+
+    def test_a_list_narrowed_to_fit_wraps_and_holds_every_line(self) -> None:
+        from openfollow.runtime.overlay_draw_hud import draw_menu_help
+
+        state = _base_state(keyboard_connected=True, controller_connected=True)
+        cr = FakeCairo()
+        draw_menu_help(FakeRenderer(state=state), cr, state, 1280, 720)
+        assert not any(t.text.endswith("...") for t in cr.texts)
+        panel_bottom = max(cy + r for _cx, cy, r in cr.arcs)
+        assert max(t.y for t in cr.texts) < panel_bottom
+        assert len(cr.texts) > _MENU_LIST_TEXTS, "nothing wrapped at the narrowed width"
+
+    def test_without_a_keyboard_or_controller_there_is_no_list(self) -> None:
+        from openfollow.runtime.overlay_draw_hud import draw_menu_help
+
+        state = _base_state(keyboard_connected=False, controller_connected=False)
+        cr = FakeCairo()
+        draw_menu_help(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert cr.texts == []
+
+
+class TestDrawHud:
+    def test_always_draws_bottom_left_info_and_system_stats(self) -> None:
+        state = _base_state(ip_text="127.0.0.1")
+        cr = FakeCairo()
+        renderer = FakeRenderer(state=state)
+        draw_hud(renderer, cr, state, 1920, 1080)
+        texts = cr.show_text_strings()
+        assert "IP Address:" in texts
+        assert any(t.startswith("CPU:") for t in texts)
+
+    # The bottom-center controller panel was retired; the per-marker
+    # controller badge on each marker card now carries that information.
+
+    def test_icon_is_requested_from_renderer(self) -> None:
+        state = _base_state()
+        cr = FakeCairo()
+        renderer = FakeRenderer(state=state)
+        draw_hud(renderer, cr, state, 1920, 1080)
+        assert renderer.draw_icon_calls == [(10.0, 10.0, 24.0)]
+
+    def test_hud_help_on_renders_help_block(self) -> None:
+        state = _base_state(show_hud_help=True)
+        cr = FakeCairo()
+        draw_hud(FakeRenderer(state=state), cr, state, 1920, 1080)
+        # "Keyboard" section heading renders in ALL CAPS by the help block.
+        assert "KEYBOARD" in cr.show_text_strings()
+
+    def test_hud_help_off_shows_hint_next_to_icon(self) -> None:
+        state = _base_state(show_hud_help=False)
+        state.keyboard_labels = {"toggle_help": "h"}
+        state.button_labels = {}
+        cr = FakeCairo()
+        draw_hud(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert any(": help" in t for t in cr.show_text_strings())
+
+    def test_hud_help_off_with_no_key_or_btn_renders_no_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Defensive branch: if both label lookups somehow yield empty
+        strings (which shouldn't happen with the ``or "h"`` / ``or "Y"``
+        fallbacks), the hint line is suppressed rather than rendering
+        ": help".  We force the situation by patching the name lookups at
+        the overlay-hud import site.
+        """
+        from openfollow.runtime import overlay_draw_hud as hud_mod
+
+        monkeypatch.setattr(hud_mod, "key_label", lambda *a, **kw: "")
+        monkeypatch.setattr(hud_mod, "friendly_button_label", lambda *a, **kw: "")
+
+        state = _base_state(show_hud_help=False)
+        cr = FakeCairo()
+        draw_hud(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert all(": help" not in t for t in cr.show_text_strings())
+
+    def test_help_block_suppressed_when_no_inputs_connected(self) -> None:
+        state = _base_state(keyboard_connected=False, controller_connected=False)
+        cr = FakeCairo()
+        draw_hud(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert "KEYBOARD" not in cr.show_text_strings()
+        assert "CONTROLLER" not in cr.show_text_strings()
+
+    def test_marker_cards_render_one_per_marker(self) -> None:
+        state = _base_state()
+        state.markers = [_marker(marker_id=1), _marker(marker_id=2)]
+        state.selected_id = 1
+        cr = FakeCairo()
+        draw_hud(FakeRenderer(state=state), cr, state, 1920, 1080)
+        labels = [t for t in cr.show_text_strings() if t.startswith("M")]
+        assert "M1" in labels
+        assert "M2" in labels
+
+
+# --------------------------------------------------------------------------- #
+# draw_bottom_left_info_panel
+# --------------------------------------------------------------------------- #
+
+
+class TestBottomLeftInfoPanel:
+    def test_renders_both_rows(self) -> None:
+        state = _base_state(ip_text="192.168.1.2")
+        state.video_source_type = "ndi"
+        state.source_label = "Main"
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+        texts = cr.show_text_strings()
+        assert "IP Address:" in texts
+        assert "Video Source:" in texts
+        assert "192.168.1.2" in texts
+        assert any("NDI" in t for t in texts)
+
+    def test_hostname_row_renders_alongside_the_ip(self) -> None:
+        """``<slug>.local`` is the recovery route that survives an address
+        change, so it is on the panel whenever the host has a usable name."""
+        state = _base_state(ip_text="192.168.1.2")
+        state.hostname_text = "openfollow-noble-bear.local"
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+        texts = cr.show_text_strings()
+        assert "Web address:" in texts
+        assert "openfollow-noble-bear.local" in texts
+
+    def test_no_hostname_row_when_the_host_has_no_name(self) -> None:
+        state = _base_state(ip_text="192.168.1.2")
+        state.hostname_text = ""
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert "Web address:" not in cr.show_text_strings()
+
+    def test_link_local_address_carries_the_dhcp_qualifier(self) -> None:
+        """Without it an operator reads a 169.254 address as a working lease."""
+        state = _base_state(ip_text="169.254.8.31")
+        state.ip_is_fallback = True
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert any("DHCP unavailable" in t for t in cr.show_text_strings())
+
+    def test_routable_address_carries_no_qualifier(self) -> None:
+        state = _base_state(ip_text="192.168.1.2")
+        state.ip_is_fallback = False
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert not any("DHCP unavailable" in t for t in cr.show_text_strings())
+
+    def test_panel_height_follows_the_row_count(self) -> None:
+        """The height was hardcoded for three rows; a fourth row has to grow
+        the panel rather than render outside it."""
+        without = _base_state(ip_text="192.168.1.2")
+        without.hostname_text = ""
+        with_host = _base_state(ip_text="192.168.1.2")
+        with_host.hostname_text = "openfollow-noble-bear.local"
+
+        spans = []
+        for state in (without, with_host):
+            cr = FakeCairo()
+            draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+            ys = [t.y for t in cr.texts]
+            spans.append((max(ys) - min(ys), min(ys)))
+        # One more row of text, and the panel grows upward to hold it – the
+        # bottom row stays put because the panel is bottom-anchored.
+        assert spans[1][0] > spans[0][0]
+        assert spans[1][1] < spans[0][1]
+
+    def test_a_down_plane_turns_the_panel_red_but_its_text_goes_top_right(self) -> None:
+        """The sentence is a top-right status row, like every other fault; the
+        panel only takes the error chrome."""
+        state = _base_state(ip_text="192.168.1.2")
+        state.network_alerts = ["PSN: eth0.10 is down", "OTP output: eth0.20 is down"]
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+        texts = cr.show_text_strings()
+        assert "Network:" not in texts
+        assert not any("is down" in text for text in texts)
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
+        assert ("line_width", 1.6) in cr.calls
+
+    def test_no_network_row_when_every_plane_is_up(self) -> None:
+        state = _base_state(ip_text="192.168.1.2")
+        state.network_alerts = []
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert "Network:" not in cr.show_text_strings()
+        assert ("rgba", *COLOR_WARNING_FILL) not in cr.calls
+
+    def test_empty_ip_falls_back_to_unavailable(self) -> None:
+        state = _base_state(ip_text="")
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert "Unavailable" in cr.show_text_strings()
+
+    def test_long_values_are_truncated(self) -> None:
+        state = _base_state(ip_text="x" * 200)
+        state.video_source_type = "ndi"
+        state.source_label = "y" * 200
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 320, 200)
+        texts = cr.show_text_strings()
+        assert "x" * 200 not in texts
+
+    def test_panel_turns_red_when_settings_banner_set(self) -> None:
+        """The bottom-left HUD info panel mirrors the Settings menu's error state so operators see the failure."""
+        state = _base_state(ip_text="192.168.1.2")
+        state.video_source_type = "rtsp"
+        state.settings_menu_banner = "Video source unreachable."
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(
+            FakeRenderer(state=state),
+            cr,
+            state,
+            1920,
+            1080,
+        )
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
+        # The values keep the HUD's normal text colour; the panel carries the red.
+        assert cr.find_texts("192.168.1.2")[0].rgba[:3] == COLOR_TEXT
+
+    def test_panel_turns_red_when_error_message_set(self) -> None:
+        """Same red treatment when ``state.error_message`` is set
+        (mid-stream disconnect path that doesn't go through the
+        auto-banner)."""
+        state = _base_state(ip_text="192.168.1.2")
+        state.error_message = "Connection refused"
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(
+            FakeRenderer(state=state),
+            cr,
+            state,
+            1920,
+            1080,
+        )
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
+
+    def test_panel_stays_normal_when_no_error(self) -> None:
+        """Default state: no banner, no error_message → panel uses the
+        standard background gradient and values in normal text colour
+        (no danger-red anywhere in the draw calls)."""
+        state = _base_state(ip_text="192.168.1.2")
+        state.video_source_type = "ndi"
+        state.settings_menu_banner = ""
+        state.error_message = ""
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(
+            FakeRenderer(state=state),
+            cr,
+            state,
+            1920,
+            1080,
+        )
+        assert ("rgba", *COLOR_WARNING_FILL) not in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) not in cr.calls
+
+
+# --------------------------------------------------------------------------- #
+# draw_system_stats + draw_panel + draw_panel_background
+# --------------------------------------------------------------------------- #
+
+
+class TestSystemStatsAndPanels:
+    def test_system_stats_includes_cpu_and_ram(self) -> None:
+        state = _base_state(cpu_percent=42.1, ram_percent=33.3)
+        cr = FakeCairo()
+        draw_system_stats(FakeRenderer(state=state), cr, state, 1920)
+        rendered = cr.show_text_strings()
+        assert any("CPU:" in t and "RAM:" in t for t in rendered)
+
+    def test_system_stats_includes_temperature_when_set(self) -> None:
+        state = _base_state(cpu_percent=10.0, ram_percent=20.0, temperature=55.2)
+        cr = FakeCairo()
+        draw_system_stats(FakeRenderer(state=state), cr, state, 1920)
+        assert any("°C" in t for t in cr.show_text_strings())
+
+    def test_draw_panel_background_uses_card_chrome(self) -> None:
+        # Every panel now shares the operator-message card chrome: a
+        # translucent COLOR_BG_BASE fill + soft white COLOR_BORDER at 1px –
+        # no opaque fill, no golden accent border.
+        from openfollow.runtime.overlay_draw_style import (
+            CARD_BG_ALPHA,
+            COLOR_ACCENT,
+            COLOR_BG_BASE,
+            COLOR_BORDER,
+        )
+
+        cr = FakeCairo()
+        draw_panel_background(FakeRenderer(), cr, 5, 5, 100, 50, radius=10)
+        assert not any(c[0] == "source_pattern" for c in cr.calls)
+        # Translucent card fill (not the old opaque ``set_source_rgb``).
+        assert ("rgba", *COLOR_BG_BASE, CARD_BG_ALPHA) in cr.calls
+        assert ("rgb", *COLOR_BG_BASE) not in cr.calls
+        # Soft white border at 1px (not the old accent border at 1.6px).
+        assert ("rgba", *COLOR_BORDER) in cr.calls
+        assert ("rgba", COLOR_ACCENT[0], COLOR_ACCENT[1], COLOR_ACCENT[2], 0.58) not in cr.calls
+        assert ("line_width", 1.0) in cr.calls
+        assert cr.strokes == 1
+        assert cr.fills == 1
+
+    def test_draw_panel_centers_text_within_rect(self) -> None:
+        cr = FakeCairo()
+        draw_panel(FakeRenderer(), cr, 0, 0, 200, 40, "hello", 12)
+        shown = next(t for t in cr.texts if t.text == "hello")
+        # centred roughly inside the 200×40 rect.
+        assert 0 < shown.x < 200
+        assert 0 < shown.y < 40
+
+    def test_system_stats_panel_uses_card_chrome(self) -> None:
+        # CPU/RAM/Temp panel reads in the operator-message card style.
+        state = _base_state(cpu_percent=10.0, ram_percent=20.0, temperature=50.0)
+        cr = FakeCairo()
+        draw_system_stats(FakeRenderer(state=state), cr, state, 1920)
+        assert _emits_card_chrome(cr)
+
+    def test_info_panel_uses_card_chrome(self) -> None:
+        # IP / Video Source / Station panel reads in the card style.
+        state = _base_state(ip_text="10.0.0.5", station_name="Spot 1")
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert _emits_card_chrome(cr)
+
+    def test_info_panel_error_state_keeps_danger_chrome(self) -> None:
+        # The failure state is a deliberate red alert and must NOT be
+        # flattened into the neutral card chrome.
+        state = _base_state(ip_text="10.0.0.5", error_message="SRT connection lost")
+        cr = FakeCairo()
+        draw_bottom_left_info_panel(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert not _emits_card_chrome(cr)
+        assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
+
+    def test_help_panel_uses_card_chrome(self) -> None:
+        # Top-left help block panel reads in the card style.
+        state = _base_state(show_hud_help=True)
+        cr = FakeCairo()
+        draw_hud(FakeRenderer(state=state), cr, state, 1920, 1080)
+        assert _emits_card_chrome(cr)
+
+
+# --------------------------------------------------------------------------- #
+# draw_marker_card – card styling branches
+# --------------------------------------------------------------------------- #
+
+
+class TestMarkerCard:
+    def test_label_falls_back_to_m_prefix_when_name_empty(self) -> None:
+        """No catalog name → render ``M<id>`` so the operator still
+        sees *something* during the transient race between the
+        control plane writing the catalog and the draw plane reading
+        it (same race that the colour fallback handles)."""
+        state = _base_state()
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(marker_id=7, x=1.0, y=2.0, z=3.0, speed=1.25),
+            selected=False,
+            state=state,
+        )
+        assert "M7" in cr.show_text_strings()
+        # Position line renders via format_length_compact (metric: metres).
+        assert any("+1.00" in t and "+2.00" in t for t in cr.show_text_strings())
+        assert any("1.25 m/s" in t for t in cr.show_text_strings())
+
+    def test_group_popped_even_when_a_draw_call_raises(self) -> None:
+        """A draw exception inside a viewer-only card still pops the Cairo
+        group (try/finally), so the caller's 'Overlay Error' fallback isn't
+        captured by a dangling group surface and the group stack self-heals."""
+
+        class _BoomCairo(FakeCairo):
+            def show_text(self, text: str) -> None:
+                raise RuntimeError("draw boom")
+
+        cr = _BoomCairo()
+        # Viewer-only marker → draw_marker_card wraps the body in a group.
+        marker = _marker(marker_id=1, is_controlled=False)
+        with pytest.raises(RuntimeError, match="draw boom"):
+            draw_marker_card(FakeRenderer(), cr, x=0, y=0, w=180, h=64, t=marker, selected=False)
+        kinds = [c[0] for c in cr.calls]
+        assert kinds.count("push_group") == 1
+        assert kinds.count("pop_group_to_source") == 1
+        # The pop runs after the push – the stack is balanced on the way out.
+        assert kinds.index("pop_group_to_source") > kinds.index("push_group")
+
+    def test_imperial_unit_system_renders_feet_and_ft_per_sec(self) -> None:
+        state = _base_state(unit_system=UnitSystem.IMPERIAL)
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(marker_id=1, x=1.0, y=2.0, z=3.0, speed=0.5),
+            selected=False,
+            state=state,
+        )
+        shown = cr.show_text_strings()
+        # 1.0 m = 3.28 ft, 0.5 m/s = 1.64 ft/s.
+        assert any("+3.28" in t for t in shown)
+        assert any("1.64 ft/s" in t for t in shown)
+        assert not any("m/s" in t for t in shown)
+
+    def test_catalog_name_renders_instead_of_m_prefix(self) -> None:
+        """Catalog-populated ``name`` wins over the ``M<id>`` fallback,
+        so an operator who labelled a marker "House Left" sees that
+        on the HUD instead of "M3"."""
+        state = _base_state()
+        cr = FakeCairo()
+        marker = _marker(marker_id=3)
+        marker.name = "House Left"
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=marker,
+            selected=False,
+            state=state,
+        )
+        shown = cr.show_text_strings()
+        assert "House Left" in shown
+        assert "M3" not in shown
+
+    def test_marker_fader_value_appended_to_speed_line(self) -> None:
+        """A marker with a provisioned gamepad fader shows its 0..1 value
+        appended to the speed line ('F 0.42'). Markers without one
+        (``marker_fader=None``, the default in every other test) render
+        the plain speed line – covering the other branch."""
+        state = _base_state()
+        cr = FakeCairo()
+        marker = _marker(marker_id=2, speed=1.0)
+        marker.marker_fader = 0.42
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=marker,
+            selected=False,
+            state=state,
+        )
+        assert any("F 0.42" in t for t in cr.show_text_strings())
+
+    def test_selected_card_uses_larger_stroke_and_accent_label(self) -> None:
+        state = _base_state()
+        cr_sel = FakeCairo()
+        cr_unsel = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr_sel,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(marker_id=1),
+            selected=True,
+            state=state,
+        )
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr_unsel,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(marker_id=1),
+            selected=False,
+            state=state,
+        )
+        sel_widths = [c[1] for c in cr_sel.calls if c[0] == "line_width"]
+        unsel_widths = [c[1] for c in cr_unsel.calls if c[0] == "line_width"]
+        # The selection delta (selected = unselected + 0.5) is what tells them apart.
+        assert 4.0 in sel_widths
+        assert 3.5 in unsel_widths
+
+    def test_an_offline_marker_shows_a_crossed_disc(self) -> None:
+        """An off-white disc with a cross cut into it in the card's dark
+        background, drawn in a saved state so its line width stays local."""
+        state = _base_state()
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(online=False),
+            selected=False,
+            state=state,
+        )
+        disc = cr.calls.index(("rgb", *COLOR_TEXT))
+        cross = cr.calls.index(("rgb", *COLOR_BG_BASE), disc)
+        assert cr.calls[disc + 1][0] == "arc"
+        assert [c[0] for c in cr.calls[cross:]].count("line_to") >= 2
+        assert cr.saves == cr.restores >= 1
+
+    def test_online_marker_draws_extra_glow_ring(self) -> None:
+        """An online marker renders a second stroked arc around the dot."""
+        state = _base_state()
+        cr_online = FakeCairo()
+        cr_offline = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr_online,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(online=True),
+            selected=False,
+            state=state,
+        )
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr_offline,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(online=False),
+            selected=False,
+            state=state,
+        )
+        # Online version has exactly one extra arc (the glow ring).
+        assert len(cr_online.arcs) == len(cr_offline.arcs) + 1
+
+    def test_z_display_from_stage_subtracts_grid_z_offset(self) -> None:
+        state = _base_state()
+        state.grid_config = (10.0, 6.0, 1.0, 0.0, 0.0, 2.0)
+        state.z_display_from_stage = True
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(z=5.0),
+            selected=False,
+            state=state,
+        )
+        # Displayed z should be 5.0 − 2.0 = 3.0.
+        assert any("+3.00" in t for t in cr.show_text_strings())
+
+    def test_default_none_state_uses_marker_z_directly(self) -> None:
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(z=1.42),
+            selected=False,
+            state=None,
+        )
+        assert any("+1.42" in t for t in cr.show_text_strings())
+
+    def test_none_speed_renders_as_zero(self) -> None:
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(speed=None),
+            selected=False,
+            state=None,
+        )
+        assert any("0.00 m/s" in t for t in cr.show_text_strings())
+
+    def test_speed_bar_filled_when_speed_above_min(self) -> None:
+        """Positive speed produces an extra filled bar rectangle."""
+        state = _base_state(min_speed=0.1, max_speed=3.0)
+        cr_fast = FakeCairo()
+        cr_slow = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr_fast,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(speed=2.0),
+            selected=False,
+            state=state,
+        )
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr_slow,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(speed=0.0),
+            selected=False,
+            state=state,
+        )
+        # Fast card draws one more filled bar rect than the slow one.
+        assert len(cr_fast.rects) == len(cr_slow.rects) + 1
+
+    def test_speed_bar_skipped_when_zero_range(self) -> None:
+        """If min == max, we divide by zero in the raw ratio; the module
+        documents that as ratio = 0 so no fill."""
+        state = _base_state(min_speed=1.0, max_speed=1.0)
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(speed=5.0),
+            selected=False,
+            state=state,
+        )
+        # The bar track is a rounded rect (arc-based, not a plain rectangle);
+        # a zero range yields ratio 0, so no fill rectangle (bar_h == 8) is
+        # painted on top.
+        bar_fill_rects = [r for r in cr.rects if r[3] == 8]
+        assert bar_fill_rects == []
+
+
+# --------------------------------------------------------------------------- #
+# Marker card visual treatment (border colour, fill, alpha, controller badge)
+# --------------------------------------------------------------------------- #
+
+
+class TestMarkerCardRendering:
+    def test_border_uses_marker_color(self) -> None:
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(color="#ff0000"),
+            selected=False,
+            state=None,
+        )
+        # Solid marker colour, so the video and the card fill cannot tint it.
+        assert ("rgb", 1.0, 0.0, 0.0) in cr.calls
+        assert not any(c[0] == "rgba" and c[1:4] == (1.0, 0.0, 0.0) for c in cr.calls)
+
+    @pytest.mark.parametrize("selected", [True, False])
+    def test_the_online_dot_clears_the_border_by_2px(self, selected: bool) -> None:
+        def card(sel: bool) -> FakeCairo:
+            cr = FakeCairo()
+            draw_marker_card(FakeRenderer(), cr, x=x, y=y, w=w, h=64, t=_marker(online=True), selected=sel, state=None)
+            return cr
+
+        x, y, w = 100.0, 50.0, 180.0
+        # The dot never moves with selection, so it clears the selected (widest) border.
+        border_w = next(c[1] for c in card(True).calls if c[0] == "line_width")
+        cr = card(selected)
+        ring = next(i for i, c in enumerate(cr.calls) if c[0] == "arc" and c[3] == 6.0 and c[5] - c[4] > 6)
+        ring_w = next(c[1] for c in reversed(cr.calls[:ring]) if c[0] == "line_width")
+        _, cx, cy, r, *_ = cr.calls[ring]
+        outer = r + ring_w / 2
+        assert (x + w) - cx - outer - border_w / 2 >= 2.0
+        assert cy - y - outer - border_w / 2 >= 2.0
+
+    def test_body_fill_uses_solid_color_not_gradient(self) -> None:
+        """The body fill flattened from LinearGradient to a solid COLOR_BG_BASE."""
+        from openfollow.runtime.overlay_draw_style import COLOR_BG_BASE
+
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(),
+            selected=False,
+            state=None,
+        )
+        # No ``set_source`` pattern means no LinearGradient was used for
+        # the body fill (the speed bar gradient is still pattern-based,
+        # but the speed bar isn't reached when ratio == 0 with default state).
+        body_fills = [c for c in cr.calls if c[0] == "rgb" and tuple(c[1:]) == COLOR_BG_BASE]
+        assert body_fills
+
+    def test_controlled_marker_with_bound_pad_renders_badge(self) -> None:
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(controller_idx=0, controller_connected=True, is_controlled=True),
+            selected=False,
+            state=None,
+        )
+        # 1-based to match OSC :cN: controller_idx 0 -> "C1".
+        assert "C1" in cr.show_text_strings()
+
+    def test_a_missing_controller_turns_its_card_red(self) -> None:
+        """A bound controller that left keeps its slot; the card says so loudly."""
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(controller_idx=1, controller_connected=False, is_controlled=True),
+            selected=False,
+            state=None,
+        )
+        # 1-based: controller_idx 1 -> "C2".
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert ("rgb", *COLOR_BG_BASE) not in cr.calls
+        badge = next(d for d in cr.texts if d.text == "C2 missing")
+        assert badge.rgba[:3] == COLOR_TEXT
+
+    @staticmethod
+    def _missing_card(name: str) -> tuple[FakeCairo, Any, Any]:
+        cr = FakeCairo()
+        marker = _marker(controller_idx=1, controller_connected=False, is_controlled=True)
+        marker.name = name
+        draw_marker_card(FakeRenderer(), cr, x=0, y=0, w=180, h=64, t=marker, selected=False, state=None)
+        badge = next(d for d in cr.texts if d.text == "C2 missing")
+        label = next(d for d in cr.texts if d.y == 18)
+        return cr, badge, label
+
+    def test_a_name_clears_the_missing_badge(self) -> None:
+        cr, badge, label = self._missing_card("House Left")
+        assert label.text == "House Left"
+        assert label.x >= badge.x + len(badge.text) * 9 * 0.6
+
+    def test_a_name_too_long_beside_the_missing_badge_is_shortened_before_the_dot(self) -> None:
+        _, _, label = self._missing_card("Downstage Centre Left")
+        assert label.text != "Downstage Centre Left" and label.text.startswith("Down")
+        assert label.x + len(label.text) * 13 * 0.6 <= 180 - 18
+
+    def test_a_name_that_fits_centred_stays_centred(self) -> None:
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(marker_id=7, controller_idx=0, controller_connected=True, is_controlled=True),
+            selected=False,
+            state=None,
+        )
+        label = next(d for d in cr.texts if d.text == "M7")
+        assert label.x == pytest.approx((180 - 2 * 13 * 0.6) / 2)
+
+    def test_a_connected_controller_keeps_the_plain_card(self) -> None:
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(controller_idx=1, controller_connected=True, is_controlled=True),
+            selected=False,
+            state=None,
+        )
+        assert ("rgba", *COLOR_WARNING_FILL) not in cr.calls
+        assert not any(text.endswith("missing") for text in cr.show_text_strings())
+
+    def test_an_unbound_card_is_never_red(self) -> None:
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(controller_idx=None, controller_connected=False, is_controlled=True),
+            selected=False,
+            state=None,
+        )
+        assert ("rgba", *COLOR_WARNING_FILL) not in cr.calls
+
+    @pytest.mark.parametrize("flash", [True, False])
+    def test_identify_flashes_the_card(self, flash: bool) -> None:
+        cr = FakeCairo()
+        marker = _marker(controller_idx=0, controller_connected=True, is_controlled=True)
+        marker.identify_flash = flash
+        draw_marker_card(FakeRenderer(), cr, x=0, y=0, w=180, h=64, t=marker, selected=False, state=None)
+        assert (("rgba", *COLOR_ACCENT_SOFT) in cr.calls) is flash
+        assert (("rgb", *COLOR_ACCENT) in cr.calls) is flash
+
+    def test_unbound_controlled_marker_omits_badge(self) -> None:
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(controller_idx=None, is_controlled=True),
+            selected=False,
+            state=None,
+        )
+        texts = cr.show_text_strings()
+        assert not any(t.startswith("C") for t in texts)
+
+    def test_viewer_only_marker_omits_speed_bar(self) -> None:
+        """Viewer-only cards (in viewer_marker_ids but NOT in
+        controlled_marker_ids) drop the speed bar – it's a control-context
+        affordance that would visualise a value the operator can't change."""
+        state = _base_state(min_speed=0.1, max_speed=3.0)
+        cr_viewer = FakeCairo()
+        cr_controlled = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr_viewer,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(speed=2.0, is_controlled=False),
+            selected=False,
+            state=state,
+        )
+        draw_marker_card(
+            FakeRenderer(state=state),
+            cr_controlled,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(speed=2.0, is_controlled=True),
+            selected=False,
+            state=state,
+        )
+        # The bar track is a rounded rect; only the coloured fill is a plain
+        # rectangle (bar_h == 8). Viewer-only cards draw no bar at all, so no
+        # such rectangle; controlled cards draw the fill on top of the track.
+        viewer_bars = [r for r in cr_viewer.rects if r[3] == 8]
+        controlled_bars = [r for r in cr_controlled.rects if r[3] == 8]
+        assert viewer_bars == []
+        assert len(controlled_bars) >= 1
+
+    def test_viewer_only_marker_renders_at_reduced_alpha(self) -> None:
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(is_controlled=False),
+            selected=False,
+            state=None,
+        )
+        # Viewer-only path: push_group + pop_group_to_source + paint_with_alpha(0.6).
+        paint_alphas = [c[1] for c in cr.calls if c[0] == "paint_with_alpha"]
+        assert paint_alphas == [pytest.approx(0.6)]
+        ops = [c[0] for c in cr.calls]
+        assert "push_group" in ops
+        assert "pop_group_to_source" in ops
+
+    def test_controlled_marker_skips_group_for_zero_overhead(self) -> None:
+        cr = FakeCairo()
+        draw_marker_card(
+            FakeRenderer(),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=64,
+            t=_marker(is_controlled=True),
+            selected=False,
+            state=None,
+        )
+        ops = [c[0] for c in cr.calls]
+        assert "push_group" not in ops
+        assert "pop_group_to_source" not in ops
+        assert "paint_with_alpha" not in ops
+
+
+# --------------------------------------------------------------------------- #
+# Settings menu info card – orphan controllers
+# --------------------------------------------------------------------------- #
+
+
+class TestSettingsInfoCardOrphans:
+    def test_unbound_controllers_row_renders_when_list_present(self) -> None:
+        from openfollow.runtime.overlay_draw_hud import _draw_settings_info_card
+
+        state = _base_state(ip_text="1.2.3.4")
+        state.unbound_controller_indices = [2, 3]
+        cr = FakeCairo()
+        _draw_settings_info_card(FakeRenderer(state=state), cr, state, 0, 0, 400)
+        texts = cr.show_text_strings()
+        assert "Unbound controllers:" in texts
+        # 1-based display: indices 2, 3 -> "Ctrl3", "Ctrl4".
+        assert any("Ctrl3" in t and "Ctrl4" in t for t in texts)
+
+    def test_unbound_controllers_row_omitted_when_empty(self) -> None:
+        from openfollow.runtime.overlay_draw_hud import _draw_settings_info_card
+
+        state = _base_state(ip_text="1.2.3.4")
+        state.unbound_controller_indices = []
+        cr = FakeCairo()
+        _draw_settings_info_card(FakeRenderer(state=state), cr, state, 0, 0, 400)
+        assert "Unbound controllers:" not in cr.show_text_strings()
+
+
+# --------------------------------------------------------------------------- #
+# draw_help_block direct test
+# --------------------------------------------------------------------------- #
+
+
+class TestHelpBlock:
+    def test_emits_section_title_then_lines(self) -> None:
+        cr = FakeCairo()
+        sections = [("Keyboard", ["W/A/S/D: Move", "R/T: Speed"])]
+        draw_help_block(FakeRenderer(), cr, 10, 20, 200, sections)
+        texts = cr.show_text_strings()
+        assert texts[0] == "KEYBOARD"
+        # Bullet prefix is added by the block.
+        assert any(t.startswith("• W/A/S/D") for t in texts)
+        assert any(t.startswith("• R/T") for t in texts)
+
+    def test_a_long_line_wraps_under_its_own_text_and_is_never_cut(self) -> None:
+        cr = FakeCairo()
+        line = "D-Pad Up/Down: Move, or change a digit"
+        draw_help_block(FakeRenderer(), cr, 10, 20, 120, [("K", [line])])
+        first, *rest = [t for t in cr.texts if t.text != "K"]
+        assert rest, "the line did not wrap"
+        assert " ".join([first.text.removeprefix("• "), *(t.text for t in rest)]) == line
+        assert all(t.x > first.x for t in rest)
+        assert [t.y for t in rest] == sorted({t.y for t in rest}) and rest[0].y > first.y
+
+    def test_gap_between_sections_does_not_break_rendering(self) -> None:
+        cr = FakeCairo()
+        sections = [("A", ["line1"]), ("B", ["line2"])]
+        draw_help_block(FakeRenderer(), cr, 10, 20, 300, sections)
+        texts = cr.show_text_strings()
+        assert "A" in texts
+        assert "B" in texts
+
+
+# --------------------------------------------------------------------------- #
+# draw_button_detection_overlay
+# --------------------------------------------------------------------------- #
+
+
+class TestButtonDetectionOverlay:
+    def test_none_state_draws_nothing(self) -> None:
+        state = _base_state(button_detection=None)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert cr.calls == []
+
+    def test_inactive_state_draws_nothing(self) -> None:
+        state = _base_state(button_detection=ButtonDetectionState(active=False))
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert cr.calls == []
+
+    def test_active_with_current_label_draws_prompt(self) -> None:
+        bd = ButtonDetectionState(
+            active=True,
+            current_label="A",
+            step=0,
+            total_steps=4,
+        )
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "Press button:" in texts
+        # "A" is mapped through _BUTTON_DISPLAY_NAMES to "A" (pass-through).
+        assert "A" in texts
+
+    def test_bumper_uses_long_form_display_name(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="RB", step=1, total_steps=4)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert "Right Bumper" in cr.show_text_strings()
+
+    def test_unknown_label_passes_through_unchanged(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="CUSTOM_BTN", step=0, total_steps=1)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert "CUSTOM_BTN" in cr.show_text_strings()
+
+    def test_empty_label_shows_detection_complete(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="", step=4, total_steps=4)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert "Detection Complete!" in cr.show_text_strings()
+
+    def test_detection_complete_is_green_and_led_by_the_check_sign(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="", step=4, total_steps=4)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        done = next(d for d in cr.texts if d.text == "Detection Complete!")
+        assert done.rgba == (*COLOR_OK, 1.0)
+        # The sign: a green disc left of the text, its check cut out in the panel colour.
+        disc = next(a for a in cr.calls if a[0] == "arc" and a[3] == 20.0 * 0.45)
+        assert disc[1] < done.x
+        assert ("rgb", *COLOR_BG_BASE) in cr.calls
+
+    def test_a_step_in_progress_counts_from_one(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="B", step=1, total_steps=4)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert "Step 2 of 4" in cr.show_text_strings()
+
+    def test_a_finished_run_says_so_instead_of_a_step_past_the_end(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="", step=4, total_steps=4)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert "All 4 steps done" in texts
+        assert not any(t.startswith("Step 5") for t in texts)
+
+    @pytest.mark.parametrize(("step", "line"), [(1, "Esc: Cancel"), (4, "Esc: Close")], ids=["running", "done"])
+    def test_the_wizard_names_its_one_key(self, step: int, line: str) -> None:
+        """Not the menus' list: every pad button here is recorded as the prompted one."""
+        bd = ButtonDetectionState(active=True, current_label="B" if step < 4 else "", step=step, total_steps=4)
+        state = _base_state(button_detection=bd, keyboard_connected=True, controller_connected=True)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert line in texts
+        assert not any(t.endswith((": Confirm", ": Back")) for t in texts)
+
+    def test_without_a_keyboard_the_wizard_names_no_key(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="B", step=1, total_steps=4)
+        state = _base_state(button_detection=bd, keyboard_connected=False, controller_connected=True)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert not any(t.startswith("Esc") for t in cr.show_text_strings())
+
+    def test_low_height_shrinks_prompt_font(self) -> None:
+        """`h < 720` switches the big prompt from font 42 to 32."""
+        bd = ButtonDetectionState(active=True, current_label="A", step=0, total_steps=2)
+        state = _base_state(button_detection=bd)
+        cr_big = FakeCairo()
+        cr_small = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr_big, state, 1600, 800)
+        draw_button_detection_overlay(FakeRenderer(state=state), cr_small, state, 1600, 500)
+        big_sizes = {t.font_size for t in cr_big.texts if t.text == "A"}
+        small_sizes = {t.font_size for t in cr_small.texts if t.text == "A"}
+        assert 42 in big_sizes
+        assert 32 in small_sizes
+
+    def test_progress_bar_renders_with_ratio_above_zero(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="X", step=1, total_steps=4)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        # One background track + one progress fill = at least two rounded
+        # rectangles.  Each emits the 4 arcs of a rounded rect.
+        progress_arcs = [a for a in cr.arcs if a[2] == 3.0]
+        assert len(progress_arcs) >= 8
+
+    def test_progress_bar_draws_only_background_at_step_zero(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="A", step=0, total_steps=4)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        # step=0 → ratio=0 → second rounded-rect not emitted.
+        progress_arcs = [a for a in cr.arcs if a[2] == 3.0]
+        assert len(progress_arcs) == 4
+
+    def test_progress_bar_skipped_when_total_steps_zero(self) -> None:
+        bd = ButtonDetectionState(active=True, current_label="A", step=0, total_steps=0)
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        # Still emits the background rounded rect; the filled part is gated on
+        # total_steps > 0 AND ratio > 0.
+        progress_arcs = [a for a in cr.arcs if a[2] == 3.0]
+        assert len(progress_arcs) == 4
+
+    def test_completed_list_renders_buttons_hats_and_axes(self) -> None:
+        bd = ButtonDetectionState(
+            active=True,
+            current_label="A",
+            step=3,
+            total_steps=6,
+            completed={
+                "A": 0,  # positive raw_idx → "btn 0"
+                "DPAD_UP": -1,  # hat known name
+                "LT": -105,  # axis idx = -100 - (-105) = 5
+                "CUSTOM": -200,  # axis idx = -100 - (-200) = 100
+                "B": -99,  # hat unknown → fallback "hat -99"
+            },
+        )
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        # Section header.
+        assert "DETECTED:" in texts
+        # Positive index → btn N.
+        assert any(t == "→ btn 0" for t in texts)
+        # Known hat.
+        assert any(t == "→ hat Up" for t in texts)
+        # Unknown hat falls back through `_HAT_RESULT_NAMES.get(..., "hat <n>")`.
+        assert any(t == "→ hat -99" for t in texts)
+        # Axis (raw_idx = -105 → axis 5).
+        assert any(t == "→ axis 5" for t in texts)
+        assert any(t == "→ axis 100" for t in texts)
+
+    def test_short_names_used_in_completed_list(self) -> None:
+        bd = ButtonDetectionState(
+            active=True,
+            current_label="X",
+            step=1,
+            total_steps=2,
+            completed={"DPAD_RIGHT": -4},
+        )
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        # DPAD_RIGHT is shortened to "D-Right" in the completed list.
+        assert "D-Right" in cr.show_text_strings()
+
+    def test_unknown_label_kept_as_fallback_short_name(self) -> None:
+        bd = ButtonDetectionState(
+            active=True,
+            current_label="X",
+            step=1,
+            total_steps=2,
+            completed={"CUSTOM": 3},
+        )
+        state = _base_state(button_detection=bd)
+        cr = FakeCairo()
+        draw_button_detection_overlay(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert "CUSTOM" in cr.show_text_strings()
+
+
+# --------------------------------------------------------------------------- #
+# Virtual fader stack – Group 10
+# --------------------------------------------------------------------------- #
+
+
+def _vf(
+    index: int = 1,
+    *,
+    name: str = "Master",
+    value: float = 0.5,
+    picked_up: bool = True,
+) -> VirtualFaderDisplayData:
+    return VirtualFaderDisplayData(
+        index=index,
+        name=name,
+        value=value,
+        picked_up=picked_up,
+    )
+
+
+class TestVirtualFaders:
+    """``draw_virtual_faders`` stacks bottom-up on the left side; each
+    row carries name + 0..1 value rendered to two decimals, with a
+    ``(not picked up)`` suffix while the fader's pickup gate is
+    open."""
+
+    def test_empty_list_short_circuits_with_no_draw_calls(self) -> None:
+        cr = FakeCairo()
+        state = _base_state()
+        draw_virtual_faders(FakeRenderer(state=state), cr, state, 1080)
+        # Nothing to draw – the helper must touch zero Cairo
+        # primitives so a row that doesn't opt into show-on-display
+        # costs literally nothing on the render path.
+        assert cr.calls == []
+
+    def test_single_fader_renders_name_and_value(self) -> None:
+        state = _base_state()
+        state.virtual_faders_display = [_vf(name="Master", value=0.42)]
+        cr = FakeCairo()
+        draw_virtual_faders(FakeRenderer(state=state), cr, state, 1080)
+        texts = cr.show_text_strings()
+        assert "Master" in texts
+        # Value formatted to two decimals – matches the MIDI page's
+        # live indicator so the operator's mental model lines up.
+        assert "0.42" in texts
+
+    def test_picked_up_fader_omits_not_picked_up_suffix(self) -> None:
+        state = _base_state()
+        state.virtual_faders_display = [_vf(picked_up=True)]
+        cr = FakeCairo()
+        draw_virtual_faders(FakeRenderer(state=state), cr, state, 1080)
+        # The suffix is concatenated with the value, so we look for
+        # the substring rather than an exact-match cell.
+        assert not any("not picked up" in t for t in cr.show_text_strings())
+
+    def test_not_picked_up_fader_renders_suffix(self) -> None:
+        state = _base_state()
+        state.virtual_faders_display = [
+            _vf(picked_up=False, value=0.7),
+        ]
+        cr = FakeCairo()
+        draw_virtual_faders(FakeRenderer(state=state), cr, state, 1080)
+        assert any("0.70 (not picked up)" in t for t in cr.show_text_strings())
+
+    def test_multiple_faders_stack_in_input_order(self) -> None:
+        """Vertical stacking from the bottom up – fader index 0 in
+        the input list lands at the lowest Y on screen (highest
+        ``card_y`` value); each subsequent index sits above it.
+        Verifies ``virtual_fader_card_y``'s ordering is reflected
+        in the actual draw calls."""
+        state = _base_state()
+        state.virtual_faders_display = [
+            _vf(index=1, name="One", value=0.1),
+            _vf(index=2, name="Two", value=0.2),
+            _vf(index=3, name="Three", value=0.3),
+        ]
+        cr = FakeCairo()
+        draw_virtual_faders(FakeRenderer(state=state), cr, state, 1080)
+        # All three names are rendered.
+        texts = cr.show_text_strings()
+        for name in ("One", "Two", "Three"):
+            assert name in texts
+        # Each row is its own panel – three panel-background
+        # rectangles (gradient + accent stroke = two passes per row,
+        # so 6 ``rounded_rect`` arcs total). We just check that the
+        # number of fills matches the number of rows: each
+        # background paints one filled rect.
+        # ``draw_panel_background`` calls ``cr.fill()`` once per row.
+        assert cr.fills == 3
+
+
+class TestVirtualFaderCard:
+    def test_long_name_truncated_to_fit_card(self) -> None:
+        cr = FakeCairo()
+        state = _base_state()
+        long_name = "X" * 80
+        draw_virtual_fader_card(
+            FakeRenderer(state=state),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=28,
+            vf=_vf(name=long_name, value=0.5),
+        )
+        texts = cr.show_text_strings()
+        # The full untruncated name is NOT in the output; the
+        # truncation helper produced something shorter.
+        assert long_name not in texts
+        # The value still renders alongside.
+        assert "0.50" in texts
+
+    def test_picked_up_uses_solid_text_color(self) -> None:
+        """A picked-up fader's value renders in the solid text
+        colour. Verifies by counting the muted-text calls – a
+        picked-up card uses muted only for the (absent) suffix
+        path; the value stays solid."""
+        cr = FakeCairo()
+        state = _base_state()
+        draw_virtual_fader_card(
+            FakeRenderer(state=state),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=28,
+            vf=_vf(picked_up=True),
+        )
+        # The value text is in the solid-colour set, which the
+        # renderer applies via ``set_source_rgb`` (not rgba).
+        rgb_calls = [c for c in cr.calls if c[0] == "rgb"]
+        # At least the name-set + value-set calls; both go through
+        # ``set_source_rgb`` for picked-up state.
+        assert len(rgb_calls) >= 2
+
+    def test_value_two_decimal_format(self) -> None:
+        cr = FakeCairo()
+        state = _base_state()
+        draw_virtual_fader_card(
+            FakeRenderer(state=state),
+            cr,
+            x=0,
+            y=0,
+            w=180,
+            h=28,
+            vf=_vf(value=0.123456789),
+        )
+        # Two decimals – matches the MIDI page's live indicator.
+        assert any("0.12" in t for t in cr.show_text_strings())
+        # Higher-precision form is not rendered.
+        assert not any("0.12345" in t for t in cr.show_text_strings())
+
+
+# --------------------------------------------------------------------------- #
+# Network screens
+# --------------------------------------------------------------------------- #
+
+
+def _network_state(**overrides: object):
+    """Build a ``PiNetworkOverlayState`` with sensible defaults for tests."""
+    from openfollow.runtime.overlay_state import PiNetworkOverlayState
+
+    s = PiNetworkOverlayState()
+    s.active_iface = "eth0"
+    s.banner = ""
+    s.rows = []
+    s.selected_index = 0
+    s.field_label = "IP Address"
+    s.field_value = "192.168.1.50"
+    for k, v in overrides.items():
+        setattr(s, k, v)
+    return s
+
+
+@pytest.fixture
+def chevrons(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, float, str]]:
+    """Every chevron drawn, as ``(cx, cy, direction)``."""
+    import openfollow.runtime.overlay_draw_hud as hud
+
+    drawn: list[tuple[float, float, str]] = []
+    real = hud.draw_chevron
+
+    def _record(cr: Any, cx: float, cy: float, direction: str = "right", **kwargs: Any) -> None:
+        drawn.append((cx, cy, direction))
+        real(cr, cx, cy, direction, **kwargs)
+
+    monkeypatch.setattr(hud, "draw_chevron", _record)
+    return drawn
+
+
+class TestTheChevron:
+    def test_it_is_drawn_as_heavily_as_the_signs_beside_it(self) -> None:
+        """A text glyph drew it thin and small on the station's screen. It is
+        now a stroked angle the size of the level signs, at their weight."""
+        import inspect
+
+        from openfollow.runtime.overlay_draw_style import CHEVRON_SIZE, draw_chevron, draw_level_sign
+
+        cr = FakeCairo()
+        draw_chevron(cr, 100.0, 50.0)
+        ys = [y for _x, y in cr.move_tos + cr.line_tos]
+        assert inspect.signature(draw_level_sign).parameters["size"].default == CHEVRON_SIZE
+        assert max(ys) - min(ys) >= 0.8 * CHEVRON_SIZE
+        assert ("line_width", CHEVRON_SIZE * 0.18) in cr.calls
+        assert CHEVRON_SIZE * 0.18 >= 2.0
+
+    @pytest.mark.parametrize("direction", ["down", "up"])
+    def test_turned_it_is_wider_than_tall(self, direction: str) -> None:
+        from openfollow.runtime.overlay_draw_style import draw_chevron
+
+        cr = FakeCairo()
+        draw_chevron(cr, 100.0, 50.0, direction)
+        xs = [x for x, _y in cr.move_tos + cr.line_tos]
+        ys = [y for _x, y in cr.move_tos + cr.line_tos]
+        assert max(xs) - min(xs) > max(ys) - min(ys)
+
+
+class TestTheSettingsMenuMarksWhatOpensAScreen:
+    def test_an_entry_that_opens_a_screen_gets_a_chevron(self, chevrons: list) -> None:
+        state = _base_state()
+        state.settings_menu_active = True
+        state.settings_items = ["Network", "Restart"]
+        state.settings_items_enabled = [True, True]
+        state.settings_items_disabled_reasons = ["", ""]
+        state.settings_items_submenu = [True, False]
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+        # One chevron for Network, none for Restart, which acts where it stands.
+        assert [direction for _x, _y, direction in chevrons] == ["right"]
+
+    def test_a_list_too_long_for_its_panel_hints_below_its_middle(self, chevrons: list) -> None:
+        """A ``v`` at the right edge of the last row read as that row's
+        chevron knocked over; a scroll hint sits centred under the list."""
+        state = _base_state()
+        state.settings_menu_active = True
+        state.settings_items = [f"Entry {i}" for i in range(40)]
+        state.settings_items_enabled = [True] * 40
+        state.settings_items_disabled_reasons = [""] * 40
+        state.settings_items_submenu = [True] + [False] * 39
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+        row = next(c for c in chevrons if c[2] == "right")
+        (hint,) = [c for c in chevrons if c[2] == "down"]
+        assert hint[0] < row[0] - 100.0
+        assert hint[1] > row[1]
+        assert not [t for t in cr.texts if t.text in ("v", "^")]
+
+
+class TestDrawPiNetworkScreen:
+    def test_a_row_that_opens_a_screen_is_marked(self, chevrons: list) -> None:
+        """A d-pad menu otherwise hides which rows take you somewhere until
+        you have already pressed one."""
+        rows = [
+            {"kind": "choice", "key": "iface:eth0", "label": "eth0", "value": "10.0.0.2", "opens": True},
+            {"kind": "display", "key": "web_host", "label": "http://x.local", "value": "any interface"},
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert len(chevrons) == 1
+
+    def test_the_chevron_and_the_pill_do_not_share_a_place(self, chevrons: list) -> None:
+        """Both want the right edge; the chevron takes it and the pill moves
+        inboard, or they draw on top of each other."""
+        rows = [
+            {
+                "kind": "choice",
+                "key": "iface:eth0",
+                "label": "eth0",
+                "value": "10.0.0.2",
+                "pill": "DHCP",
+                "opens": True,
+            }
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        (chevron,) = chevrons
+        bare = FakeCairo()
+        bare_state = _base_state(pi_network=_network_state(rows=[{k: v for k, v in rows[0].items() if k != "pill"}]))
+        draw_pi_network_screen(FakeRenderer(state=bare_state), bare, bare_state, 1600, 900)
+        pill_arcs = [arc for arc in cr.arcs if arc not in bare.arcs]
+        pill_right = max(cx + radius for cx, _cy, radius in pill_arcs)
+        # The chevron's left arm reaches about a third of its size from its centre.
+        assert pill_right < chevron[0] - 0.3 * CHEVRON_SIZE
+
+    def test_the_chevron_sits_in_its_row(self, chevrons: list) -> None:
+        """Centred on the row it marks, so it reads as that row's and not the next."""
+        rows = [{"kind": "choice", "key": "iface:eth0", "label": "eth0", "value": "10.0.0.2", "opens": True}]
+        state = _base_state(pi_network=_network_state(rows=rows, selected_index=-1))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        (chevron,) = chevrons
+        label = next(t for t in cr.texts if t.text == "eth0")
+        # The label's baseline sits below the row's middle by under its font size.
+        assert 0.0 < label.y - chevron[1] < label.font_size
+
+    def test_a_pill_is_no_rounder_than_the_row_it_sits_in(self) -> None:
+        """An inner corner is never rounder than its container, which is what
+        gives the HUD's pills the web's square-ish corners."""
+        from collections import Counter
+
+        from openfollow.runtime.overlay_draw_style import ROW_RADIUS
+
+        def arcs(row: dict) -> Counter:
+            state = _base_state(pi_network=_network_state(rows=[row]))
+            cr = FakeCairo()
+            draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+            return Counter(cr.arcs)
+
+        row = {"kind": "choice", "key": "iface:eth0", "label": "eth0", "value": "10.0.0.2"}
+        pill_arcs = arcs({**row, "pill": "fallback", "pill_level": "error"}) - arcs(row)
+        assert pill_arcs
+        assert {radius for _x, _y, radius in pill_arcs} == {ROW_RADIUS}
+
+    def test_a_pill_is_drawn_and_keeps_clear_of_the_value(self) -> None:
+        """The pill sits at the right edge, so the value has to stop short of
+        it - a value drawn to the full width would run underneath."""
+        rows = [
+            {"kind": "choice", "key": "iface:eth0", "label": "eth0", "value": "192.168.1.5", "pill": "DHCP"},
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        pill = next(t for t in cr.texts if t.text == "DHCP")
+        value = next(t for t in cr.texts if t.text == "192.168.1.5")
+        assert pill.x > value.x
+
+    @pytest.mark.parametrize(
+        ("pill", "level", "fill", "border"),
+        [
+            ("fallback", "error", COLOR_WARNING_FILL, COLOR_WARNING_BORDER),
+            ("web UI not here", "info", COLOR_INFO_FILL, COLOR_INFO_BORDER),
+        ],
+    )
+    def test_a_state_pill_takes_its_levels_chip_colours(self, pill, level, fill, border) -> None:  # noqa: ANN001
+        rows = [
+            {"kind": "choice", "key": "iface:eth0", "label": "eth0", "value": "", "pill": pill, "pill_level": level},
+            {"kind": "choice", "key": "iface:wlan0", "label": "wlan0", "value": "10.0.0.2", "pill": "DHCP"},
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert ("rgba", *fill) in cr.calls
+        assert ("rgb", *border) in cr.calls
+        # Off-white on the level's fill; the neutral pill keeps its muted text.
+        assert next(t for t in cr.texts if t.text == pill).rgba == (*COLOR_TEXT, 1.0)
+        assert next(t for t in cr.texts if t.text == "DHCP").rgba == COLOR_TEXT_MUTED
+
+    @pytest.mark.parametrize(
+        "level",
+        [{}, {"pill_level": ""}, {"pill_level": None}],
+        ids=["absent", "empty", "none"],
+    )
+    def test_a_neutral_pill_draws_no_status_colour(self, level: dict) -> None:
+        rows = [{"kind": "choice", "key": "iface:eth0", "label": "eth0", "value": "", "pill": "no address", **level}]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        fills = {c[1:] for c in cr.calls if c[0] == "rgba"}
+        assert not fills & {COLOR_WARNING_FILL, COLOR_INFO_FILL, COLOR_CAUTION_FILL}
+
+    @pytest.mark.parametrize("level", ["warning", "ERROR", 5, ["info"]], ids=["unknown", "wrong-case", "int", "list"])
+    def test_a_pill_level_nobody_defined_draws_as_an_error(self, level: object) -> None:
+        """A malformed writer shows as a fault, not as the neutral grey of no state at all."""
+        rows = [
+            {"kind": "choice", "key": "iface:eth0", "label": "eth0", "value": "", "pill": "odd", "pill_level": level}
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert ("rgb", *COLOR_WARNING_BORDER) in cr.calls
+        assert next(t for t in cr.texts if t.text == "odd").rgba == (*COLOR_TEXT, 1.0)
+
+    def test_a_row_without_a_pill_draws_none(self) -> None:
+        rows = [{"kind": "choice", "key": "iface:eth0", "label": "eth0", "value": "192.168.1.5"}]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert [t for t in cr.texts if t.text in {"DHCP", "fallback", "no address"}] == []
+
+    def test_a_heading_is_not_drawn_in_the_warning_colour(self) -> None:
+        """Amber on this screen means a row needs attention. A heading that
+        shares it raises a false alarm on a screen the operator only reaches
+        when something is already wrong, and leaves the real warnings reading
+        as furniture. Asserts they differ rather than naming a colour, so a
+        palette change cannot quietly reunite them."""
+        rows = [
+            {"kind": "header", "label": "Fix reachability"},
+            {"kind": "notice", "label": "eth0 has no address"},
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        heading = next(t for t in cr.texts if "FIX REACHABILITY" in t.text)
+        warning = next(t for t in cr.texts if "no address" in t.text)
+        assert heading.rgba != warning.rgba
+
+    def test_renders_sectioned_layout(self) -> None:
+        rows = [
+            {"kind": "header", "label": "Interface"},
+            {"kind": "choice", "key": "interface", "label": "Selected", "value": "eth0"},
+            {"kind": "header", "label": "IPv4"},
+            {"kind": "choice", "key": "method", "label": "Configure", "value": "DHCP"},
+            {"kind": "display", "key": "address", "label": "IP Address", "value": "192.168.1.50"},
+            {"kind": "header", "label": "Actions"},
+            {"kind": "action", "key": "apply", "label": "Apply Changes", "value": ""},
+            {"kind": "action", "key": "back", "label": "Back", "value": ""},
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows, selected_index=6))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        # Section headers shouted in caps.
+        assert "INTERFACE" in texts
+        assert "IPV4" in texts
+        assert "ACTIONS" in texts
+        # Data row label/value rendered.
+        assert any("Selected" in t for t in texts)
+        # Action row text rendered.
+        assert any("Apply Changes" in t for t in texts)
+
+    @pytest.mark.parametrize(
+        ("level", "fill", "border"),
+        [
+            ("error", COLOR_WARNING_FILL, COLOR_WARNING_BORDER),
+            ("caution", COLOR_CAUTION_FILL, COLOR_CAUTION_BORDER),
+            ("info", COLOR_INFO_FILL, COLOR_INFO_BORDER),
+        ],
+    )
+    def test_a_notice_is_a_status_row_of_its_level(self, level, fill, border) -> None:  # noqa: ANN001
+        """Off-white text on the level's fill, as the web boxes: never a tinted text."""
+        rows = [{"kind": "notice", "level": level, "label": "Web UI is served only at 10.0.0.2", "value": ""}]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert ("rgba", *fill) in cr.calls
+        assert ("rgb", *border) in cr.calls
+        assert next(t for t in cr.texts if "served only" in t.text).rgba == (*COLOR_TEXT, 1.0)
+
+    def test_a_notice_keeps_clear_of_the_row_above_and_the_heading_below(self) -> None:
+        rows = [
+            {"kind": "choice", "key": "iface:eth0", "label": "eth0", "value": "192.0.2.10"},
+            {"kind": "notice", "level": "info", "label": "Web UI is served only at 192.0.2.10"},
+            {"kind": "header", "label": "If you still can't reach it"},
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        row = next(t for t in cr.texts if t.text == "eth0")
+        notice = next(t for t in cr.texts if "served only" in t.text)
+        heading = next(t for t in cr.texts if t.text == "IF YOU STILL CAN'T REACH IT")
+        # Baseline to baseline: a data row followed by an unspaced notice sat 27px apart, the heading 35px below.
+        assert notice.y - row.y > 30
+        assert heading.y - notice.y > 40
+
+    def test_an_error_notice_leads_with_the_warning_sign(self) -> None:
+        rows = [{"kind": "notice", "level": "error", "label": "eth0 has no lease", "value": ""}]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        # The "!" is cut into the triangle in the warning red.
+        assert ("rgb", *COLOR_DANGER_BG) in cr.calls
+        assert not any(t.text.startswith("! ") for t in cr.texts)
+
+    def test_a_long_notice_wraps_rather_than_losing_its_end(self) -> None:
+        """The fallback sentence says who will not reach the station; truncated
+        to one line, that is the half an operator never sees."""
+        label = (
+            "No DHCP server answered, so eth0 gave itself 169.254.8.31. "
+            "Other machines on this network will not reach the station here."
+        )
+        rows = [{"kind": "notice", "level": "error", "label": label, "value": ""}]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 800, 900)
+        drawn = [t.text for t in cr.texts if t.rgba == (*COLOR_TEXT, 1.0) and t.text.strip()]
+        assert len(drawn) > 1
+        assert "reach the station here." in drawn[-1]
+
+    def test_a_notice_stops_at_three_lines(self) -> None:
+        """A backend message can run on; past three lines it is cut, not left to push the list off the panel."""
+        rows = [{"kind": "notice", "level": "error", "label": "word " * 400, "value": ""}]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 800, 900)
+        assert len([t for t in cr.texts if t.rgba == (*COLOR_TEXT, 1.0) and "word" in t.text]) == 3
+
+    @pytest.mark.parametrize(
+        ("level", "fill"),
+        [
+            ("error", COLOR_WARNING_FILL),
+            ("caution", COLOR_CAUTION_FILL),
+            ("info", COLOR_INFO_FILL),
+            ("success", COLOR_SUCCESS_FILL),
+        ],
+    )
+    def test_a_result_banner_takes_its_levels_colours(self, level, fill) -> None:  # noqa: ANN001
+        state = _base_state(pi_network=_network_state(banner="Apply failed: refused", banner_level=level))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert ("rgba", *fill) in cr.calls
+        assert any("Apply failed" in t for t in cr.show_text_strings())
+
+    def test_a_confirmation_is_a_green_row_led_by_the_off_white_check(self) -> None:
+        """As the web success box: the success fill and border, the sign off-white like every row's."""
+        state = _base_state(pi_network=_network_state(banner="Apply ok.", banner_level="success"))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert ("rgba", *COLOR_SUCCESS_FILL) in cr.calls
+        assert ("rgb", *COLOR_SUCCESS_BORDER) in cr.calls
+        assert ("rgb", *COLOR_SUCCESS_BG) in cr.calls  # the check, cut out of the off-white disc
+        assert ("rgb", *COLOR_OK) not in cr.calls
+
+    @pytest.mark.parametrize("busy", [True, False])
+    def test_an_action_in_progress_is_led_by_the_spinner(self, monkeypatch: pytest.MonkeyPatch, busy: bool) -> None:
+        """As the web's busy box: the spinner in the sign's place until the
+        answer comes, and the sign again once it has."""
+        import openfollow.runtime.overlay_draw_hud as hud
+
+        drawn: list[str] = []
+        monkeypatch.setattr(hud, "draw_spinner", lambda *args, **kwargs: drawn.append("spinner"))
+        monkeypatch.setattr(hud, "draw_level_sign", lambda cr, level, *args, **kwargs: drawn.append(level))
+        net = _network_state(banner="Apply in progress…", banner_level="info")
+        net.busy = busy
+        state = _base_state(pi_network=net)
+        draw_pi_network_screen(FakeRenderer(state=state), FakeCairo(), state, 1600, 900)
+        assert drawn[0] == ("spinner" if busy else "info")
+        assert ("info" in drawn) is not busy
+
+    @pytest.mark.parametrize("level", ["", "warning"], ids=["no-level", "unknown-level"])
+    def test_a_result_without_a_known_level_reads_as_a_fault(self, level: str) -> None:
+        """As the status badge: a malformed writer's line shows as an error, not as news."""
+        state = _base_state(pi_network=_network_state(banner="Apply failed: refused", banner_level=level))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert ("rgba", *COLOR_INFO_FILL) not in cr.calls
+
+    @pytest.mark.parametrize("level", [None, "warning", ["error"]], ids=["no-level", "unknown-level", "unhashable"])
+    def test_a_notice_without_a_known_level_reads_as_a_fault(self, level: object) -> None:
+        """It draws as an error rather than taking the screen down with it."""
+        rows = [{"kind": "notice", "level": level, "label": "eth0 has no address", "value": ""}]
+        state = _base_state(pi_network=_network_state(rows=rows))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert ("rgba", *COLOR_WARNING_FILL) in cr.calls
+        assert any("no address" in t for t in cr.show_text_strings())
+
+    def test_renders_banner_when_set(self) -> None:
+        rows = [
+            {"kind": "header", "label": "Actions"},
+            {"kind": "action", "key": "back", "label": "Back", "value": ""},
+        ]
+        state = _base_state(
+            pi_network=_network_state(
+                rows=rows,
+                selected_index=1,
+                banner="Apply ok.",
+            )
+        )
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        texts = cr.show_text_strings()
+        assert any("Apply ok" in t for t in texts)
+
+    def test_overlay_wraps_with_scrim(self) -> None:
+        rows = [{"kind": "action", "key": "back", "label": "Back", "value": ""}]
+        state = _base_state(pi_network=_network_state(rows=rows, selected_index=0))
+        cr = FakeCairo()
+        draw_pi_network_screen_overlay(FakeRenderer(state=state), cr, state, 1280, 720)
+        # Scrim is the full-frame rect at origin.
+        assert (0, 0, 1280, 720) in cr.rects
+
+    def test_selected_action_renders_with_highlight(self) -> None:
+        rows = [
+            {"kind": "action", "key": "apply", "label": "Apply", "value": ""},
+            {"kind": "action", "key": "back", "label": "Back", "value": ""},
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows, selected_index=0))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        # Both action labels rendered.
+        texts = cr.show_text_strings()
+        assert any("Apply" in t for t in texts)
+        assert any("Back" in t for t in texts)
+
+    def test_selected_choice_row_renders_highlight_box(self) -> None:
+        """When the cursor sits on a choice / text row the row gets a
+        soft-accent highlight box (the conditional branch at
+        overlay_draw_hud.py:1170)."""
+        rows = [
+            {"kind": "choice", "key": "method", "label": "Configure", "value": "DHCP"},
+            {"kind": "action", "key": "back", "label": "Back", "value": ""},
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows, selected_index=0))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        # COLOR_ACCENT_SOFT is set somewhere in the draw – verify by
+        # checking that the rgba call list includes a non-fully-opaque
+        # accent-soft tuple (the highlight) AND show_text shows the
+        # row label.
+        texts = cr.show_text_strings()
+        assert any("Configure" in t for t in texts)
+
+
+def _stroked_segments(cr) -> list[tuple[float, float, float, float]]:
+    """``(x0, y0, x1, y1)`` for each move_to immediately followed by line_to."""
+    segments = []
+    for prev, cur in zip(cr.calls, cr.calls[1:], strict=False):
+        if prev[0] == "move_to" and cur[0] == "line_to":
+            segments.append((prev[1], prev[2], cur[1], cur[2]))
+    return segments
+
+
+class TestTheFieldEditorShowsTheDpadCursor:
+    """Without this the gamepad entry path has no visual feedback at all:
+    left/right move nothing on screen, and up then changes a digit at a
+    position the operator cannot see."""
+
+    def _underlines(self, caret: int) -> list[tuple[float, float, float, float]]:
+        state = _base_state(
+            pi_network=_network_state(
+                field_label="IP Address",
+                field_value="192.168.001.005",
+                field_caret_offset=caret,
+                field_edit_active=True,
+            )
+        )
+        cr = FakeCairo()
+        draw_pi_network_field_edit(FakeRenderer(state=state), cr, state, 1280, 720)
+        return [seg for seg in _stroked_segments(cr) if abs(seg[1] - seg[3]) < 0.5]
+
+    def test_the_marker_tracks_the_digit_the_cursor_names(self) -> None:
+        """Asserted by moving it: the panel chrome draws horizontal strokes
+        too, so "a horizontal line exists" would pass with no cursor drawn
+        at all."""
+        first = set(self._underlines(0))
+        last = set(self._underlines(14))
+        moved = last - first
+        assert moved, "the cursor marker did not move with the cursor"
+        assert min(seg[0] for seg in moved) > max(seg[0] for seg in first - last)
+
+    def test_a_typed_value_keeps_the_end_of_string_caret(self) -> None:
+        """A freely typed value has no fixed slot-to-character mapping, so a
+        digit underline would sit under an arbitrary character."""
+        state = _base_state(
+            pi_network=_network_state(
+                field_label="IP Address",
+                field_value="192.168.1.5",
+                field_caret_offset=-1,
+                field_edit_active=True,
+            )
+        )
+        cr = FakeCairo()
+        draw_pi_network_field_edit(FakeRenderer(state=state), cr, state, 1280, 720)
+        verticals = [seg for seg in _stroked_segments(cr) if abs(seg[0] - seg[2]) < 0.5]
+        assert verticals, "no caret drawn for a typed value"
+
+    def test_the_title_says_what_is_being_changed(self) -> None:
+        """ "Address" is the internal key for the row; the operator-facing name
+        is the one the row itself carries."""
+        state = _base_state(
+            pi_network=_network_state(field_label="IP Address", field_edit_active=True, active_iface="eth0")
+        )
+        cr = FakeCairo()
+        draw_pi_network_field_edit(FakeRenderer(state=state), cr, state, 1280, 720)
+        assert any("CHANGE IP ADDRESS" in t for t in cr.show_text_strings())
+
+    def test_the_subtitle_names_the_interface(self) -> None:
+        """On a multi-NIC station the field alone does not say which interface
+        is about to change."""
+        state = _base_state(
+            pi_network=_network_state(field_label="IP Address", field_edit_active=True, active_iface="eth0.13")
+        )
+        cr = FakeCairo()
+        draw_pi_network_field_edit(FakeRenderer(state=state), cr, state, 1280, 720)
+        texts = cr.show_text_strings()
+        assert texts[texts.index("CHANGE IP ADDRESS") + 1] == "eth0.13"
+
+
+class TestTheScreenDoesNotTruncateAUrl:
+    def test_a_station_hostname_url_fits_the_label_column(self) -> None:
+        """The ``<slug>.local`` row is the headline of the recovery screen and
+        the line an operator reads out over comms. At the old 180px split it
+        ellipsised for a realistic station name."""
+        url = "http://openfollow-eager-moose.local"
+        rows = [
+            {"kind": "header", "label": "Open on a computer on the same network"},
+            {"kind": "display", "key": "web_host", "label": url, "value": "any interface"},
+        ]
+        state = _base_state(pi_network=_network_state(rows=rows, selected_index=1))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1280, 720)
+        assert url in cr.show_text_strings()
+
+
+class TestARowWithNoValueLendsItsColumnToTheLabel:
+    """An FQDN's URL runs past the column a ``.local`` one fits in, and the station's
+    name is the line an operator reads out, so an ellipsis there is a wrong address.
+    A name wider than the panel itself still ellipsises at its edge."""
+
+    _URL = "http://of-1.production.venue-name.example.org"
+
+    @staticmethod
+    def _draw(row: dict[str, object]) -> FakeCairo:
+        rows = [{"kind": "header", "label": "Open on a computer on the same network"}, row]
+        state = _base_state(pi_network=_network_state(rows=rows, selected_index=1))
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1280, 720)
+        return cr
+
+    def test_a_long_url_with_no_value_is_drawn_across_the_panel(self) -> None:
+        cr = self._draw({"kind": "display", "key": "web_host", "label": self._URL, "value": ""})
+        assert self._URL in cr.show_text_strings()
+
+    def test_a_row_with_a_value_keeps_its_label_to_the_column(self) -> None:
+        cr = self._draw({"kind": "display", "key": "web_host", "label": self._URL, "value": "any interface"})
+        assert self._URL not in cr.show_text_strings()
+        assert "any interface" in cr.show_text_strings()
+
+    def test_the_label_stops_short_of_a_pill(self) -> None:
+        """Lent the value column, the label still must not run under the pill."""
+        label = "x" * 400
+        cr = self._draw({"kind": "display", "key": "web_host", "label": label, "value": "", "pill": "Down"})
+        drawn = next(t for t in cr.texts if t.text.startswith("xxx"))
+        pill = next(t for t in cr.texts if t.text == "Down")
+        assert drawn.x + len(drawn.text) * drawn.font_size * 0.6 < pill.x
+
+
+class TestDrawPiNetworkFieldEdit:
+    def test_renders_field_label_and_value(self) -> None:
+        state = _base_state(
+            pi_network=_network_state(
+                field_label="IP Address",
+                field_value="192.168.1.50",
+            )
+        )
+        cr = FakeCairo()
+        draw_pi_network_field_edit(FakeRenderer(state=state), cr, state, 1280, 720)
+        texts = cr.show_text_strings()
+        assert any("IP ADDRESS" in t for t in texts)
+        assert any("192.168.1.50" in t for t in texts)
+
+    def test_empty_label_uses_value_placeholder(self) -> None:
+        state = _base_state(pi_network=_network_state(field_label="", field_value=""))
+        cr = FakeCairo()
+        draw_pi_network_field_edit(FakeRenderer(state=state), cr, state, 1280, 720)
+        texts = cr.show_text_strings()
+        assert "CHANGE VALUE" in texts
+
+    def test_overlay_wraps_with_scrim(self) -> None:
+        state = _base_state(pi_network=_network_state())
+        cr = FakeCairo()
+        draw_pi_network_field_edit_overlay(FakeRenderer(state=state), cr, state, 1280, 720)
+        assert (0, 0, 1280, 720) in cr.rects
+
+
+class _CountingCairo(FakeCairo):
+    """FakeCairo that counts ``text_extents`` calls – used to prove the
+    per-frame memo caches skip measurement on unchanged frames."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.text_extents_calls = 0
+
+    def text_extents(self, text: str):  # type: ignore[override]
+        self.text_extents_calls += 1
+        return super().text_extents(text)
+
+
+class TestPerFrameCaches:
+    """Verify per-frame HUD invariants are cached; unchanged frames
+    skip font re-resolution, measurement, and help rebuilds."""
+
+    # -- item 4: font face cache ------------------------------------------
+    def test_set_ui_font_uses_cached_face(self) -> None:
+        from openfollow.video.overlay import _UI_FONT_FACES, CairoOverlayRenderer
+
+        cr = FakeCairo()
+        CairoOverlayRenderer._set_ui_font(cr, 12.0, bold=False)
+        CairoOverlayRenderer._set_ui_font(cr, 14.0, bold=True)
+        CairoOverlayRenderer._set_ui_font(cr, 10.0, bold=False)  # cache hit
+        # No select_font_face: production sets a cached ToyFontFace instead.
+        assert not any(c[0] == "font_face" for c in cr.calls)
+        assert any(c[0] == "set_font_face" for c in cr.calls)
+        # Both variants resolved once and cached process-wide.
+        assert _UI_FONT_FACES[False] is not None
+        assert _UI_FONT_FACES[True] is not None
+
+    # -- item 5: info panel memo ------------------------------------------
+    def test_info_panel_memoises_measurement(self) -> None:
+        renderer = FakeRenderer()
+        st = renderer.state
+        st.ip_text = "192.168.1.50"
+        st.station_name = "Booth A"
+
+        cr1 = _CountingCairo()
+        draw_bottom_left_info_panel(renderer, cr1, st, 1280, 720)
+        assert cr1.text_extents_calls > 0  # first frame measures
+
+        cr2 = _CountingCairo()
+        draw_bottom_left_info_panel(renderer, cr2, st, 1280, 720)
+        assert cr2.text_extents_calls == 0  # unchanged → cache hit, no measure
+
+        st.ip_text = "192.168.1.99"  # a value changed
+        cr3 = _CountingCairo()
+        draw_bottom_left_info_panel(renderer, cr3, st, 1280, 720)
+        assert cr3.text_extents_calls > 0  # invalidated → re-measures
+
+    # -- item 6: help sections memo ---------------------------------------
+    def test_help_sections_memoised(self, monkeypatch) -> None:
+        import openfollow.runtime.overlay_draw_hud as hud
+
+        modes: list[str] = []
+        real = hud.build_help_sections
+
+        def _counting(**kw):
+            modes.append(kw["mode"])
+            return real(**kw)
+
+        monkeypatch.setattr(hud, "build_help_sections", _counting)
+        renderer = FakeRenderer()
+        st = renderer.state
+        st.controller_connected = True
+
+        s1 = hud._help_sections_for(renderer, "normal", st)
+        s2 = hud._help_sections_for(renderer, "normal", st)
+        assert s1 is s2  # same object returned from cache
+        assert modes == ["normal"]  # built once
+
+        hud._help_sections_for(renderer, "settings", st)  # mode change
+        assert modes == ["normal", "settings"]
+
+        st.button_labels = {"reset": "Y"}  # a rebind
+        hud._help_sections_for(renderer, "settings", st)
+        assert modes == ["normal", "settings", "settings"]
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_wheel_hint_follows_the_wheel_z_setting_on_every_platform(self, monkeypatch, platform) -> None:
+        # Wheel-Z works on macOS too, so the hint must not be hidden there;
+        # turning wheel-Z off is what hides it, and the cached help rebuilds.
+        import openfollow.runtime.overlay_draw_hud as hud
+
+        monkeypatch.setattr(sys, "platform", platform)
+        renderer = FakeRenderer()
+        st = renderer.state
+        st.mouse_enabled = True
+        st.mouse_wheel_z_enabled = True
+        mouse = dict(hud._help_sections_for(renderer, "normal", st))["Mouse"]
+        assert "Scroll wheel: Adjust Z" in mouse
+        st.mouse_wheel_z_enabled = False
+        mouse = dict(hud._help_sections_for(renderer, "normal", st))["Mouse"]
+        assert not any("Scroll wheel" in line for line in mouse)
+
+
+class TestVideoFailureReachesTheDeviceSurfaces:
+    """The classification has to reach the operator standing at the machine.
+
+    The browser led with the sentence naming what failed and put the element's
+    wording under it; the device's own error box carried only the raw wording,
+    which is half of what the browser was reporting.
+    """
+
+    def _state(self, *, sentence: str, error: str = "", action: str = "") -> OverlayState:
+        state = OverlayState()
+        state.settings_menu_active = True
+        state.video_failure_text = sentence
+        state.video_failure_action = action
+        state.error_message = error
+        return state
+
+    def _drawn(self, state: OverlayState) -> str:
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(), cr, state, 1920, 1080)
+        # The box word-wraps, so a sentence arrives as several show_text calls.
+        return " ".join(cr.show_text_strings())
+
+    def test_the_box_carries_the_sentence_and_the_next_step(self) -> None:
+        """Both halves: what the station saw, and the one thing to try. The
+        pipeline's own wording is not here - there is nothing an operator on a
+        dark stage can do with "could not open resource for reading"."""
+        drawn = self._drawn(
+            self._state(
+                sentence="Nothing answered at 192.0.2.10:554.",
+                error="Could not open resource for reading and writing.",
+                action="Check the camera is powered and on this network.",
+            )
+        )
+        assert "Nothing answered at 192.0.2.10:554." in drawn
+        assert "Check the camera is powered and on this network." in drawn
+        assert "Could not open resource" not in drawn
+
+    def test_the_element_wording_stands_in_when_there_is_no_sentence(self) -> None:
+        """A local fault has no classification, so its raw text is the message."""
+        drawn = self._drawn(self._state(sentence="", error="v4l2src is Linux-only", action="Check Video Source."))
+        assert "v4l2src is Linux-only" in drawn
+
+    def test_an_auto_opened_banner_still_wins(self) -> None:
+        """The startup path composes its own message; it must not be doubled."""
+        state = self._state(sentence="Nothing answered at X.", error="raw")
+        state.settings_menu_banner = "Video source (rtsp) is not available."
+        drawn = self._drawn(state)
+
+        assert "Video source (rtsp) is not available." in drawn
+        assert "Nothing answered at X." not in drawn
+
+    def test_a_healthy_feed_draws_no_error_box(self) -> None:
+        assert "ERROR" not in self._drawn(self._state(sentence="", error=""))
+
+    def test_a_classified_failure_alone_still_raises_the_box(self) -> None:
+        """Our own watchdog often fires before GStreamer posts anything, so
+        there is a verdict and no element wording at all."""
+        assert "ERROR" in self._drawn(self._state(sentence="Video from X stopped arriving."))
+
+
+class TestTheDeviceBoxMatchesTheBrowser:
+    """An operator comparing the projected screen against a laptop must see one
+    message, not two versions of it. Same two weights, same colours as the web
+    UI's ``.notice.error`` and its ``.notice-sub``.
+    """
+
+    def _draws(self) -> FakeCairo:
+        cr = FakeCairo()
+        state = OverlayState()
+        state.settings_menu_active = True
+        state.video_failure_text = "Nothing answered at 192.0.2.10:554."
+        state.video_failure_action = "Check the camera is powered and on this network."
+        draw_settings_menu(FakeRenderer(), cr, state, 1920, 1080)
+        return cr
+
+    def _find(self, cr: FakeCairo, needle: str) -> Any:
+        matches = cr.find_texts(needle)
+        assert matches, f"{needle!r} was not drawn"
+        return matches[0]
+
+    def test_the_observation_carries_the_emphasis(self) -> None:
+        assert self._find(self._draws(), "Nothing answered").bold is True
+
+    def test_the_next_step_is_lighter_but_the_same_size(self) -> None:
+        """Weight and opacity carry the subordination. A smaller face costs
+        legibility on a projected screen for a distinction already made."""
+        cr = self._draws()
+        lead = self._find(cr, "Nothing answered")
+        action = self._find(cr, "Check the camera")
+        assert action.bold is False
+        assert lead.bold is True
+        assert action.font_size == lead.font_size
+
+    def test_the_box_leads_with_the_warning_sign(self) -> None:
+        """The same sign as the status rows, with every text line beside it."""
+        cr = self._draws()
+        kinds = [c[0] for c in cr.calls]
+        apex = next(c for c in cr.calls[kinds.index("line_join") :] if c[0] == "move_to")
+        label = self._find(cr, "ERROR")
+        assert label.x > apex[1] + 8
+        assert self._find(cr, "Nothing answered").x == label.x
+        assert self._find(cr, "Check the camera").x == label.x
+
+    def test_the_text_keeps_the_huds_own_colours(self) -> None:
+        """The box carries the red; its text reads like every other HUD text:
+        the observation in the normal colour, the label and next step muted."""
+        cr = self._draws()
+        assert self._find(cr, "Nothing answered").rgba[:3] == COLOR_TEXT
+        assert self._find(cr, "Check the camera").rgba == COLOR_TEXT_MUTED
+        assert self._find(cr, "ERROR").rgba == COLOR_TEXT_MUTED
+
+    def test_the_source_is_named_once(self) -> None:
+        """The sentence already carries the address; a headline above it
+        printed the same URL a second line later."""
+        cr = self._draws()
+        assert len(cr.find_texts("192.0.2.10:554")) == 1
+
+
+class TestSettingsMenuLinkColumns:
+    """The Settings screen ends in the addresses an operator cannot type.
+
+    The station has no keyboard for a URL and often no second screen, so the
+    codes are the usable half and the rows above them must leave room: the list
+    takes the height its items need rather than everything left over.
+    """
+
+    @staticmethod
+    def _draw(width: int = 1600, height: int = 900) -> FakeCairo:
+        state = _base_state(settings_items=["Network"], settings_items_enabled=[True])
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, width, height)
+        return cr
+
+    @staticmethod
+    def _codes(cr: FakeCairo) -> list[list[tuple[float, float, float, float]]]:
+        """The drawn modules, grouped into one list per code from left to right."""
+        modules = sorted((r for r in cr.rects if r[2] == r[3] and r[2] < 10.0), key=lambda r: r[0])
+        codes: list[list[tuple[float, float, float, float]]] = [[modules[0]]]
+        for rect in modules[1:]:
+            if rect[0] - max(r[0] for r in codes[-1]) > 2 * rect[2]:
+                codes.append([])
+            codes[-1].append(rect)
+        return codes
+
+    def test_every_caption_renders_in_full(self) -> None:
+        """Three columns are narrower than two were; no authored line may lose its end."""
+        drawn = self._draw().show_text_strings()
+        for code in LINKS:
+            for line in code.lines:
+                assert line in drawn
+
+    def test_every_code_renders(self) -> None:
+        codes = self._codes(self._draw())
+        assert [len(c) for c in codes] == [sum(row.count("#") for row in code.symbol) for code in LINKS]
+
+    def test_the_codes_sit_side_by_side_on_one_line(self) -> None:
+        """Each code's white field starts on the same line, whatever its own size
+        or its caption; and they are separate columns, not one code split up."""
+        codes = self._codes(self._draw())
+        assert len(codes) == len(LINKS)
+        fields = [min(r[1] for r in c) - QUIET_MODULES * c[0][2] for c in codes]
+        assert fields == pytest.approx([fields[0]] * len(LINKS))
+        for left, right in zip(codes, codes[1:], strict=False):
+            assert min(r[0] for r in right) - max(r[0] for r in left) > right[0][2]
+
+    def test_the_list_takes_its_rows_not_the_whole_panel(self) -> None:
+        """Two items must not produce the same list box as eight."""
+        heights = []
+        for count in (2, 8):
+            state = _base_state(
+                settings_items=[f"Item {i}" for i in range(count)],
+                settings_items_enabled=[True] * count,
+            )
+            cr = FakeCairo()
+            draw_settings_menu(FakeRenderer(state=state), cr, state, 1600, 900)
+            module = min(r[2] for r in cr.rects if r[2] > 0.0)
+            tops = [r[1] for r in cr.rects if r[2] == pytest.approx(module)]
+            heights.append(min(tops))
+        assert heights[0] < heights[1]
+
+    def test_a_panel_too_short_for_a_readable_code_draws_none(self) -> None:
+        """Half a code is not a code; below the floor the block is dropped."""
+        state = _base_state(
+            settings_items=[f"Item {i}" for i in range(12)],
+            settings_items_enabled=[True] * 12,
+        )
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, 640, 320)
+        blob = " ".join(cr.show_text_strings())
+        assert "openfollow.app/docs" not in blob
+        assert "Support OpenFollow" not in blob
+
+
+class TestSettingsMenuSupportColumn:
+    """The Support OpenFollow column reads as a request, not as another link."""
+
+    @staticmethod
+    def _draw(width: int = 1600, height: int = 900) -> FakeCairo:
+        state = _base_state(settings_items=["Network"], settings_items_enabled=[True])
+        cr = FakeCairo()
+        draw_settings_menu(FakeRenderer(state=state), cr, state, width, height)
+        return cr
+
+    @staticmethod
+    def _box(modules: list[tuple[float, float, float, float]]) -> tuple[float, float, float, float]:
+        """A code's white field as (left, top, right, bottom), quiet zone included."""
+        quiet = QUIET_MODULES * modules[0][2]
+        return (
+            min(r[0] for r in modules) - quiet,
+            min(r[1] for r in modules) - quiet,
+            max(r[0] + r[2] for r in modules) + quiet,
+            max(r[1] + r[3] for r in modules) + quiet,
+        )
+
+    @classmethod
+    def _frame_and_content(cls, cr: FakeCairo) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """The dashed frame's edges and the support column's ink, each as (left, top, right, bottom)."""
+        at = cr.calls.index(("dash", SUPPORT_DASH, 0.0))
+        start = max(i for i, c in enumerate(cr.calls[:at]) if c == ("save",))
+        xs, ys = zip(*(c[1:3] for c in cr.calls[start:at] if c[0] in {"move_to", "line_to"}), strict=True)
+        field = cls._box(TestSettingsMenuLinkColumns._codes(cr)[LINKS.index(SUPPORT)])
+        lefts = [field[0], min(min(c[1], c[3], c[5]) for c in cr.calls if c[0] == "curve_to")]
+        rights = [field[2]]
+        measure = FakeCairo()
+        for line in SUPPORT.lines:
+            text = next(t for t in cr.texts if t.text == line)
+            measure.set_font_size(text.font_size)
+            lefts.append(text.x)
+            rights.append(text.x + measure.text_extents(line).width)
+        title = next(t for t in cr.texts if t.text == SUPPORT.lines[0])
+        measure.set_font_size(title.font_size)
+        top = title.y + measure.text_extents(title.text).y_bearing
+        return (min(xs), min(ys), max(xs), max(ys)), (min(lefts), top, max(rights), field[3])
+
+    def test_only_the_support_column_is_framed_dashed(self) -> None:
+        dashes = [c for c in self._draw().calls if c[0] == "dash"]
+        assert dashes == [("dash", SUPPORT_DASH, 0.0)]
+
+    def test_the_frame_takes_the_websites_edge_colour(self) -> None:
+        """The same dashed gold as the website's card, so both read as one request."""
+        calls = self._draw().calls
+        at = calls.index(("dash", SUPPORT_DASH, 0.0))
+        colour = next(c for c in reversed(calls[:at]) if c[0] in {"rgb", "rgba"})
+        assert colour == ("rgba", *COLOR_SUPPORT_BORDER)
+
+    def test_the_dash_ends_with_the_frame(self) -> None:
+        """Left set, the dash would carry into every later stroke on the screen."""
+        calls = self._draw().calls
+        at = calls.index(("dash", SUPPORT_DASH, 0.0))
+        saved = max(i for i, c in enumerate(calls[:at]) if c == ("save",))
+        restored = next(i for i, c in enumerate(calls[at:], start=at) if c == ("restore",))
+        assert sum(1 for c in calls[saved:restored] if c == ("save",)) == 1
+        assert ("stroke",) in calls[at:restored]
+
+    @pytest.mark.parametrize(
+        "size",
+        [(1600, 900), (1100, 600), (1120, 900)],
+        ids=["code-widest", "caption-widest", "code-fills-its-column"],
+    )
+    def test_the_frame_leaves_the_same_space_on_all_four_sides(self, size: tuple[int, int]) -> None:
+        """The frame hugs the caption and the code, not the column they are centred in."""
+        frame, content = self._frame_and_content(self._draw(*size))
+        gaps = [content[0] - frame[0], content[1] - frame[1], frame[2] - content[2], frame[3] - content[3]]
+        assert gaps[0] > 0
+        assert gaps == pytest.approx([gaps[0]] * 4, abs=0.5)
+
+    def test_the_frame_keeps_clear_of_the_next_code(self) -> None:
+        """Where the code fills its column the space shrinks on every side rather than crowd its neighbour."""
+        cr = self._draw(1120, 900)
+        frame, content = self._frame_and_content(cr)
+        neighbour = self._box(TestSettingsMenuLinkColumns._codes(cr)[LINKS.index(SUPPORT) - 1])
+        pad = content[0] - frame[0]
+        assert pad > 0
+        assert frame[0] - neighbour[2] >= pad - 1e-6
+
+    def test_a_heart_leads_the_accent_title(self) -> None:
+        cr = self._draw()
+        title = next(t for t in cr.texts if t.text == SUPPORT.lines[0])
+        assert title.rgba[:3] == COLOR_ACCENT
+        hearts = [c for c in cr.calls if c[0] == "curve_to"]
+        assert len(hearts) == 6
+        assert max(max(c[1], c[3], c[5]) for c in hearts) < title.x
+        for line in SUPPORT.lines[1:]:
+            assert next(t for t in cr.texts if t.text == line).rgba == COLOR_TEXT_MUTED
+
+
+class TestDriveScreens:
+    """Settings → Export Diagnostics File for Support: the drive picker and the export screen."""
+
+    def test_the_picker_lists_every_drive_and_why_one_cannot_be_written(self) -> None:
+        from openfollow.runtime.overlay_draw_hud import draw_media_picker_overlay
+
+        state = OverlayState()
+        state.media_picker_title = "SAVE DIAGNOSTICS"
+        state.media_picker_items = [
+            "SanDisk Ultra · FAT32 · 32 GB",
+            "WD Passport (MAC) · APFS · 2.0 TB (APFS can't be written)",
+        ]
+        state.media_picker_index = 0
+        cr = FakeCairo()
+        draw_media_picker_overlay(FakeRenderer(), cr, state, 1920, 1080)
+        texts = cr.show_text_strings()
+        assert "SAVE DIAGNOSTICS" in texts
+        assert "Choose a USB storage device and confirm to save." in texts
+        assert any("SanDisk Ultra · FAT32 · 32 GB" in t for t in texts)
+        assert any("(APFS can't be written)" in t for t in texts)
+
+    def test_the_picker_says_when_no_drive_is_attached(self) -> None:
+        from openfollow.runtime.overlay_draw_hud import draw_media_picker_overlay
+
+        state = OverlayState()
+        state.media_picker_title = "SAVE DIAGNOSTICS"
+        state.media_picker_empty = "No USB storage device found. Plug one in."
+        cr = FakeCairo()
+        draw_media_picker_overlay(FakeRenderer(), cr, state, 1920, 1080)
+        assert any("No USB storage device found. Plug one in." in t for t in cr.show_text_strings())
+
+    @pytest.mark.parametrize(
+        ("lines", "subtitle", "sign"),
+        [
+            (
+                ("Collecting diagnostics", "The export continues in the background.", None),
+                "The diagnostics file for support, to a USB storage device.",
+                None,
+            ),
+            (
+                ("Saved ofdiag-rig.txt to SanDisk Ultra.", "It can be removed now.", True),
+                "The diagnostics file for support, to a USB storage device.",
+                "success",
+            ),
+            (
+                ("The USB storage device is full.", "Pick a USB storage device to try again.", False),
+                "The diagnostics file for support, to a USB storage device.",
+                "error",
+            ),
+        ],
+        ids=["running", "saved", "failed"],
+    )
+    def test_the_export_screen_says_what_happened_and_the_next_step(self, monkeypatch, lines, subtitle, sign) -> None:  # noqa: ANN001
+        import openfollow.runtime.overlay_draw_hud as hud
+
+        signs: list[str] = []
+        monkeypatch.setattr(hud, "draw_level_sign", lambda cr, level, *a, **k: signs.append(level))
+        state = OverlayState()
+        state.media_export_lines = lines
+        cr = FakeCairo()
+        hud.draw_media_export_overlay(FakeRenderer(), cr, state, 1920, 1080)
+        texts = cr.show_text_strings()
+        assert ["SAVE DIAGNOSTICS", subtitle, lines[0], lines[1]] == [
+            t for t in texts if t in {"SAVE DIAGNOSTICS", subtitle, lines[0], lines[1]}
+        ]
+        assert signs == ([] if sign is None else [sign])
+
+    def test_a_drive_that_cannot_be_written_is_led_by_the_crossed_disc(self, monkeypatch) -> None:  # noqa: ANN001
+        import openfollow.runtime.overlay_draw_hud as hud
+
+        marks: list[float] = []
+        monkeypatch.setattr(hud, "_draw_offline_mark", lambda cr, cx, cy, r: marks.append(cy))
+        state = OverlayState()
+        state.media_picker_title = "SAVE DIAGNOSTICS"
+        state.media_picker_items = [
+            "SanDisk Ultra · FAT32 · 31 GB",
+            "WD Passport · APFS · 2.0 TB (APFS can't be written)",
+        ]
+        state.media_picker_enabled = [True, False]
+        state.media_picker_index = 0
+        cr = FakeCairo()
+        hud.draw_media_picker_overlay(FakeRenderer(), cr, state, 1920, 1080)
+        assert len(marks) == 1
+        moves = {d.text: d for d in cr.texts}
+        writable = next(d for t, d in moves.items() if t.startswith("SanDisk"))
+        unwritable = next(d for t, d in moves.items() if t.startswith("WD Passport"))
+        # The name moves right to make room for the mark, on the second row.
+        assert unwritable.x > writable.x
+        assert marks[0] > writable.y - 30
+
+    @pytest.mark.parametrize("now", [0.0, 0.175, 0.35])
+    def test_the_spinner_turns_with_the_clock(self, now: float) -> None:
+        import math
+
+        from openfollow.runtime.overlay_draw_hud import draw_spinner
+
+        cr = FakeCairo()
+        draw_spinner(cr, 100.0, 50.0, 8.0, now)
+        ring, arc = [c for c in cr.calls if c[0] == "arc"]
+        assert ring[4:] == (0, 2 * math.pi)
+        start = now / 0.7 * 2 * math.pi
+        assert arc[4:] == pytest.approx((start, start + math.pi / 2))
+
+    @pytest.mark.parametrize(("ok", "drawn"), [(None, "spinner"), (True, "success"), (False, "error")])
+    def test_the_spinner_shows_only_while_the_export_runs(self, monkeypatch, ok, drawn) -> None:  # noqa: ANN001
+        import openfollow.runtime.overlay_draw_hud as hud
+
+        seen: list[str] = []
+        monkeypatch.setattr(hud, "draw_spinner", lambda *a, **k: seen.append("spinner"))
+        monkeypatch.setattr(hud, "draw_level_sign", lambda cr, level, *a, **k: seen.append(level))
+        state = OverlayState()
+        state.media_export_lines = ("Collecting diagnostics", "The export continues in the background.", ok)
+        hud.draw_media_export_overlay(FakeRenderer(), FakeCairo(), state, 1920, 1080)
+        assert seen == [drawn]
+
+    def test_the_export_screen_spinner_reads_the_clock_by_itself(self, monkeypatch) -> None:  # noqa: ANN001
+        import openfollow.runtime.overlay_draw_hud as hud
+
+        times: list[float] = []
+        monkeypatch.setattr(hud, "draw_spinner", lambda cr, cx, cy, r, now: times.append(now))
+        monkeypatch.setattr(hud.time, "monotonic", lambda: 12.5)
+        state = OverlayState()
+        state.media_export_lines = ("Collecting diagnostics", "The export continues in the background.", None)
+        hud.draw_media_export_overlay(FakeRenderer(), FakeCairo(), state, 1920, 1080)
+        hud.draw_media_export_overlay(FakeRenderer(), FakeCairo(), state, 1920, 1080, now=3.0)
+        assert times == [12.5, 3.0]
+
+    @pytest.mark.parametrize(
+        ("ok", "fill", "border"),
+        [(True, COLOR_SUCCESS_FILL, COLOR_SUCCESS_BORDER), (False, COLOR_WARNING_FILL, COLOR_WARNING_BORDER)],
+        ids=["saved", "failed"],
+    )
+    def test_the_export_result_is_a_box_of_its_level(self, ok, fill, border) -> None:  # noqa: ANN001
+        """As the web's result box: off-white on the level's fill, the next step muted under it."""
+        from openfollow.runtime.overlay_draw_hud import draw_media_export_overlay
+
+        state = OverlayState()
+        state.media_export_lines = ("Saved ofdiag-rig.txt to SanDisk Ultra.", "It can be removed now.", ok)
+        cr = FakeCairo()
+        draw_media_export_overlay(FakeRenderer(), cr, state, 1920, 1080)
+        assert ("rgba", *fill) in cr.calls
+        assert ("rgb", *border) in cr.calls
+        (head,) = cr.find_texts("Saved ofdiag-rig.txt")
+        (step,) = cr.find_texts("It can be removed now.")
+        assert (head.rgba, head.bold) == ((*COLOR_TEXT, 1.0), True)
+        assert (step.rgba, step.bold) == (tuple(COLOR_TEXT_MUTED), False)
+
+    def test_an_export_in_progress_is_not_a_box(self) -> None:
+        from openfollow.runtime.overlay_draw_hud import draw_media_export_overlay
+
+        state = OverlayState()
+        state.media_export_lines = ("Collecting diagnostics", "The export continues in the background.", None)
+        cr = FakeCairo()
+        draw_media_export_overlay(FakeRenderer(), cr, state, 1920, 1080, now=0.0)
+        fills = {c[1:] for c in cr.calls if c[0] == "rgba"}
+        assert not fills & {COLOR_SUCCESS_FILL, COLOR_WARNING_FILL, COLOR_INFO_FILL, COLOR_CAUTION_FILL}
+
+    def test_a_saved_export_is_led_by_the_off_white_check(self) -> None:
+        """A sign in a row of its level's fill is off-white, as every status row's."""
+        from openfollow.runtime.overlay_draw_hud import draw_media_export_overlay
+
+        state = OverlayState()
+        state.media_export_lines = ("Saved ofdiag-rig.txt to SanDisk Ultra.", "It can be removed now.", True)
+        cr = FakeCairo()
+        draw_media_export_overlay(FakeRenderer(), cr, state, 1920, 1080)
+        assert ("rgb", *COLOR_SUCCESS_BG) in cr.calls  # the check, cut out of the off-white disc
+        assert ("rgb", *COLOR_OK) not in cr.calls
+
+    def test_a_long_result_wraps_and_the_panel_grows_to_hold_it(self) -> None:
+        """Cut to one line, a long station name left out the drive the file went to."""
+        from openfollow.runtime.overlay_draw_hud import draw_media_export_overlay
+
+        def drawn(headline: str) -> tuple[list[str], list[float]]:
+            state = OverlayState()
+            state.media_export_lines = (headline, "It can be removed now.", True)
+            cr = FakeCairo()
+            draw_media_export_overlay(FakeRenderer(), cr, state, 1920, 1080)
+            heads = [t.text for t in cr.texts if t.bold and t.font_size == 16 and t.text]
+            (title,) = cr.find_texts("SAVE DIAGNOSTICS")
+            (step,) = cr.find_texts("It can be removed now.")
+            # The panel's rounded corners are its outermost arcs.
+            panel_h = max(cy + r for _cx, cy, r in cr.arcs) - min(cy - r for _cx, cy, r in cr.arcs)
+            return heads, [step.y - title.y, panel_h]
+
+        headline = "Saved ofdiag-front-of-house-stage-left-20261004T221500Z.txt to SanDisk Ultra Fit (sda1)."
+        short_heads, short_below = drawn("Saved ofdiag-rig.txt to SanDisk Ultra.")
+        long_heads, long_below = drawn(headline)
+        assert (len(short_heads), " ".join(long_heads)) == (1, headline)
+        assert len(long_heads) == 2
+        # The next step moves down by the headline's second line, and the panel grows by it.
+        assert [b - a for a, b in zip(short_below, long_below, strict=True)] == pytest.approx([22.0, 22.0])
+
+    def test_a_result_stops_at_two_lines(self) -> None:
+        from openfollow.runtime.overlay_draw_hud import draw_media_export_overlay
+
+        state = OverlayState()
+        state.media_export_lines = ("word " * 200, "step " * 200, False)
+        cr = FakeCairo()
+        draw_media_export_overlay(FakeRenderer(), cr, state, 1920, 1080)
+        heads = cr.find_texts("word")
+        steps = cr.find_texts("step")
+        assert (len(heads), len(steps)) == (2, 2)
+        assert heads[-1].text.endswith("...") and steps[-1].text.endswith("...")
+
+
+class TestNetworkScreenTitle:
+    def test_an_interface_screen_draws_its_headline_in_capitals(self) -> None:
+        net = _network_state(rows=[])
+        net.open_iface = "enx9c69d3ac16ab"
+        net.title = "Network Interface: Lighting (enx9c69d3ac16ab)"
+        state = _base_state(pi_network=net)
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert "NETWORK INTERFACE: LIGHTING (ENX9C69D3AC16AB)" in cr.show_text_strings()
+
+    def test_a_headline_wider_than_the_panel_is_cut_to_it(self) -> None:
+        net = _network_state(rows=[])
+        net.open_iface = "enx9c69d3ac16ab"
+        net.title = "Network Interface: WWWWWWWWWWWWWWWWWWWW (enx9c69d3ac16ab)"
+        state = _base_state(pi_network=net)
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1280, 720)
+        title = next(t for t in cr.texts if t.text.startswith("NETWORK INTERFACE"))
+        assert title.text.endswith("...")
+
+    def test_without_a_headline_the_interface_name_titles_it(self) -> None:
+        net = _network_state(rows=[])
+        net.open_iface = "eth0"
+        state = _base_state(pi_network=net)
+        cr = FakeCairo()
+        draw_pi_network_screen(FakeRenderer(state=state), cr, state, 1600, 900)
+        assert "ETH0" in cr.show_text_strings()

@@ -1,0 +1,8392 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""System tests for ConfigWebServer – real HTTP requests against a live server.
+
+Spins up a Bottle server on a free localhost port.  Multicast beacon I/O is
+stubbed out so tests run offline and without network privileges.  Every test
+that hits a template validates end-to-end rendering; every config POST test
+re-reads the saved file to confirm persistence.
+"""
+
+from __future__ import annotations
+
+import html
+import io
+import json
+import os
+import re
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import wsgiref.util
+from pathlib import Path
+from typing import Any
+
+import pytest
+import tomllib
+
+import openfollow
+import openfollow.services as services_module
+import openfollow.web.discovery as discovery_module
+from openfollow.configuration import MOUSE3D_AXIS_FORM_LABELS, AppConfig, load_config, save_config
+from openfollow.marker_catalog import MarkerCatalog
+from openfollow.palette import AUTO_PICK_ORDER
+from openfollow.runtime.overlay_links import SUPPORT
+from openfollow.web import diagnostics, peer_auth
+from openfollow.web import whats_new as whats_new_module
+from openfollow.web.server import ConfigWebServer
+from tests._ports import live_on_free_port, start_on_free_port
+
+pytestmark = pytest.mark.integration
+
+# ---------------------------------------------------------------------------
+# Infrastructure
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def live_server(tmp_path, monkeypatch):
+    """ConfigWebServer on a free localhost port; beacon I/O stubbed out."""
+    monkeypatch.setattr(discovery_module.BeaconSender, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconSender, "stop", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "stop", lambda self: None)
+
+    config_path = tmp_path / "config.toml"
+    with live_on_free_port(
+        lambda port: ConfigWebServer(
+            config_path=str(config_path),
+            host="127.0.0.1",
+            port=port,
+            system_name="TestSystem",
+        )
+    ) as (server, base):
+        yield server, base
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+
+def _get(base: str, path: str) -> tuple[int, str]:
+    try:
+        with urllib.request.urlopen(f"{base}{path}", timeout=5) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def _get_json(base: str, path: str) -> tuple[int, dict]:
+    status, body = _get(base, path)
+    return status, json.loads(body)
+
+
+def _post_json(base: str, path: str, data: dict) -> tuple[int, dict]:
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=json.dumps(data).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def _post_raw_json(base: str, path: str, payload: object, method: str = "POST") -> tuple[int, dict]:
+    """Post an arbitrary JSON value (not necessarily a dict) and parse the response."""
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def _post_form_full(base: str, path: str, data: dict) -> tuple[int, str, dict]:
+    """Form POST returning ``(status, body, headers_dict)``."""
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=urllib.parse.urlencode(data).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode(), dict(r.headers.items())
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(), dict(e.headers.items())
+
+
+def _post_form(base: str, path: str, data: dict) -> tuple[int, str]:
+    status, body, _ = _post_form_full(base, path, data)
+    return status, body
+
+
+def _no_redirect_opener() -> urllib.request.OpenerDirector:
+    """Return an opener that surfaces 3xx responses instead of following them.
+
+    Tests assert on the Location header + status code; following the
+    redirect would lose that information.
+    """
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_a, **_kw):
+            return None
+
+    return urllib.request.build_opener(_NoRedirect)
+
+
+# ---------------------------------------------------------------------------
+# HTML page smoke tests – any template rendering error surfaces here
+# ---------------------------------------------------------------------------
+
+
+def test_index_page_renders(live_server) -> None:
+    server, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert len(body) > 200
+
+
+def test_index_page_populates_detection_partial_context(live_server) -> None:
+    """Initial render supplies same context as /section/detection for
+    dropdowns and static catalogue entries."""
+    _, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+    sec_status, section = _get(base, "/section/detection")
+    assert sec_status == 200
+    # The "Download Model" group renders only when ``catalogue_unavailable`` is
+    # non-empty, i.e. when the route passed ``detection_available_models`` rather
+    # than the empty-list fallback. Compare the index render against the canonical
+    # section route instead of an absolute string: if the index dropped the
+    # context it would diverge here, and the check stays correct regardless of how
+    # many catalogue models happen to be on disk in the test cwd.
+    assert ("Download Model" in body) == ("Download Model" in section)
+
+
+def test_index_page_uses_locally_bundled_htmx(live_server) -> None:
+    _, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+    # Local bundle, cache-busted with the build identity (``?v=…``) so an
+    # app update can't be masked by a stale browser copy.
+    assert re.search(r'<script src="/assets/htmx\.min\.js\?v=[^"]+"></script>', body)
+    # Negative CDN list catches a copy-paste reintroduction even if the
+    # positive assertion above passes via an additional script tag.
+    for cdn in ("unpkg.com", "cdn.jsdelivr.net", "cdnjs.cloudflare.com"):
+        assert cdn not in body, f"CDN reference reintroduced: {cdn!r}"
+
+
+def test_index_page_offers_restore_defaults_outside_the_form_gate(live_server) -> None:
+    """The control is a plain button, not a form submit: ``refreshFormGate``
+    disables every ``button[type="submit"].save-btn`` while a validation error
+    is on screen, and a destructive action that saves no form must stay
+    clickable."""
+    _, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+
+    match = re.search(r"<button[^>]*id=\"restore-defaults-btn\"[^>]*>", body)
+    assert match, "Restore Defaults button missing from the General tab"
+    button = match.group(0)
+    assert 'onclick="restoreDefaults()"' in button
+    assert 'type="button"' in button
+    assert "save-btn" not in button
+    assert "/api/config/reset" in body
+
+
+def test_update_banner_and_footer_flag_shown_when_available(live_server, monkeypatch) -> None:
+    # The background online-sync worker publishes a discovered version via the
+    # command queue; the index page renders the banner (General section) and the
+    # footer flag, and the section-reload route renders the banner too. Force a
+    # Linux platform: the .deb installer (and so the whole Software Update
+    # surface) is Pi-only, hidden on the macOS host that may run the suite.
+    from openfollow.web import routes
+
+    monkeypatch.setattr(routes.sys, "platform", "linux")
+
+    server, base = live_server
+    server._command_queue.set_update_available("0.4.0")
+
+    status, body = _get(base, "/")
+    assert status == 200
+    assert "is ready to install" in body  # General-section banner
+    assert '<span class="update-flag">Update available: v0.4.0</span>' in body  # footer flag
+
+    status_section, section = _get(base, "/section/general")
+    assert status_section == 200
+    assert "is ready to install" in section
+
+
+def test_wizard_page_shows_update_footer_flag(live_server, monkeypatch) -> None:
+    # The footer "Update available" flag is global chrome, not limited to the
+    # config landing page: an update is most often discovered during setup.
+    from openfollow.web import routes
+
+    monkeypatch.setattr(routes.sys, "platform", "linux")
+
+    server, base = live_server
+    server._command_queue.set_update_available("0.4.0")
+
+    status, body = _get(base, "/wizard")
+    assert status == 200
+    assert '<span class="update-flag">Update available: v0.4.0</span>' in body  # footer flag
+
+
+def test_update_banner_and_footer_hidden_on_unsupported_platform(live_server, monkeypatch) -> None:
+    # macOS can't run the .deb installer, so neither the Software Update banner
+    # nor the footer flag surfaces even when a newer release was discovered.
+    from openfollow.web import routes
+
+    monkeypatch.setattr(routes.sys, "platform", "darwin")
+
+    server, base = live_server
+    server._command_queue.set_update_available("0.4.0")
+
+    status, body = _get(base, "/")
+    assert status == 200
+    assert "is ready to install" not in body
+    assert '<span class="update-flag">' not in body
+
+    status_section, section = _get(base, "/section/general")
+    assert status_section == 200
+    assert "is ready to install" not in section
+
+
+def test_update_banner_hidden_when_up_to_date(live_server) -> None:
+    server, base = live_server
+    server._command_queue.set_update_available("")  # default / up to date
+
+    status, body = _get(base, "/")
+    assert status == 200
+    # Banner copy and the rendered footer flag are both absent (the ``.update-flag``
+    # class also appears in base.tpl's CSS, so assert on the element).
+    assert "is ready to install" not in body
+    assert '<span class="update-flag">' not in body
+
+
+_SLOT_ITEMS = [
+    {
+        "controller_index": 0,
+        "name": "GameSir",
+        "kind": "gamepad",
+        "state": "missing",
+        "connected": False,
+        "marker_id": 10,
+        "port_label": "USB 2, port 1",
+        "port_key": "usb:h:1",
+        "slot_ref": "gamepad|usb:h:1|GameSir|missing",
+        "seconds_since_input": None,
+    },
+    {
+        "controller_index": 1,
+        "name": "SpaceNavigator",
+        "kind": "mouse3d",
+        "state": "connected",
+        "connected": True,
+        "marker_id": 11,
+        "port_label": "USB 1, port 2",
+        "port_key": "usb:h:2",
+        "slot_ref": 'mouse3d|usb:h:2|Space "Navigator" <1>|connected',
+        "seconds_since_input": 0.2,
+    },
+    {
+        "controller_index": 2,
+        "name": "8BitDo",
+        "kind": "gamepad",
+        "state": "reserved",
+        "connected": False,
+        "marker_id": None,
+        "port_label": "no stable port",
+        "port_key": None,
+        "seconds_since_input": None,
+    },
+]
+
+
+@pytest.fixture()
+def slots_server(tmp_path, monkeypatch):
+    """A live server whose runtime stats carry a missing, a connected and a reserved slot."""
+    monkeypatch.setattr(discovery_module.BeaconSender, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconSender, "stop", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "stop", lambda self: None)
+    stats: dict = {"controllers": {"connected_count": 1, "missing_count": 1, "items": list(_SLOT_ITEMS)}}
+    catalog = MarkerCatalog()
+    catalog.upsert(10, "Lead & <Keys>", "#E0A030")
+    with live_on_free_port(
+        lambda port: ConfigWebServer(
+            config_path=str(tmp_path / "config.toml"),
+            host="127.0.0.1",
+            port=port,
+            system_name="TestSystem",
+            runtime_stats_provider=lambda: stats,
+            marker_catalog_provider=lambda: catalog,
+        )
+    ) as (server, base):
+        yield server, base, stats
+
+
+def _row(body: str, slot: str) -> str:
+    start = body.index(f'<th scope="row">{slot}</th>')
+    return body[start : body.index("</tr>", start)]
+
+
+@pytest.mark.parametrize("path", ["/section/controller_slots", "/"])
+def test_controller_slots_name_each_marker_in_its_colour(slots_server, path: str) -> None:
+    """A slot's marker reads as its HUD card does: the catalog name and colour, or
+    ``Marker <id>`` in the palette colour while the catalog has no entry."""
+    _, base, _ = slots_server
+    _, body = _get(base, path)
+    named, unnamed, empty = _row(body, "C1"), _row(body, "C2"), _row(body, "C3")
+    assert '<span class="slot-marker-dot" style="--marker-color: #e0a030"></span>Lead &amp; &lt;Keys&gt; (10)' in named
+    palette = AUTO_PICK_ORDER[11 % len(AUTO_PICK_ORDER)].lower()
+    assert f'<span class="slot-marker-dot" style="--marker-color: {palette}"></span>Marker 11</span>' in unnamed
+    assert "slot-marker" not in empty
+    assert "<td>-</td>" in empty
+
+
+def test_controller_slots_table_shows_every_state(slots_server) -> None:
+    _, base, _ = slots_server
+    status, body = _get(base, "/section/controller_slots")
+    assert status == 200
+    missing, connected, reserved = _row(body, "C1"), _row(body, "C2"), _row(body, "C3")
+    assert '<span class="slot-kind">Gamepad<span class="slot-state missing">Missing</span></span>' in missing
+    assert '<span class="slot-port">on USB 2, port 1</span>' in missing
+    assert '<span class="slot-kind">3D Mouse<span class="slot-state">Connected</span></span>' in connected
+    assert '<span class="slot-kind">Gamepad<span class="slot-state">Reserved</span></span>' in reserved
+    assert '<span class="slot-port">no stable port</span>' in reserved
+
+
+def test_each_slot_lists_what_its_controller_cannot_do(slots_server) -> None:
+    _, base, stats = slots_server
+    items = stats["controllers"]["items"]
+    items[0] = {**_SLOT_ITEMS[0], "notes": ["buttons_unrecognised", "cannot_identify"]}
+    items[1] = {**_SLOT_ITEMS[1], "notes": ["button_map_other_model"]}
+    items[2] = {**_SLOT_ITEMS[2], "notes": ["a_note_from_a_newer_station"]}
+    _, body = _get(base, "/section/controller_slots")
+    assert (
+        '<div class="slot-notes"><span class="slot-note">Buttons not recognised</span>'
+        '<span class="slot-note-fact">Can&#039;t identify</span></div>'
+    ) in _row(body, "C1")
+    assert '<div class="slot-notes"><span class="slot-note">Button map is for another model</span></div>' in (
+        _row(body, "C2")
+    )
+    assert "slot-notes" not in _row(body, "C3")
+
+
+def test_a_controller_that_can_do_everything_has_no_notes(slots_server) -> None:
+    _, base, _ = slots_server
+    _, body = _get(base, "/section/controller_slots")
+    assert "slot-notes" not in body.split("<tbody>", 1)[1]
+
+
+def test_the_activity_dot_follows_a_connected_controllers_name(slots_server) -> None:
+    _, base, _ = slots_server
+    _, body = _get(base, "/section/controller_slots")
+    assert '<td>SpaceNavigator<span class="slot-activity is-active" role="img" aria-label="In use"></span></td>' in (
+        _row(body, "C2")
+    )
+    assert "slot-activity" not in _row(body, "C1") and "slot-activity" not in _row(body, "C3")
+
+
+def test_each_slot_offers_only_the_action_its_state_allows(slots_server) -> None:
+    """Identify on a connected slot, Forget (destructive) on a missing one, nothing on a reserved one."""
+    _, base, _ = slots_server
+    _, body = _get(base, "/section/controller_slots")
+    missing, connected, reserved = _row(body, "C1"), _row(body, "C2"), _row(body, "C3")
+    assert '<button type="button" class="danger small" hx-post="/section/controller_slots/forget/0"' in missing
+    assert "/identify/" not in missing
+    assert '<button type="button" class="secondary small" hx-post="/section/controller_slots/identify/1"' in connected
+    assert "/forget/" not in connected
+    assert "<button" not in reserved
+
+
+def test_the_slot_actions_sit_at_the_right_edge(slots_server) -> None:
+    # ``.data-table td`` aligns every cell left; a bare ``.row-actions`` rule loses to it.
+    _, base, _ = slots_server
+    _, page = _get(base, "/")
+    _, body = _get(base, "/section/controller_slots")
+    assert '<td class="row-actions">' in body
+    rule = page[page.index(".data-table td.row-actions {") :]
+    assert "text-align: right;" in rule[: rule.index("}")]
+
+
+def test_an_idle_controller_has_an_unlit_dot(slots_server) -> None:
+    _, base, stats = slots_server
+    stats["controllers"]["items"][1] = {**_SLOT_ITEMS[1], "seconds_since_input": 4.0}
+    _, body = _get(base, "/section/controller_slots")
+    assert 'class="slot-activity" role="img" aria-label="Idle"' in _row(body, "C2")
+
+
+def test_no_controllers_says_so(slots_server) -> None:
+    _, base, stats = slots_server
+    stats["controllers"] = {}
+    _, body = _get(base, "/section/controller_slots")
+    assert "No controller connected." in body
+
+
+@pytest.mark.parametrize(("action", "index"), [("identify", 1), ("forget", 0)])
+def test_slot_actions_are_queued_with_the_slot_the_row_showed(slots_server, action: str, index: int) -> None:
+    server, base, _ = slots_server
+    _, table = _get(base, "/section/controller_slots")
+    row = _row(table, f"C{index + 1}")
+    ref = _SLOT_ITEMS[index]["slot_ref"]
+    button = row[row.index(f'hx-post="/section/controller_slots/{action}/{index}"') :]
+    vals = button[button.index("hx-vals='") + len("hx-vals='") :]
+    assert json.loads(html.unescape(vals[: vals.index("'")])) == {"ref": ref}
+    status, body = _post_form(base, f"/section/controller_slots/{action}/{index}", {"ref": ref})
+    assert status == 200
+    assert "slot-table" in body
+    assert server._command_queue.consume_slot_actions() == [(action, index, ref)]
+
+
+@pytest.mark.parametrize("path", ["/section/controller_slots/delete/0", "/section/controller_slots/identify/one"])
+def test_anything_else_is_not_a_slot_action(slots_server, path: str) -> None:
+    server, base, _ = slots_server
+    status, _ = _post_form(base, path, {})
+    assert status == 404
+    assert server._command_queue.consume_slot_actions() == []
+
+
+def test_the_input_tab_opens_with_the_controller_slots(slots_server) -> None:
+    _, base, _ = slots_server
+    _, body = _get(base, "/")
+    tab = body[body.index('id="tab-input"') :]
+    assert tab.index('id="controller-slots-section"') < tab.index('id="gamepad-section"')
+    assert 'data-help="controller_slots"' in tab
+    assert "this.closest('.tab-content').classList.contains('active')" in tab
+
+
+def test_statistics_name_each_missing_controller(slots_server) -> None:
+    _, base, _ = slots_server
+    _, body = _get(base, "/section/statistics")
+    assert "1 connected · 1 missing" in body
+    # No role: the panel is swapped every second, and the announcer speaks the box.
+    box = body[body.index('<div class="notice error">') :]
+    assert box.index("<div>C1 missing · marker 10 · GameSir (USB 2, port 1)</div>") < box.index("</div>\n")
+
+
+def test_statistics_without_missing_controllers_raise_no_warning(slots_server) -> None:
+    _, base, stats = slots_server
+    stats["controllers"] = {"connected_count": 1, "missing_count": 0, "items": [_SLOT_ITEMS[1]]}
+    _, body = _get(base, "/section/statistics")
+    assert "1 connected<" in body
+    assert re.search(r"C\d+ missing", body) is None
+
+
+@pytest.fixture()
+def after_in_app_update(tmp_path, monkeypatch):
+    """The installer's state as a fresh start after an in-app update finds it.
+
+    Requested before ``live_server`` so the server's queue starts from it.
+    """
+    state_file = tmp_path / "update-state.json"
+    state_file.write_text('{"state":"restarting","message":"","error":""}')
+    seen_file = tmp_path / "whats-new-seen"
+    monkeypatch.setattr(services_module, "_DETACHED_UPDATE_STATE_FILE", str(state_file))
+    monkeypatch.setattr(services_module, "_WHATS_NEW_SEEN_FILE", str(seen_file))
+    return seen_file
+
+
+_WHATS_NEW_TRIGGER = "document.addEventListener('DOMContentLoaded', openfollowShowWhatsNew)"
+
+
+@pytest.fixture()
+def after_a_failed_install(tmp_path, monkeypatch):
+    """The installer's state as the start it makes after a failed install finds it."""
+    state_file = tmp_path / "update-state.json"
+    state_file.write_text('{"state":"failed","message":"Update failed.","error":"E: dpkg error","ts":1}')
+    monkeypatch.setattr(services_module, "_DETACHED_UPDATE_STATE_FILE", str(state_file))
+    monkeypatch.setattr(services_module, "_WHATS_NEW_SEEN_FILE", str(tmp_path / "whats-new-seen"))
+    # The Software Update section renders only where the .deb updater can run.
+    monkeypatch.setattr("openfollow.web.routes._deb_update_supported", lambda: True)
+
+
+def test_a_failed_install_is_reported_by_the_station_it_restarted(after_a_failed_install, live_server) -> None:
+    _, base = live_server
+    status, data = _get_json(base, "/api/update-status")
+    assert (status, data) == (200, {"state": "failed", "message": "Update failed.", "error": "E: dpkg error"})
+    _, body = _get(base, "/")
+    assert '<div class="update-notice error">Update failed. E: dpkg error</div>' in body
+    assert _WHATS_NEW_TRIGGER not in body
+
+
+def test_whats_new_does_not_open_on_an_ordinary_start(live_server) -> None:
+    _, base = live_server
+    for path in ("/", "/wizard"):
+        status, body = _get(base, path)
+        assert status == 200
+        assert _WHATS_NEW_TRIGGER not in body
+
+
+def test_whats_new_opens_on_every_full_page_after_an_in_app_update(after_in_app_update, live_server) -> None:
+    _, base = live_server
+    for path in ("/", "/wizard"):
+        status, body = _get(base, path)
+        assert status == 200
+        assert _WHATS_NEW_TRIGGER in body
+
+
+def test_dismissing_whats_new_closes_it_for_the_station(after_in_app_update, live_server) -> None:
+    _, base = live_server
+    status, data = _post_json(base, "/api/whats-new/dismiss", {})
+    assert (status, data) == (200, {"ok": True})
+    assert after_in_app_update.read_text() == openfollow.__version__
+    assert _WHATS_NEW_TRIGGER not in _get(base, "/")[1]
+
+
+def test_whats_new_serves_the_notes_for_the_installed_release(live_server, tmp_path, monkeypatch) -> None:
+    _, base = live_server
+    notes = tmp_path / "whatsnew.md"
+    notes.write_text(f"v{openfollow.__version__}\n\n## Controllers\n", encoding="utf-8")
+    monkeypatch.setattr(whats_new_module, "WHATS_NEW_FILE", notes)
+    monkeypatch.setattr(whats_new_module, "STATE_DIR", tmp_path)
+    status, data = _get_json(base, "/api/whats-new")
+    assert status == 200
+    assert data.pop("support_html")
+    assert data == {
+        "version": openfollow.__version__,
+        "matches": True,
+        "html": "<h2>Controllers</h2>\n",
+        "backup": None,
+    }
+
+    notes.write_text("v0.0.1\n\n## Something older\n", encoding="utf-8")
+    _, data = _get_json(base, "/api/whats-new")
+    assert data.pop("support_html")
+    assert data == {"version": openfollow.__version__, "matches": False, "html": "", "backup": None}
+
+
+@pytest.mark.parametrize("first_line", ["v{version}", "v0.0.1"], ids=["notes", "fallback"])
+def test_whats_new_carries_the_support_card(live_server, tmp_path, monkeypatch, first_line: str) -> None:
+    """With the release's notes or without them, the dialog brings the compact card."""
+    _, base = live_server
+    notes = tmp_path / "whatsnew.md"
+    notes.write_text(first_line.format(version=openfollow.__version__) + "\n\n## Controllers\n", encoding="utf-8")
+    monkeypatch.setattr(whats_new_module, "WHATS_NEW_FILE", notes)
+    monkeypatch.setattr(whats_new_module, "STATE_DIR", tmp_path)
+    _, data = _get_json(base, "/api/whats-new")
+    card = data["support_html"]
+    assert 'class="support-card support-card--compact"' in card
+    assert 'href="https://openfollow.app/support-openfollow"' in card
+    assert len(re.findall(r"M\d+ \d+h1v1h-1z", card)) == sum(row.count("#") for row in SUPPORT.symbol)
+
+
+def test_whats_new_docks_the_support_card_beside_continue(live_server) -> None:
+    """In the footer row, not the notes: long notes scroll, the card stays in view."""
+    _, base = live_server
+    _, body = _get(base, "/")
+    opener = body[body.index("async function openfollowShowWhatsNew()") :]
+    opener = opener[: opener.index("``modalChooseTemplate``")]
+    assert "footerHTML: notes.support_html" in opener
+    assert "notes.support_html" not in opener[: opener.index("footerHTML:")]
+    open_modal = body[body.index(" function openModal(opts) {") :]
+    open_modal = open_modal[: open_modal.index(" function ", 1)]
+    lead = open_modal[open_modal.index("if (opts.footerHTML)") :]
+    assert lead.index("lead.className = 'modal-footer-lead'") < lead.index("opts.footerButtons")
+
+
+def test_the_docked_card_hugs_its_content_and_continue_keeps_clear(live_server) -> None:
+    """The card is as wide as its text, not the row; Continue sits at the row's foot, apart from it."""
+    _, base = live_server
+    _, body = _get(base, "/")
+    footer = re.search(r"\.modal-footer \{([^}]*)\}", body).group(1)
+    assert "align-items: flex-end;" in footer
+    lead = re.search(r"\.modal-footer-lead \{([^}]*)\}", body).group(1)
+    assert "flex: 0 1 auto;" in lead and "max-width:" in lead
+    assert re.search(r"\.modal-footer-lead \+ button \{ margin-left: [\d.]+rem; \}", body)
+
+
+@pytest.mark.parametrize("selector", [r"\.support-card", r"\.support-card--compact"])
+def test_the_support_card_is_padded_evenly(live_server, selector: str) -> None:
+    _, base = live_server
+    _, body = _get(base, "/about")
+    padding = re.search(selector + r" \{[^}]*padding: ([^;]+);", body).group(1)
+    assert len(padding.split()) == 1
+
+
+def test_whats_new_reads_at_a_narrower_width_than_the_large_dialog(live_server) -> None:
+    _, base = live_server
+    _, body = _get(base, "/")
+    opener = body[body.index("async function openfollowShowWhatsNew()") :]
+    assert "size: 'notes'" in opener[: opener.index("``modalChooseTemplate``")]
+    notes = re.search(r"\.modal-card\.modal-card-notes \{ width: min\((\d+)px, 100%\)", body)
+    large = re.search(r"\.modal-card\.modal-card-large \{ width: min\((\d+)px, 100%\)", body)
+    assert notes and large and int(notes.group(1)) < int(large.group(1))
+
+
+def test_the_docked_support_card_has_the_same_space_above_left_and_below(live_server) -> None:
+    """One padding on the What's new footer, equal to the notes' own left edge."""
+    _, base = live_server
+    _, body = _get(base, "/")
+    footer = re.search(r"\.modal-card-notes \.modal-footer \{ padding: ([^;]+); \}", body)
+    notes_left = re.search(r"\.modal-body \{\s*padding: [^ ;]+ ([^;]+);", body)
+    assert footer and notes_left
+    assert footer.group(1).split() == [notes_left.group(1)]
+
+
+def test_whats_new_names_the_settings_backup_the_update_made(live_server, tmp_path, monkeypatch) -> None:
+    _, base = live_server
+    monkeypatch.setattr(whats_new_module, "STATE_DIR", tmp_path)
+    (tmp_path / "backups").mkdir()
+    record = {"from": "0.0.1", "to": openfollow.__version__, "archive": "", "error": "Disk full", "ts": ""}
+    (tmp_path / "backups" / "last-backup.json").write_text(json.dumps(record), encoding="utf-8")
+    _, data = _get_json(base, "/api/whats-new")
+    assert data["backup"]["level"] == "warning"
+    assert "Disk full" in data["backup"]["text"]
+
+
+def test_whats_new_escapes_the_backup_note(live_server) -> None:
+    _, base = live_server
+    _, body = _get(base, "/")
+    opener = body[body.index("async function openfollowShowWhatsNew()") :]
+    opener = opener[: opener.index("``modalChooseTemplate``")]
+    assert "escapeHTML(notes.backup.text)" in opener
+    assert "escapeHTML(notes.backup.step)" in opener
+
+
+def test_whats_new_without_notes_points_to_the_docs_and_any_close_dismisses(live_server) -> None:
+    _, base = live_server
+    _, body = _get(base, "/")
+    opener = body[body.index("async function openfollowShowWhatsNew()") :]
+    opener = opener[: opener.index("``modalChooseTemplate``")]
+    fallback = opener[opener.index(": '<p>Find the full release notes") :]
+    assert '<a href="https://openfollow.app/docs"' in fallback
+    # Closed by Continue, the ×, ESC or the backdrop: every path reaches onClose.
+    assert "onClose: () => { fetch('/api/whats-new/dismiss', { method: 'POST' })" in opener
+
+
+def test_select_options_have_explicit_dark_background(live_server) -> None:
+    # Regression guard: the native <select> dropdown popup does not inherit
+    # the select's dark background. Firefox renders the option list on the
+    # OS-default white surface, so our light --text colour on <option>s was
+    # near-invisible (the "contrastless video source picker" bug report).
+    # The fix pins an explicit dark background on option/optgroup; pin it so a
+    # future base.tpl edit can't silently drop it and bring back the white
+    # popup. Match the rule shape, not exact whitespace.
+    _, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+    rule = re.search(
+        r"option[^{}]*\{[^{}]*background-color\s*:\s*var\(--bg-deep\)",
+        body,
+    )
+    assert rule is not None, "option dropdown popup lost its explicit dark background"
+
+
+def test_body_background_fade_is_viewport_sized(live_server) -> None:
+    # Regression guard: the yellow->green page fade is painted on <body>. If it
+    # sizes to the body's content box, the fade stretches with page length – a
+    # short section compresses it, a long one (Detection) spreads it over
+    # thousands of pixels, so the same fade lands in a different place per
+    # section. The fix keys the gradient height to the viewport (100vh) and
+    # fills below it with the matching base colour. Pin the viewport sizing so a
+    # future base.tpl edit can't silently reintroduce the page-length coupling.
+    _, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+    rule = re.search(
+        r"body\s*\{[^{}]*background-size\s*:\s*100%\s+100vh",
+        body,
+    )
+    assert rule is not None, "body background fade is no longer viewport-sized (100vh)"
+
+
+def test_index_page_preserves_scroll_across_poll_swaps(live_server) -> None:
+    # Regression guard: the Overview tab's 1s statistics poll (and the 5s
+    # diagnostics / server-overview swaps) replace whole DOM subtrees, which
+    # destroys Firefox's scroll-anchor node and snaps the viewport to the top
+    # on every tick. The fix re-pins the scroll position after automatic
+    # (poll / ``load``) swaps. Pin the wiring so a future base.tpl edit can't
+    # silently drop it and reintroduce the jump.
+    _, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+    # Captures scroll before an automatic swap and restores it after.
+    assert "htmx:beforeSwap" in body
+    assert "window.scrollTo(" in body
+    # Gates on user-vs-poll so Save / click swaps still scroll naturally –
+    # without this discriminator the handler would over-pin user actions.
+    assert "triggeringEvent" in body
+    # Only captures when a swap will actually occur – an error / no-swap
+    # response fires beforeSwap but never afterSwap, which would otherwise
+    # leave a stale position for a later poll to restore to.
+    assert "shouldSwap" in body
+
+
+def test_htmx_static_asset_is_served(live_server) -> None:
+    _, base = live_server
+    with urllib.request.urlopen(f"{base}/assets/htmx.min.js", timeout=5) as r:
+        assert r.status == 200
+        # ``.js`` resolves to ``text/javascript`` or ``application/javascript``
+        # depending on the mimetypes database; either is a JS MIME the browser
+        # will execute.
+        ct = r.headers.get("Content-Type", "")
+        assert "javascript" in ct.lower(), f"unexpected Content-Type: {ct!r}"
+        body = r.read()
+    # htmx ships as a UMD bundle; the wrapper preamble is a stable
+    # content-shape check.
+    assert body.startswith(b"(function("), "asset is not the htmx UMD bundle"
+    # Generous floor: catches a truncated/placeholder asset but survives a
+    # future htmx upgrade.
+    assert len(body) > 30_000
+
+
+def test_bundled_assets_are_cache_busted(live_server) -> None:
+    # Every bundled ``/assets/...`` reference on the page must carry a
+    # ``?v=<build>`` token. Without it, a browser on the offline LAN keeps
+    # the previous release's cached JS after an app update – the picker /
+    # units scripts silently run stale code (the "Box Color reverts on
+    # save" report: an old color-picker.js updated the swatch but not the
+    # hidden input, so Save submitted the old value).
+    _, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+    refs = re.findall(r'(?:src|href)="(/assets/[^"]+)"', body)
+    assert refs, "no bundled asset references found on the page"
+    unversioned = [r for r in refs if "?v=" not in r]
+    assert not unversioned, f"asset references missing a ?v= cache-bust token: {unversioned}"
+
+
+def test_versioned_asset_is_immutably_cacheable(live_server) -> None:
+    # A versioned URL is safe to cache hard: a new build changes the token,
+    # so the URL changes. This is what makes the cache-bust effective – the
+    # browser keeps the asset until the version moves, then refetches.
+    _, base = live_server
+    with urllib.request.urlopen(f"{base}/assets/js/color-picker.js?v=testbuild", timeout=5) as r:
+        assert r.status == 200
+        cc = r.headers.get("Cache-Control", "")
+    assert "immutable" in cc, f"versioned asset not immutably cacheable: {cc!r}"
+    assert "max-age=31536000" in cc, f"versioned asset missing long max-age: {cc!r}"
+
+
+def test_unversioned_asset_must_revalidate(live_server) -> None:
+    # A request without the token (direct hit / unversioned reference) must
+    # revalidate, so it can never pin a stale copy across an app update.
+    _, base = live_server
+    with urllib.request.urlopen(f"{base}/assets/js/color-picker.js", timeout=5) as r:
+        assert r.status == 200
+        cc = r.headers.get("Cache-Control", "")
+    assert "no-cache" in cc, f"unversioned asset is not forced to revalidate: {cc!r}"
+
+
+def test_color_picker_js_syncs_hidden_input(live_server) -> None:
+    # The picker's commit path must write the sibling hidden ``<input>`` (the
+    # value the form actually submits), not only the swatch's visible state.
+    # If a refactor drops the hidden-input sync, the swatch shows the new
+    # colour but Save submits the old value – exactly the reverts-on-save
+    # report. Pin the wiring in the served asset.
+    _, base = live_server
+    with urllib.request.urlopen(f"{base}/assets/js/color-picker.js", timeout=5) as r:
+        assert r.status == 200
+        js = r.read().decode()
+    assert "nextElementSibling" in js
+    assert "hidden.value = hex" in js
+
+
+def test_detection_box_color_round_trips(live_server) -> None:
+    # End-to-end guard for the reported field: a POSTed Box Color persists to
+    # disk *and* comes back in the re-rendered partial (the HTMX swap body),
+    # so a save can't silently revert server-side.
+    server, base = live_server
+    status, body = _post_form(
+        base,
+        "/section/detection/inference",
+        {
+            "confidence": "0.5",
+            "interval_ms": "100",
+            "max_persons": "5",
+            "show_boxes": "on",
+            "show_labels": "on",
+            "box_color": "#ff00aa",
+            "box_thickness": "3",
+        },
+    )
+    assert status == 200
+    assert load_config(server.config_path).detection.box_color == "#ff00aa"
+    # The swap response the browser renders must show the new colour, not the old.
+    assert 'name="box_color" value="#ff00aa"' in body
+    assert 'data-value="#ff00aa"' in body
+
+
+def test_asset_version_changes_when_an_asset_changes(tmp_path, monkeypatch) -> None:
+    # The token is a content fingerprint: editing any bundled asset must change
+    # it (so the next server start refetches), and an unchanged dir must keep
+    # the same token (so caches survive a restart that ships no asset changes).
+    from openfollow.web import routes
+
+    monkeypatch.setattr(routes, "_WEB_STATIC_DIR", tmp_path)
+    (tmp_path / "app.js").write_text("one")
+    first = routes._compute_asset_version()
+    assert len(first) == 12 and all(c in "0123456789abcdef" for c in first)
+    assert routes._compute_asset_version() == first, "unchanged dir changed the token"
+    (tmp_path / "app.js").write_text("two")
+    assert routes._compute_asset_version() != first, "edited asset did not bust the token"
+
+
+def test_asset_version_falls_back_without_bundled_assets(tmp_path, monkeypatch) -> None:
+    # A non-standard install with no static files still gets a non-empty token
+    # from the build identity, so asset URLs never collapse to a bare ``?v=``.
+    from openfollow import __commit__, __version__
+    from openfollow.web import routes
+
+    monkeypatch.setattr(routes, "_WEB_STATIC_DIR", tmp_path)  # empty dir
+    assert routes._compute_asset_version() == (__commit__ or __version__)
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "general",
+        "camera",
+        "grid",
+        "movement",
+        "marker",
+        "controller",
+        "osc",
+        "detection",
+    ],
+)
+def test_section_partial_renders(live_server, section: str) -> None:
+    _, base = live_server
+    status, body = _get(base, f"/section/{section}")
+    assert status == 200, f"/section/{section} returned {status}"
+    assert len(body) > 50
+
+
+def test_overview_partial_renders(live_server) -> None:
+    _, base = live_server
+    status, body = _get(base, "/section/overview")
+    assert status == 200
+    assert len(body) > 10
+
+
+def test_overview_poll_returns_peer_rows_without_section_shell(live_server) -> None:
+    # Flicker fix: the 5s overview poll swaps ONLY the peer rows, not the whole
+    # section via outerHTML. The fragment must carry peer markup but NOT the
+    # section shell (head / fold key / Refresh) – re-rendering the shell every
+    # tick is what made the section flash.
+    _, base = live_server
+    status, body = _get(base, "/section/overview")
+    assert status == 200
+    assert "peer-item" in body  # the local-server row is always present
+    assert "Station Network" not in body
+    assert "data-fold-key" not in body
+    assert 'class="section"' not in body
+
+
+def test_overview_says_station_default_is_down_rather_than_showing_its_address(live_server) -> None:
+    server, base = live_server
+    server.suspend_beacons()
+    status, body = _get(base, "/section/overview")
+    assert status == 200
+    assert '<span class="peer-address">Station default interface down</span>' in body
+
+
+def test_index_overview_section_polls_only_peer_rows(live_server) -> None:
+    # The polling element is the inner peer list (#overview-peers), gated on the
+    # enclosing section's collapsed state – not the whole #overview-section via
+    # outerHTML, which is what flickered.
+    _, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert 'id="overview-peers"' in body
+    assert "closest('.section').classList.contains('is-collapsed')" in body
+
+
+def test_statistics_partial_renders(live_server) -> None:
+    _, base = live_server
+    status, body = _get(base, "/section/statistics")
+    assert status == 200
+
+
+def test_video_source_failure_fragment_is_empty_while_healthy(live_server) -> None:
+    """The Camera & Grid tab polls this every few seconds. With no failure it
+    must swap in nothing, not an empty red box."""
+    _, base = live_server
+    status, body = _get(base, "/section/video_source/failure")
+    assert status == 200
+    assert body.strip() == ""
+
+
+def test_video_source_failure_fragment_carries_the_box(live_server, monkeypatch) -> None:
+    """The fragment is what makes a failure appear on a page that was already
+    open; the section itself never re-renders."""
+    server, base = live_server
+    monkeypatch.setattr(
+        server,
+        "get_runtime_stats",
+        lambda: {
+            "video": {
+                "failure": "unreachable",
+                "failure_text": "Nothing answered at 192.0.2.10:554.",
+                "failure_action": "Check the camera is powered.",
+                "error_message": "Could not open resource.",
+            }
+        },
+    )
+    status, body = _get(base, "/section/video_source/failure")
+
+    assert status == 200
+    assert "Nothing answered at 192.0.2.10:554." in body
+    assert "Check the camera is powered." in body
+    # Its own id namespace, or the Statistics poll steals the node.
+    assert 'id="video-error-source-' in body
+    # The same polite live region as the section's own render of the box.
+    assert 'role="status" aria-live="polite" aria-atomic="true"' in body
+    # The pipeline's own wording is not shown where there is a classification.
+    assert "Could not open resource." not in body
+
+
+def test_unknown_section_returns_404(live_server) -> None:
+    _, base = live_server
+    status, _ = _get(base, "/section/nonexistent")
+    assert status == 404
+
+
+def test_network_interfaces_by_name_returns_iface_keyed_options(
+    live_server,
+    monkeypatch,
+) -> None:
+    """Interface dropdown options keyed by name with IP as label suffix."""
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {
+            "eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")],
+            "wlan0": [SimpleNamespace(family=_socket.AF_INET, address="10.0.0.5")],
+        },
+    )
+    _, base = live_server
+    status, body = _get(base, "/network/interfaces/by_name")
+    assert status == 200
+    # Value = iface name, label = "iface – ip".
+    assert 'value="eth0"' in body
+    assert "eth0 – 192.168.178.59" in body
+    assert 'value="wlan0"' in body
+    # Auto-detect option always present.
+    assert 'value=""' in body and "Auto-detect" in body
+
+
+def test_network_interfaces_by_name_marks_pinned_iface_not_available(
+    live_server,
+    monkeypatch,
+) -> None:
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {
+            "eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")],
+        },
+    )
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "wlan0_gone"
+    save_config(cfg, server.config_path)
+
+    status, body = _get(base, "/network/interfaces/by_name")
+    assert status == 200
+    assert '<option value="wlan0_gone" selected>wlan0_gone – not connected</option>' in body
+
+
+def test_network_interfaces_by_name_current_param_overrides_psn_default(
+    live_server,
+    monkeypatch,
+) -> None:
+    """``?current=<iface>`` (the OTP picker) selects that iface, not the PSN
+    default, so each picker highlights its own pin."""
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {
+            "eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")],
+            "wlan0": [SimpleNamespace(family=_socket.AF_INET, address="10.0.0.5")],
+        },
+    )
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "eth0"
+    save_config(cfg, server.config_path)
+
+    status, body = _get(base, "/network/interfaces/by_name?current=wlan0")
+    assert status == 200
+    assert 'value="wlan0" selected' in body
+    assert 'value="eth0" selected' not in body
+
+
+def test_network_interfaces_by_name_empty_current_does_not_fall_back_to_psn(
+    live_server,
+    monkeypatch,
+) -> None:
+    """An unpinned OTP picker sends ``?current=`` (present, empty); it must NOT
+    inherit the PSN default – nothing is pre-selected."""
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {"eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")]},
+    )
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "eth0"
+    save_config(cfg, server.config_path)
+
+    status, body = _get(base, "/network/interfaces/by_name?current=")
+    assert status == 200
+    # The PSN default must not leak into an empty OTP pin.
+    assert "selected" not in body
+
+
+def test_psn_save_preserves_pin_now_that_the_picker_moved(live_server) -> None:
+    """The PSN section no longer posts ``psn_source_iface`` – its picker moved
+    to Interface Assignment. Saving PSN must leave the pin alone rather than
+    clearing it, which is the silent-data-loss trap of dropping a form field."""
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "eth0"
+    save_config(cfg, server.config_path)
+
+    status, _body = _post_form(
+        base,
+        "/section/psn",
+        {"psn_system_name": "Stage Left", "psn_mcast_ip": "236.10.10.10"},
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.psn_system_name == "Stage Left"
+    assert saved.psn_source_iface == "eth0"
+
+
+def test_otp_save_preserves_pin_now_that_the_picker_moved(live_server) -> None:
+    """Same guard for OTP: its Save posts no ``source_iface`` any more."""
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.otp_output.source_iface = "eth1"
+    save_config(cfg, server.config_path)
+
+    status, _body = _post_form(
+        base,
+        "/section/otp_output",
+        {"port": "5568", "system_number": "3", "priority": "100"},
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.otp_output.system_number == 3
+    assert saved.otp_output.source_iface == "eth1"
+
+
+def test_interface_assignment_renders_rows_with_resolved_addresses(
+    live_server,
+    monkeypatch,
+) -> None:
+    """The panel shows where each plane will actually bind, including rows
+    left on "follow station" – an empty cell would hide the indirection."""
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {
+            "eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")],
+            "eth1": [SimpleNamespace(family=_socket.AF_INET, address="10.0.0.9")],
+        },
+    )
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "eth0"
+    cfg.otp_output.source_iface = "eth1"
+    save_config(cfg, server.config_path)
+
+    status, body = _get(base, "/section/interface_assignment")
+    assert status == 200
+    assert "Station default" in body
+    assert "OTP output" in body
+    # PSN follows the station pin and has no picker of its own.
+    assert "PSN in / out" in body
+    assert 'name="psn_source_iface"' in body
+    assert 'name="otp_output.source_iface"' in body
+    # Both resolved addresses are on screen: the station's and the OTP pin's.
+    assert "192.168.178.59" in body
+    assert "10.0.0.9" in body
+
+
+def test_interface_assignment_shows_a_down_interface_as_an_error(
+    live_server,
+    monkeypatch,
+) -> None:
+    """A configured interface with no address must not render as some other
+    interface's address – the plane will not send there."""
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {"eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")]},
+    )
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "eth0"
+    cfg.otp_output.source_iface = "eth_gone"
+    save_config(cfg, server.config_path)
+
+    status, body = _get(base, "/section/interface_assignment")
+    assert status == 200
+    # Scope to the OTP row: the station-following rows legitimately carry the
+    # station address, and it must not leak into OTP's cell.
+    otp_row = body[body.index("OTP output") :].split("</tr>", 1)[0]
+    assert '<span class="stat-chip off">Not connected</span>' in otp_row
+    assert "192.168.178.59" not in otp_row
+
+
+def _patch_ifaces(monkeypatch, ifaces: dict[str, str]) -> None:
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {name: [SimpleNamespace(family=_socket.AF_INET, address=addr)] for name, addr in ifaces.items()},
+    )
+
+
+def test_interface_assignment_has_a_web_ui_row(live_server, monkeypatch) -> None:
+    """The web UI gets its own pin rather than following the station: a
+    station pinned to a lighting VLAN would otherwise take its own config UI
+    off the office LAN as a side effect."""
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59", "eth1": "10.0.0.9"})
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "eth0"
+    cfg.web_bind_iface = "eth1"
+    save_config(cfg, server.config_path)
+
+    status, body = _get(base, "/section/interface_assignment")
+    assert status == 200
+    assert 'name="web_bind_iface"' in body
+    web_row = body[body.index("Web UI") :].split("</tr>", 1)[0]
+    assert "10.0.0.9" in web_row
+    assert "192.168.178.59" not in web_row
+
+
+def test_interface_assignment_web_ui_row_defaults_to_all_interfaces(live_server) -> None:
+    """Blank is not "down" for this row - unpinned means every interface, and
+    reading it as an error would alarm every stock station."""
+    _server, base = live_server
+    _status, body = _get(base, "/section/interface_assignment")
+    web_row = body[body.index("Web UI") :].split("</tr>", 1)[0]
+    assert "All interfaces" in web_row
+    assert "is down" not in web_row
+
+
+def test_interface_assignment_web_ui_row_reads_as_the_wildcard_when_the_pin_is_down(
+    live_server,
+    monkeypatch,
+) -> None:
+    """Unlike the protocol rows, a down pin here is not an error: the runtime
+    serves on every interface rather than failing closed, so the row has to
+    say that instead of implying the UI is unreachable."""
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59"})
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.web_bind_iface = "eth_gone"
+    save_config(cfg, server.config_path)
+
+    _status, body = _get(base, "/section/interface_assignment")
+    web_row = body[body.index("Web UI") :].split("</tr>", 1)[0]
+    assert "eth_gone is down - all interfaces" in web_row
+    assert "192.168.178.59" not in web_row
+
+
+def test_interface_assignment_web_ui_row_is_read_only_under_a_literal_bind(live_server, monkeypatch) -> None:
+    """``web_bind`` outranks the interface picker, so an editable picker there
+    could never take effect - and with the pin blank it would report "All
+    interfaces" for a UI answering at exactly one."""
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59"})
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.web_bind = "192.168.178.59"
+    save_config(cfg, server.config_path)
+
+    _status, body = _get(base, "/section/interface_assignment")
+    web_row = body[body.index("Web UI") :].split("</tr>", 1)[0]
+    assert 'name="web_bind_iface"' not in web_row, "the picker cannot apply while web_bind is set"
+    assert "web_bind in config.toml" in web_row
+    assert "192.168.178.59" in web_row
+
+
+def test_interface_assignment_web_ui_row_stays_editable_without_one(live_server, monkeypatch) -> None:
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59"})
+    _server, base = live_server
+    _status, body = _get(base, "/section/interface_assignment")
+    web_row = body[body.index("Web UI") :].split("</tr>", 1)[0]
+    assert 'name="web_bind_iface"' in web_row
+
+
+def test_interface_assignment_web_ui_pin_warns_with_the_surviving_url(live_server, monkeypatch) -> None:
+    """The address that stops working is the one the operator is reading this
+    on, so the warning has to name the replacement before the restart."""
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59", "eth1": "10.0.0.9"})
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.web_bind_iface = "eth1"
+    save_config(cfg, server.config_path)
+
+    _status, body = _get(base, "/section/interface_assignment")
+    assert "http://10.0.0.9" in body
+    # Names the on-screen escape, so a lockout has a documented way back.
+    assert "Network screen" in body
+
+
+def test_interface_assignment_unpinned_web_ui_shows_no_warning(live_server) -> None:
+    _server, base = live_server
+    _status, body = _get(base, "/section/interface_assignment")
+    assert "After a restart the web UI answers only on" not in body
+
+
+def test_interface_assignment_web_ui_pin_offers_a_restart(live_server, monkeypatch) -> None:
+    """The listening socket can't be moved under the request being served on
+    it, so this one pin needs a restart the other rows don't."""
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59", "eth1": "10.0.0.9"})
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.web_bind_iface = "eth1"
+    save_config(cfg, server.config_path)
+
+    _status, body = _get(base, "/section/interface_assignment")
+    # Its own red action, not a second kind of Save.
+    tag_start = body.rindex("<button", 0, body.index('hx-post="/section/interface_assignment/restart"'))
+    button = body[tag_start : body.index("</button>", tag_start)]
+    assert 'type="button" class="danger"' in button
+    assert button.endswith(">Restart OpenFollow")
+    # Restarting pauses every output, so it asks first, with the danger button.
+    assert 'data-confirm-label="Restart"' in button
+    assert "data-confirm-danger" in button
+    assert body.count("hx-confirm=") == 1
+    assert "Save &amp; Restart" not in body
+
+
+def test_interface_assignment_offers_a_restart_for_a_pin_to_a_down_interface(
+    live_server,
+    monkeypatch,
+) -> None:
+    """A pin naming a down interface resolves to the same wildcard the server
+    is already on, so comparing addresses reports nothing pending – and the
+    operator is never told the pin has not taken effect."""
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59"})
+    server, base = live_server
+    monkeypatch.setattr(
+        server,
+        "_web_bind_advisory_provider",
+        lambda: {"status": "", "banner": "", "resolved_ip": "", "bind_at_start": "", "iface_at_start": ""},
+        raising=False,
+    )
+    cfg = load_config(server.config_path)
+    cfg.web_bind_iface = "eth_gone"
+    save_config(cfg, server.config_path)
+
+    _status, body = _get(base, "/section/interface_assignment")
+    assert "/section/interface_assignment/restart" in body
+
+
+def test_interface_assignment_offers_no_restart_once_the_pin_is_in_force(
+    live_server,
+    monkeypatch,
+) -> None:
+    """Self-clearing: after the restart the recorded pin equals the saved one
+    and the button goes away, even though the pin never resolved."""
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59"})
+    server, base = live_server
+    monkeypatch.setattr(
+        server,
+        "_web_bind_advisory_provider",
+        lambda: {"status": "down", "banner": "", "resolved_ip": "", "bind_at_start": "", "iface_at_start": "eth_gone"},
+        raising=False,
+    )
+    cfg = load_config(server.config_path)
+    cfg.web_bind_iface = "eth_gone"
+    save_config(cfg, server.config_path)
+
+    _status, body = _get(base, "/section/interface_assignment")
+    assert "/section/interface_assignment/restart" not in body
+
+
+def test_interface_assignment_restart_notice_names_the_moved_address(live_server, monkeypatch) -> None:
+    """Unlike every other restart notice, this one may come back at a
+    different address – so it has to say where to look when the reload
+    cannot reach this one."""
+    _patch_ifaces(monkeypatch, {"eth1": "10.0.0.9"})
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.web_bind_iface = "eth1"
+    save_config(cfg, server.config_path)
+    status, body = _post_form(base, "/section/interface_assignment/restart", {})
+    assert status == 200
+    assert "restart-notice" in body
+    assert "Network screen" in body
+    assert "After a restart the web UI answers only on http://10.0.0.9" in body
+    # The notice polls for the server's return; the Address poll would only fail meanwhile.
+    assert "/section/interface_assignment/status" not in body
+
+
+_IA_STATUS = "/section/interface_assignment/status"
+
+
+def _ia_status(base: str, seen: str | None = None) -> tuple[str, str | None]:
+    """The poll's body and the event its ``HX-Trigger`` header names, if any."""
+    query = "" if seen is None else "?" + urllib.parse.urlencode({"seen": seen})
+    status, body, headers = _raw_request(base, _IA_STATUS + query, headers={}, method="GET")
+    assert status == 200
+    return body, {k.lower(): v for k, v in headers.items()}.get("hx-trigger")
+
+
+def _ia_fingerprint(body: str) -> str:
+    match = re.search(r'id="ia-options-fp" data-fp="([0-9a-f]+)"', body)
+    assert match is not None
+    return match.group(1)
+
+
+def _ia_address(body: str, slot: str) -> str:
+    match = re.search(rf'<span id="{slot}"[^>]*>\n(.*?)\n</span>', body, re.S)
+    assert match is not None
+    return match.group(1).strip()
+
+
+def test_the_interface_assignment_poll_replaces_every_address_cell_and_no_picker(live_server, monkeypatch) -> None:
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59", "eth1": "10.0.0.9"})
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "eth0"
+    cfg.otp_output.source_iface = "eth1"
+    save_config(cfg, server.config_path)
+
+    _status, panel = _get(base, "/section/interface_assignment")
+    body, _event = _ia_status(base)
+    cells = re.findall(r'<span id="(ia-addr-[^"]+)">', panel)
+    assert len(cells) == len(re.findall(r"<tr class=", panel)) > 5
+    assert re.findall(r'<span id="(ia-addr-[^"]+)" hx-swap-oob="true">', body) == cells
+    # An unsaved choice lives in the pickers, so the poll never sends one.
+    assert "<select" not in body
+    assert _ia_address(body, "ia-addr-otp_output-2e-source_iface") == "10.0.0.9"
+
+
+def test_the_interface_assignment_poll_tells_apart_ids_that_differ_by_punctuation(live_server, monkeypatch) -> None:
+    from openfollow.configuration import OscDestinationConfig
+
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59", "eth1": "10.0.0.9"})
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "eth0"
+    cfg.osc_destinations.destinations = [
+        OscDestinationConfig(id="media.v2", name="A", host="198.51.100.1", source_iface="eth1"),
+        OscDestinationConfig(id="media-v2", name="B", host="198.51.100.2", source_iface="eth0"),
+    ]
+    save_config(cfg, server.config_path)
+
+    _status, panel = _get(base, "/section/interface_assignment")
+    cells = re.findall(r'<span id="(ia-addr-[^"]+)">', panel)
+    assert len(set(cells)) == len(cells)
+    body, _event = _ia_status(base)
+    assert re.findall(r'<span id="(ia-addr-[^"]+)" hx-swap-oob="true">', body) == cells
+    assert "10.0.0.9" in _ia_address(body, "ia-addr-osc_destinations-2e-media-2e-v2-2e-source_iface")
+    assert "192.168.178.59" in _ia_address(body, "ia-addr-osc_destinations-2e-media-2d-v2-2e-source_iface")
+
+
+@pytest.mark.parametrize(
+    ("present", "chip"),
+    [({"eth0": "192.168.178.59"}, "Not connected"), ({"eth0": "192.168.178.59", "eth1": None}, "Interface down")],
+    ids=["unplugged", "no-address"],
+)
+def test_the_interface_assignment_poll_shows_an_outage_without_a_scan(live_server, monkeypatch, present, chip) -> None:
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59", "eth1": "10.0.0.9"})
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "eth0"
+    cfg.otp_output.source_iface = "eth1"
+    save_config(cfg, server.config_path)
+    _get(base, "/section/interface_assignment")
+
+    # A present interface without an IPv4 address still lists, under a link-layer entry.
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {
+            name: [SimpleNamespace(family=_socket.AF_INET if addr else _socket.AF_INET6, address=addr or "fe80::1")]
+            for name, addr in present.items()
+        },
+    )
+    body, _event = _ia_status(base)
+    assert _ia_address(body, "ia-addr-otp_output-2e-source_iface") == f'<span class="stat-chip off">{chip}</span>'
+    assert _ia_address(body, "ia-addr-psn_source_iface") == "192.168.178.59"
+
+
+def _relabel(server: Any, _monkeypatch: Any) -> None:
+    cfg = load_config(server.config_path)
+    cfg.interface_labels = {"eth1": "Lighting"}
+    save_config(cfg, server.config_path)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        _relabel,
+        lambda _server, monkeypatch: _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59"}),
+        lambda _server, monkeypatch: _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59", "eth1": "10.0.0.10"}),
+        lambda _server, monkeypatch: _patch_ifaces(
+            monkeypatch, {"eth0": "192.168.178.59", "eth1": "10.0.0.9", "eth2": "10.1.0.9"}
+        ),
+    ],
+    ids=["label-saved", "adapter-unplugged", "address-changed", "adapter-plugged-in"],
+)
+def test_the_interface_assignment_poll_reloads_the_pickers_once_their_list_changes(
+    live_server, monkeypatch, change
+) -> None:
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59", "eth1": "10.0.0.9"})
+    server, base = live_server
+    _status, panel = _get(base, "/section/interface_assignment")
+    seen = _ia_fingerprint(panel)
+    body, event = _ia_status(base, seen)
+    assert event is None
+    assert _ia_fingerprint(body) == seen
+
+    change(server, monkeypatch)
+    body, event = _ia_status(base, seen)
+    assert event == "iface-options-changed"
+    changed = _ia_fingerprint(body)
+    assert changed != seen
+    # The page keeps the new fingerprint, so the next poll is quiet again.
+    assert _ia_status(base, changed)[1] is None
+
+
+def test_the_interface_assignment_poll_without_a_fingerprint_reloads_nothing(live_server) -> None:
+    _server, base = live_server
+    assert _ia_status(base)[1] is None
+
+
+def test_the_interface_assignment_panel_polls_and_its_pickers_can_reload_in_place(live_server) -> None:
+    _server, base = live_server
+    _status, panel = _get(base, "/section/interface_assignment")
+    poller = panel[panel.rindex("<div", 0, panel.index(f'hx-get="{_IA_STATUS}"')) :].split("</div>", 1)[0]
+    assert 'hx-trigger="every 5s"' in poller
+    assert 'hx-swap="none"' in poller and 'hx-target="this"' in poller
+    assert 'document.getElementById("ia-options-fp").dataset.fp' in poller
+    selects = re.findall(r'<select [^>]*data-options-url="([^"]+)"[^>]*hx-get="([^"]+)"', panel)
+    assert len(selects) == panel.count("<select ") > 3
+    for options_url, load_url in selects:
+        assert load_url.startswith(options_url + "&current=")
+    _status, page = _get(base, "/")
+    assert "document.addEventListener('iface-options-changed', refreshIfacePickers);" in page
+
+
+def test_interface_assignment_offers_no_restart_when_the_bind_already_matches(live_server) -> None:
+    """Self-clearing: once the server is listening on what the config asks
+    for, the restart button goes away on its own rather than staying as
+    permanent noise."""
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.web_bind = server.bind_host
+    save_config(cfg, server.config_path)
+
+    _status, body = _get(base, "/section/interface_assignment")
+    assert "/section/interface_assignment/restart" not in body
+
+
+def test_interface_assignment_saves_the_web_ui_pin(live_server, monkeypatch) -> None:
+    _patch_ifaces(monkeypatch, {"eth0": "192.168.178.59", "eth1": "10.0.0.9"})
+    server, base = live_server
+    status, _body = _post_form(
+        base,
+        "/section/interface_assignment",
+        {"psn_source_iface": "eth0", "otp_output.source_iface": "", "web_bind_iface": "eth1"},
+    )
+    assert status == 200
+    assert load_config(server.config_path).web_bind_iface == "eth1"
+
+
+def test_interface_assignment_surfaces_the_runtime_fallback(tmp_path, monkeypatch) -> None:
+    """When the pin missed at boot the panel has to say the UI is serving
+    everywhere. A panel that showed only the configured pin would let the
+    operator believe a bind that never happened."""
+    monkeypatch.setattr(discovery_module.BeaconSender, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconSender, "stop", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "stop", lambda self: None)
+    config_path = tmp_path / "config.toml"
+    with live_on_free_port(
+        lambda port: ConfigWebServer(
+            config_path=str(config_path),
+            host="127.0.0.1",
+            port=port,
+            system_name="TestSystem",
+            web_bind_advisory_provider=lambda: {
+                "status": "down",
+                "banner": "Web UI is pinned to 'eth7', which has no address.",
+                "resolved_ip": "",
+            },
+        )
+    ) as (_server, base):
+        _status, body = _get(base, "/section/interface_assignment")
+    assert "Web UI is pinned to &#039;eth7&#039;, which has no address." in body
+
+
+def test_interface_assignment_renders_and_saves_the_sender_rows(live_server, monkeypatch) -> None:
+    """RTTrPM and each OSC destination get a picker on the panel, and a save
+    writes the destination pin to disk."""
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {"eth1": [SimpleNamespace(family=_socket.AF_INET, address="10.0.0.9")]},
+    )
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.rttrpm_output.source_iface = "eth1"
+    save_config(cfg, server.config_path)
+
+    status, body = _get(base, "/section/interface_assignment")
+    assert status == 200
+    assert 'name="rttrpm_output.source_iface"' in body
+    assert 'name="osc_destinations.default.source_iface"' in body
+    assert "OSC Destination Default" in body
+    assert "experimental-feature" in body
+
+    status, _ = _post_form(
+        base,
+        "/section/interface_assignment",
+        {"osc_destinations.default.source_iface": "eth1", "rttrpm_output.source_iface": "eth1"},
+    )
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.osc_destinations.destinations[0].source_iface == "eth1"
+    assert saved.rttrpm_output.source_iface == "eth1"
+
+
+def _pin_osc_destinations(cfg: Any, pin: str) -> None:
+    for dest in cfg.osc_destinations.destinations:
+        dest.source_iface = pin
+
+
+_SENDER_POINTERS = {
+    "/section/otp_output": lambda cfg, pin: setattr(cfg.otp_output, "source_iface", pin),
+    "/section/rttrpm_output": lambda cfg, pin: setattr(cfg.rttrpm_output, "source_iface", pin),
+    "/section/osc": lambda cfg, pin: setattr(cfg.osc, "listen_iface", pin),
+    "/section/osc_destinations": _pin_osc_destinations,
+}
+
+
+@pytest.mark.parametrize("path", sorted(_SENDER_POINTERS))
+@pytest.mark.parametrize(
+    ("pin", "shown"), [("", diagnostics.FOLLOWS_STATION_DEFAULT), ("eth7", "eth7")], ids=["blank", "pinned"]
+)
+def test_sender_sections_point_to_the_panel_with_their_own_pin(live_server, path: str, pin: str, shown: str) -> None:
+    """Each section shows its row's pin read-only, and Station default's wording only when it is blank."""
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    _SENDER_POINTERS[path](cfg, pin)
+    save_config(cfg, server.config_path)
+
+    status, body = _get(base, path)
+    assert status == 200
+    assert f'<span class="ia-pointer-value">{shown}</span>' in body
+    assert "goToSection('general', 'interface-assignment')" in body
+    assert 'name="source_iface"' not in body
+
+
+def test_interface_assignment_scan_rerenders_the_panel(live_server) -> None:
+    """Scan re-renders instead of refreshing the pickers in place: an in-place
+    refresh re-marked the SAVED value as selected and silently discarded an
+    unsaved choice."""
+    _server, base = live_server
+    _status, body = _get(base, "/section/interface_assignment")
+    assert 'hx-get="/section/interface_assignment"' in body
+    assert 'hx-target="#interface-assignment-section"' in body
+    # The pickers load once and are not re-fetched by Scan.
+    assert "click from:#refresh-iface-assignment" not in body
+
+
+def test_interface_assignment_pickers_have_accessible_names(live_server) -> None:
+    """A <th scope="row"> names cells, not a nested control."""
+    _server, base = live_server
+    _status, body = _get(base, "/section/interface_assignment")
+    assert 'aria-label="Station default interface"' in body
+    assert 'aria-label="OTP output interface"' in body
+
+
+def test_protocol_sections_link_switches_to_the_general_tab(live_server) -> None:
+    """A bare href="#id" does nothing when the target sits in a display:none
+    tab, so the pointer had no effect at all."""
+    _server, base = live_server
+    for path in ("/section/psn", "/section/otp_output", "/section/osc"):
+        _status, body = _get(base, path)
+        assert "goToSection('general', 'interface-assignment')" in body
+
+
+def test_interface_assignment_save_round_trips_to_disk(
+    live_server,
+    monkeypatch,
+) -> None:
+    """One POST writes pins that live on different owning dataclasses."""
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {
+            "eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")],
+            "eth1": [SimpleNamespace(family=_socket.AF_INET, address="10.0.0.9")],
+        },
+    )
+    server, base = live_server
+
+    status, body = _post_form(
+        base,
+        "/section/interface_assignment",
+        {
+            "psn_source_iface": "eth0",
+            "otp_output.source_iface": "eth1",
+            "osc.listen_iface": "eth1",
+        },
+    )
+    assert status == 200
+    assert "saved" in body
+
+    saved = load_config(server.config_path)
+    assert saved.psn_source_iface == "eth0"
+    assert saved.otp_output.source_iface == "eth1"
+    # The panel is the only editing surface for the OSC pin, so the dotted form
+    # key, the template's submission and the on-disk field have to agree end to
+    # end - a unit test on ``apply_section_data`` alone cannot see a mismatch
+    # between them.
+    assert saved.osc.listen_iface == "eth1"
+
+
+def test_interface_assignment_save_can_clear_a_pin(
+    live_server,
+    monkeypatch,
+) -> None:
+    """Selecting "follow station interface" must undo a pin – otherwise a
+    plane can be moved onto its own NIC but never moved back."""
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {"eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")]},
+    )
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.otp_output.source_iface = "eth1"
+    save_config(cfg, server.config_path)
+
+    status, _body = _post_form(
+        base,
+        "/section/interface_assignment",
+        {"psn_source_iface": "eth0", "otp_output.source_iface": ""},
+    )
+    assert status == 200
+    assert load_config(server.config_path).otp_output.source_iface == ""
+
+
+def test_network_interfaces_by_name_blank_station_relabels_empty_option(
+    live_server,
+    monkeypatch,
+) -> None:
+    """Per-plane pickers ask for ``?blank=station``: an empty pin there means
+    "follow the station interface", not "let the OS choose", and the label has
+    to say so or the indirection is invisible."""
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {"eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")]},
+    )
+    _server, base = live_server
+
+    status, body = _get(base, "/network/interfaces/by_name?blank=station&current=")
+    assert status == 200
+    assert "Follow station default interface" in body
+    assert "Auto-detect" not in body
+
+
+def test_network_interfaces_by_name_unknown_blank_falls_back_to_auto_detect(
+    live_server,
+    monkeypatch,
+) -> None:
+    """The blank label is allow-listed, never interpolated – an unknown (or
+    crafted) ``?blank=`` renders the default wording rather than reaching the
+    HTML."""
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    monkeypatch.setattr(
+        net_utils_mod.psutil,
+        "net_if_addrs",
+        lambda: {"eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")]},
+    )
+    _server, base = live_server
+
+    status, body = _get(base, "/network/interfaces/by_name?blank=%3Cscript%3E&current=")
+    assert status == 200
+    assert "Auto-detect" in body
+    assert "<script>" not in body
+
+
+# ---------------------------------------------------------------------------
+# JSON API – shape and content
+# ---------------------------------------------------------------------------
+
+
+def test_api_info_returns_expected_fields(live_server) -> None:
+    server, base = live_server
+    status, data = _get_json(base, "/api/info")
+    assert status == 200
+    assert data["name"] == "TestSystem"
+    assert "ip" in data
+    assert data["port"] == server.port
+    # Must reflect the real package version, not the legacy "0.1.0" placeholder.
+    assert data["version"] == openfollow.__version__
+
+
+def test_api_stats_returns_json(live_server) -> None:
+    _, base = live_server
+    status, data = _get_json(base, "/api/stats")
+    assert status == 200
+    assert isinstance(data, dict)
+
+
+def test_api_update_status_returns_json(live_server) -> None:
+    _, base = live_server
+    status, data = _get_json(base, "/api/update-status")
+    assert status == 200
+    assert isinstance(data, dict)
+
+
+def test_api_peers_returns_local_and_peers_keys(live_server) -> None:
+    server, base = live_server
+    status, data = _get_json(base, "/api/peers")
+    assert status == 200
+    assert "local" in data
+    assert "peers" in data
+    local = data["local"]
+    assert local["name"] == "TestSystem"
+    assert local["port"] == server.port
+    # local.version must be the real package version, not the "0.1.0" placeholder.
+    assert local["version"] == openfollow.__version__
+
+
+def test_api_config_returns_full_config(live_server) -> None:
+    _, base = live_server
+    status, data = _get_json(base, "/api/config")
+    assert status == 200
+    # Spot-check top-level keys that must always exist
+    for key in ("video_source_type", "psn_system_name", "camera", "grid", "marker"):
+        assert key in data, f"Missing key: {key}"
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "general",
+        "video_source",
+        "camera",
+        "grid",
+        "movement",
+        "marker",
+        "controller",
+        "osc",
+        "detection",
+    ],
+)
+def test_api_get_section_returns_dict(live_server, section: str) -> None:
+    _, base = live_server
+    status, data = _get_json(base, f"/api/config/{section}")
+    assert status == 200, f"/api/config/{section} returned {status}"
+    assert isinstance(data, dict)
+
+
+def test_api_get_unknown_section_returns_404(live_server) -> None:
+    _, base = live_server
+    status, data = _get_json(base, "/api/config/doesnotexist")
+    assert status == 404
+    assert "error" in data
+
+
+# ---------------------------------------------------------------------------
+# Config persistence – POST then re-read the saved file
+# ---------------------------------------------------------------------------
+
+
+def test_api_post_camera_persists_values(live_server) -> None:
+    server, base = live_server
+    status, data = _post_json(base, "/api/config/camera", {"pos_x": 3.5, "pos_z": 7.0})
+    assert status == 200
+    assert data.get("success") is True
+
+    saved = load_config(server.config_path)
+    assert saved.camera.pos_x == pytest.approx(3.5)
+    assert saved.camera.pos_z == pytest.approx(7.0)
+
+
+def test_api_post_osc_persists_enabled_flag(live_server) -> None:
+    server, base = live_server
+    status, data = _post_json(base, "/api/config/osc", {"enabled": True, "port": 9001})
+    assert status == 200
+    assert data.get("success") is True
+
+    saved = load_config(server.config_path)
+    assert saved.osc.enabled is True
+    assert saved.osc.port == 9001
+
+
+def test_api_post_grid_persists_dimensions(live_server) -> None:
+    server, base = live_server
+    status, data = _post_json(base, "/api/config/grid", {"width": 30.0, "depth": 20.0})
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.grid.width == pytest.approx(30.0)
+    assert saved.grid.depth == pytest.approx(20.0)
+
+
+def test_api_post_grid_max_height_round_trips(live_server) -> None:
+    """``max_height`` saves and loads as a positive float like other dimensions."""
+    server, base = live_server
+    _post_json(base, "/api/config/grid", {"max_height": 4.0})
+    saved = load_config(server.config_path)
+    assert saved.grid.max_height == pytest.approx(4.0)
+
+
+def test_api_post_grid_max_height_emptied_clears_to_zero(live_server) -> None:
+    server, base = live_server
+    # First: set a non-zero height.
+    _post_json(base, "/api/config/grid", {"max_height": 4.0})
+    saved = load_config(server.config_path)
+    assert saved.grid.max_height == pytest.approx(4.0)
+    # Then: clear via empty string. Must collapse to 0 (= unset).
+    _post_json(base, "/api/config/grid", {"max_height": ""})
+    saved = load_config(server.config_path)
+    assert saved.grid.max_height == 0.0
+
+
+def test_api_post_grid_max_height_negative_collapses_to_zero(live_server) -> None:
+    """Negative ``max_height`` collapses to 0 in ``GridConfig.__post_init__``;
+    the save round-trip must produce 0, not -2."""
+    server, base = live_server
+    _post_json(base, "/api/config/grid", {"max_height": -2.0})
+    saved = load_config(server.config_path)
+    assert saved.grid.max_height == 0.0
+
+
+def test_api_post_movement_persists_speed_settings(live_server) -> None:
+    server, base = live_server
+    status, data = _post_json(
+        base,
+        "/api/config/movement",
+        {"min_speed": 0.5, "move_speed": 2.5, "max_speed": 5.0},
+    )
+    assert status == 200
+    assert data.get("success") is True
+
+    saved = load_config(server.config_path)
+    assert saved.marker.min_speed == pytest.approx(0.5)
+    assert saved.marker.move_speed == pytest.approx(2.5)
+    assert saved.marker.max_speed == pytest.approx(5.0)
+
+
+def test_api_post_movement_persists_default_position(live_server) -> None:
+    server, base = live_server
+    status, data = _post_json(
+        base,
+        "/api/config/movement",
+        {"default_pos_x": 1.0, "default_pos_y": -2.0, "default_pos_z": 3.5},
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.marker.default_pos_x == pytest.approx(1.0)
+    assert saved.marker.default_pos_y == pytest.approx(-2.0)
+    assert saved.marker.default_pos_z == pytest.approx(3.5)
+
+
+def test_api_post_unknown_section_returns_404(live_server) -> None:
+    _, base = live_server
+    status, data = _post_json(base, "/api/config/bogus", {"x": 1})
+    assert status == 404
+    assert "error" in data
+
+
+def test_api_post_invalid_json_returns_400(live_server) -> None:
+    _, base = live_server
+    req = urllib.request.Request(
+        f"{base}/api/config/camera",
+        data=b"not json {{{{",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+
+
+# ---------------------------------------------------------------------------
+# Form POST routes – templates must render after save
+# ---------------------------------------------------------------------------
+
+
+def test_form_post_camera_renders_saved_partial(live_server) -> None:
+    _, base = live_server
+    status, body = _post_form(base, "/section/camera", {"pos_x": "1.5", "pos_y": "-5.0", "pos_z": "4.0"})
+    assert status == 200
+    assert len(body) > 50
+
+
+def test_form_post_osc_renders_saved_partial(live_server) -> None:
+    _, base = live_server
+    status, body = _post_form(base, "/section/osc", {"enabled": "true", "port": "8765"})
+    assert status == 200
+
+
+def test_form_post_osc_saves_multicast_group(live_server) -> None:
+    # The [osc] multicast_group field round-trips through save.
+    _, base = live_server
+    status, body = _post_form(
+        base,
+        "/section/osc",
+        {"enabled": "true", "port": "8765", "multicast_group": "239.10.10.10"},
+    )
+    assert status == 200
+    assert "239.10.10.10" in body
+
+
+def test_form_post_operator_messages_renders_saved_partial(live_server) -> None:
+    # The [operator_messages] section saves + re-renders.
+    _, base = live_server
+    status, body = _post_form(
+        base,
+        "/section/operator_messages",
+        {"enabled": "true", "position": "top", "max_visible": "3"},
+    )
+    assert status == 200
+    assert "operator-messages-section" in body
+
+
+def test_form_post_movement_renders_saved_partial(live_server) -> None:
+    _, base = live_server
+    status, body = _post_form(
+        base,
+        "/section/movement",
+        {"min_speed": "0.2", "move_speed": "1.5", "max_speed": "4.0"},
+    )
+    assert status == 200
+    assert "movement-section" in body
+
+
+def test_form_post_gamepad_renders_saved_partial(live_server) -> None:
+    _, base = live_server
+    status, body = _post_form(base, "/section/gamepad", {"enabled": "true", "deadzone": "0.1"})
+    assert status == 200
+    assert "gamepad-section" in body
+
+
+def test_form_post_gamepad_persists_new_button_fields(live_server) -> None:
+    server, base = live_server
+    status, _ = _post_form(
+        base,
+        "/section/gamepad",
+        {
+            "enabled": "true",
+            "deadzone": "0.15",
+            "btn_next_marker": "RB",
+            "btn_prev_marker": "LB",
+            "btn_settings": "START",
+            "btn_menu_confirm": "A",
+            "btn_menu_cancel": "B",
+        },
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.controller.btn_next_marker == "RB"
+    assert saved.controller.btn_prev_marker == "LB"
+    assert saved.controller.btn_settings == "START"
+    assert saved.controller.btn_menu_confirm == "A"
+    assert saved.controller.btn_menu_cancel == "B"
+
+
+def test_form_post_gamepad_invalid_button_falls_back_to_default(live_server) -> None:
+    server, base = live_server
+    status, _ = _post_form(
+        base,
+        "/section/gamepad",
+        {
+            "enabled": "true",
+            "deadzone": "0.15",
+            "btn_next_marker": "NOT_A_BUTTON",
+        },
+    )
+    assert status == 200
+    saved = load_config(server.config_path)
+    # ControllerConfig.__post_init__ reverts unknown names to the default.
+    assert saved.controller.btn_next_marker == "DPAD_RIGHT"
+
+
+def test_form_post_keyboard_renders_saved_partial(live_server) -> None:
+    _, base = live_server
+    status, body = _post_form(base, "/section/keyboard", {"keyboard_enabled": "true"})
+    assert status == 200
+    assert "keyboard-section" in body
+
+
+def test_form_post_keyboard_persists_new_fields(live_server) -> None:
+    server, base = live_server
+    status, _ = _post_form(
+        base,
+        "/section/keyboard",
+        {
+            "keyboard_enabled": "true",
+            "key_next_marker": "n",
+            "key_prev_marker": "p",
+            "key_settings": "g",
+        },
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.controller.key_next_marker == "n"
+    assert saved.controller.key_prev_marker == "p"
+    assert saved.controller.key_settings == "g"
+
+
+def test_form_post_keyboard_movement_collision_reverts_to_default(live_server) -> None:
+    server, base = live_server
+    # 'w' is part of the WASD layout – action bindings must refuse it.
+    status, _ = _post_form(
+        base,
+        "/section/keyboard",
+        {
+            "keyboard_enabled": "true",
+            "key_settings": "w",
+        },
+    )
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.controller.key_settings == "m"
+
+
+def test_form_post_keyboard_persists_movement_layout(live_server) -> None:
+    server, base = live_server
+    status, _ = _post_form(
+        base,
+        "/section/keyboard",
+        {
+            "keyboard_enabled": "true",
+            "key_move_layout": "ijkl",
+        },
+    )
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.controller.key_move_layout == "ijkl"
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_form_post_mouse_saves_the_wheel_settings_on_every_platform(live_server, monkeypatch, platform) -> None:
+    # An unticked checkbox is absent from the POST and must save as off; no
+    # platform may skip the wheel fields.
+    monkeypatch.setattr(sys, "platform", platform)
+    server, base = live_server
+    status, _ = _post_form(base, "/section/mouse", {"mouse_enabled": "true", "mouse_wheel_z_step": "0.4"})
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.controller.mouse_wheel_z_enabled is False
+    assert saved.controller.mouse_wheel_z_step == pytest.approx(0.4)
+
+
+_TRUE_FALSE_DROPDOWNS = [
+    pytest.param("/section/marker", "z_display_from_stage", lambda c: c.marker.z_display_from_stage, id="z-readout"),
+    pytest.param(
+        "/section/mouse", "mouse_wheel_invert", lambda c: c.controller.mouse_wheel_invert, id="wheel-direction"
+    ),
+    pytest.param(
+        "/section/movement",
+        "invert_control_direction",
+        lambda c: c.marker.invert_control_direction,
+        id="control-direction",
+    ),
+    pytest.param("/section/gamepad", "invert_y", lambda c: c.controller.invert_y, id="stick-y-axis"),
+    pytest.param("/section/mouse3d", "invert_pan_x", lambda c: c.mouse3d.invert_pan_x, id="3d-mouse-direction"),
+    pytest.param(
+        "/section/operator_messages",
+        "route_by_marker",
+        lambda c: c.operator_messages.route_by_marker,
+        id="message-routing",
+    ),
+]
+
+
+def _selected_options(body: str, name: str) -> list[str]:
+    select = body.split(f'name="{name}"', 1)[1].split("</select>", 1)[0]
+    return re.findall(r'<option value="([^"]*)" selected>', select)
+
+
+@pytest.mark.parametrize(("path", "field", "read"), _TRUE_FALSE_DROPDOWNS)
+@pytest.mark.parametrize("value", [True, False])
+def test_a_true_false_dropdown_saves_and_shows_the_chosen_option(live_server, path, field, read, value) -> None:
+    # A dropdown always posts its value, so "false" has to save False.
+    server, base = live_server
+    status, body = _post_form(base, path, {field: str(value).lower()})
+    assert status == 200
+    assert read(load_config(server.config_path)) is value
+    assert _selected_options(body, field) == [str(value).lower()]
+
+
+@pytest.mark.parametrize(("path", "field", "read"), _TRUE_FALSE_DROPDOWNS)
+@pytest.mark.parametrize("value", [True, False])
+def test_a_post_without_the_dropdown_keeps_its_value(live_server, path, field, read, value) -> None:
+    server, base = live_server
+    _post_form(base, path, {field: str(value).lower()})
+    status, _ = _post_form(base, path, {})
+    assert status == 200
+    assert read(load_config(server.config_path)) is value
+
+
+def test_each_3d_mouse_axis_direction_is_named_after_its_axis(live_server) -> None:
+    # Six selects share the visible label "Direction"; the axis tells them apart.
+    _, base = live_server
+    status, body = _get(base, "/section/mouse3d")
+    assert status == 200
+    for axis, label in MOUSE3D_AXIS_FORM_LABELS:
+        ids = re.search(rf'<select id="m3d-invert-{axis}"[^>]*aria-labelledby="([^"]+)"', body).group(1).split()
+        names = [html.unescape(re.search(rf'id="{i}">([^<]*)<', body).group(1)) for i in ids]
+        assert names == [label, "Direction"]
+
+
+def test_form_post_mouse_renders_saved_partial(live_server) -> None:
+    _, base = live_server
+    status, body = _post_form(base, "/section/mouse", {"mouse_enabled": "true"})
+    assert status == 200
+    assert "mouse-section" in body
+
+
+# ---------------------------------------------------------------------------
+# Restart flag
+# ---------------------------------------------------------------------------
+
+
+def test_api_create_zone_rejects_non_object_json(live_server) -> None:
+    _, base = live_server
+    status, body = _post_raw_json(base, "/api/zones", ["not", "a", "dict"])
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_update_zone_rejects_non_object_json(live_server) -> None:
+    """A JSON list/scalar at PUT /api/zones/<i> must 400, not silently no-op."""
+    _, base = live_server
+    # Create a real zone first so the update target exists.
+    status, body = _post_raw_json(base, "/api/zones", {"name": "Z0"})
+    assert status == 200
+    idx = body.get("index", 0)
+    status, body = _post_raw_json(base, f"/api/zones/{idx}", "string, not an object", method="PUT")
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_create_zone_rejects_null_json(live_server) -> None:
+    """A JSON ``null`` body at POST /api/zones must 400 with an error body.
+
+    ``json.loads(\"null\")`` returns None without raising, so the route must
+    reject it explicitly rather than treating it as a successful parse.
+    """
+    _, base = live_server
+    status, body = _post_raw_json(base, "/api/zones", None)
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_update_zone_rejects_null_json(live_server) -> None:
+    """A JSON ``null`` body at PUT /api/zones/<i> must 400 with an error body."""
+    _, base = live_server
+    status, body = _post_raw_json(base, "/api/zones", {"name": "Zn"})
+    assert status == 200
+    idx = body.get("index", 0)
+    status, body = _post_raw_json(base, f"/api/zones/{idx}", None, method="PUT")
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_update_zone_ignores_non_list_vertices(live_server) -> None:
+    _, base = live_server
+    good_verts = [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]]
+    status, body = _post_raw_json(base, "/api/zones", {"name": "Z", "vertices": good_verts})
+    assert status == 200
+    idx = body.get("index", 0)
+
+    # Malformed vertices (null) – route should accept (200) but keep the polygon.
+    status, _ = _post_raw_json(base, f"/api/zones/{idx}", {"vertices": None}, method="PUT")
+    assert status == 200
+
+    status, zones_body = _get_json(base, "/api/zones")
+    vertices_after = zones_body["zones"][idx]["vertices"]
+    assert vertices_after == good_verts
+
+
+# ---------------------------------------------------------------------------
+# Restart flag
+# ---------------------------------------------------------------------------
+
+
+def test_restart_openfollow_restarts_and_saves_nothing(live_server, monkeypatch) -> None:
+    """Save and Restart are two actions: the restart takes whatever was
+    saved, and never the form it was pressed under."""
+    _patch_ifaces(monkeypatch, {"eth1": "10.0.0.9"})
+    server, base = live_server
+    assert server.check_restart_requested() is False
+
+    status, _body = _post_form(
+        base,
+        "/section/interface_assignment/restart",
+        {"psn_source_iface": "", "otp_output.source_iface": "", "web_bind_iface": "eth1"},
+    )
+    assert status == 200
+    assert load_config(server.config_path).web_bind_iface == ""
+    assert server.check_restart_requested() is True
+
+
+def test_save_never_restarts(live_server, monkeypatch) -> None:
+    _patch_ifaces(monkeypatch, {"eth1": "10.0.0.9"})
+    server, base = live_server
+    status, _body = _post_form(
+        base,
+        "/section/interface_assignment?restart=1",
+        {"psn_source_iface": "", "otp_output.source_iface": "", "web_bind_iface": "eth1"},
+    )
+    assert status == 200
+    assert load_config(server.config_path).web_bind_iface == "eth1"
+    assert server.check_restart_requested() is False
+
+
+@pytest.mark.parametrize("state", ["queued", "running", "restarting"])
+def test_restart_openfollow_waits_for_a_running_update(live_server, monkeypatch, state: str) -> None:
+    server, base = live_server
+    server.set_update_status(state=state)
+    status, body = _post_form(base, "/section/interface_assignment/restart", {})
+    assert status == 200
+    assert server.check_restart_requested() is False
+    assert "An update is running, so OpenFollow was not restarted." in body
+    assert "restart-notice" not in body
+
+
+def test_post_interface_assignment_without_restart_flag_queues_nothing(live_server, monkeypatch) -> None:
+    """A plain Save of the protocol rows is live-applied; queueing a restart
+    for those would interrupt a running show for no reason."""
+    _patch_ifaces(monkeypatch, {"eth1": "10.0.0.9"})
+    server, base = live_server
+    status, _body = _post_form(
+        base,
+        "/section/interface_assignment",
+        {"psn_source_iface": "", "otp_output.source_iface": "eth1", "web_bind_iface": ""},
+    )
+    assert status == 200
+    assert server.check_restart_requested() is False
+
+
+def test_post_general_with_restart_flag_queues_restart(live_server) -> None:
+    server, base = live_server
+    assert server.check_restart_requested() is False
+
+    status, body = _post_form(base, "/section/general?restart=1", {})
+    assert status == 200
+
+    assert server.check_restart_requested() is True
+    # consuming it should clear the flag
+    assert server.check_restart_requested() is False
+
+
+# ---------------------------------------------------------------------------
+# Peer authentication (HMAC-signed requests)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def pin_protected_server(tmp_path, monkeypatch):
+    """Variant of ``live_server`` that starts with a configured web PIN."""
+    monkeypatch.setattr(discovery_module.BeaconSender, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconSender, "stop", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "stop", lambda self: None)
+
+    config_path = tmp_path / "config.toml"
+
+    # Write a config with a PIN before the server starts; ``_check_auth``
+    # reads the pin from disk on every request via ``load_config``.
+    initial = AppConfig()
+    initial.web_pin = "sekret"
+    save_config(initial, str(config_path))
+
+    with live_on_free_port(
+        lambda port: ConfigWebServer(
+            config_path=str(config_path),
+            host="127.0.0.1",
+            port=port,
+            system_name="TestSystem",
+        )
+    ) as (server, base):
+        yield server, base, "sekret"
+
+
+def _signed_post(base: str, path: str, body_bytes: bytes, pin: str) -> int:
+    timestamp, signature = peer_auth.sign(pin, "POST", path, body_bytes)
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=body_bytes,
+        headers={
+            "Content-Type": "application/json",
+            peer_auth.TIMESTAMP_HEADER: str(timestamp),
+            peer_auth.SIGNATURE_HEADER: signature,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def _post_json_status(base: str, path: str, data: dict) -> int:
+    """POST JSON and return only the HTTP status code.
+
+    Unlike ``_post_json``, this tolerates non-JSON error bodies (e.g.,
+    bottle's default HTML 401 page).
+    """
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=json.dumps(data).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def test_api_requires_auth_when_pin_configured(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    # No cookie, no signature → 401.
+    assert _post_json_status(base, "/api/config/camera", {"pos_x": 1.0}) == 401
+
+
+def test_api_accepts_valid_hmac_signature(pin_protected_server) -> None:
+    server, base, pin = pin_protected_server
+    body = json.dumps({"pos_x": 2.5}).encode("utf-8")
+    status = _signed_post(base, "/api/config/camera", body, pin)
+
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.camera.pos_x == pytest.approx(2.5)
+
+
+def test_api_rejects_replayed_signed_request(pin_protected_server) -> None:
+    """A valid signed request is single-use within the window: re-sending the
+    exact same (timestamp, signature) is rejected as a replay."""
+    _, base, pin = pin_protected_server
+    path = "/api/config/camera"
+    body = json.dumps({"pos_x": 3.5}).encode("utf-8")
+    timestamp, signature = peer_auth.sign(pin, "POST", path, body)
+    headers = {
+        "Content-Type": "application/json",
+        peer_auth.TIMESTAMP_HEADER: str(timestamp),
+        peer_auth.SIGNATURE_HEADER: signature,
+    }
+
+    def _send() -> int:
+        req = urllib.request.Request(f"{base}{path}", data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    assert _send() == 200  # first use accepted
+    assert _send() == 401  # identical signature replayed → rejected
+
+
+def test_api_rejects_invalid_hmac_signature(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    body = json.dumps({"pos_x": 2.5}).encode("utf-8")
+    # Sign with the wrong PIN.
+    status = _signed_post(base, "/api/config/camera", body, "wrong-pin")
+
+    assert status == 401
+
+
+def test_api_rejects_tampered_body(pin_protected_server) -> None:
+    server, base, pin = pin_protected_server
+    original = json.dumps({"pos_x": 2.5}).encode("utf-8")
+    timestamp, signature = peer_auth.sign(pin, "POST", "/api/config/camera", original)
+    # Sign the original body but send a different one.
+    tampered = json.dumps({"pos_x": 999.0}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/api/config/camera",
+        data=tampered,
+        headers={
+            "Content-Type": "application/json",
+            peer_auth.TIMESTAMP_HEADER: str(timestamp),
+            peer_auth.SIGNATURE_HEADER: signature,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+
+    assert status == 401
+    saved = load_config(server.config_path)
+    assert saved.camera.pos_x != pytest.approx(999.0)
+
+
+def test_api_does_not_accept_legacy_x_auth_pin_header(pin_protected_server) -> None:
+    """The X-Auth-Pin header must no longer authenticate."""
+    _, base, pin = pin_protected_server
+    body = json.dumps({"pos_x": 3.5}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/api/config/camera",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Auth-Pin": pin,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+
+    assert status == 401
+
+
+def test_login_endpoint_remains_accessible_without_auth(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    status, body = _get(base, "/login")
+    assert status == 200
+    assert "pin" in body.lower()
+
+
+@pytest.mark.parametrize("pin", [None, "definitely-wrong"], ids=["page", "wrong-pin"])
+def test_the_login_page_shows_no_station_state(pin_protected_server, pin: str | None) -> None:
+    _, base, _ = pin_protected_server
+    status, body = _get(base, "/login") if pin is None else _post_form(base, "/login", {"pin": pin})
+    assert status == 200
+    assert 'id="statistics-section"' not in body
+    assert "/section/statistics" not in body
+    assert 'class="stat-panel"' not in body
+
+
+def test_privilege_modal_poll_unauth_returns_empty_no_redirect(pin_protected_server) -> None:
+    server, base, _ = pin_protected_server
+    # Park a privilege request so an authenticated poll would have
+    # something to render – proves the unauth path returns empty by
+    # CHOICE, not by absence of state.
+    server._command_queue.request_privilege_password(
+        reason="should not leak to unauth client",
+        capability_name="network.nm.con_mod",
+    )
+    status, body = _get(base, "/system/privilege/password/modal")
+    assert status == 200
+    assert "privilege-password-input" not in body
+    assert "should not leak to unauth client" not in body
+
+
+def test_about_page_renders_all_tabs(live_server) -> None:
+    """/about is a single tabbed page carrying every legal document inline."""
+    _, base = live_server
+    status, body = _get(base, "/about")
+    assert status == 200
+    # Tab bar (main-UI style) with the four tabs.
+    assert 'class="tab-bar"' in body
+    assert 'data-tab="about-license"' in body
+    assert 'data-tab="about-third-party"' in body
+    assert 'data-tab="about-written-offer"' in body
+    # About tab: §5(d) notice + source link + license-texts pointer.
+    assert "OpenFollow v" in body
+    # The short git commit follows the release number in both the footer and the
+    # About version row when running from a checkout (None on a no-.git install).
+    from openfollow import __commit__, __version__
+
+    if __commit__:
+        assert f"OpenFollow v{__version__} ({__commit__})" in body  # footer
+        assert f"v{__version__} ({__commit__})" in body  # About version row
+    assert "AGPL-3.0-or-later" in body
+    assert "WITHOUT ANY WARRANTY" in body
+    assert "all rights reserved" in body
+    assert "https://github.com/openfollowapp/openfollow" in body
+    assert "/usr/share/common-licenses/" in body
+    # License tab: verbatim AGPL + plain-text link.
+    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in body
+    assert 'href="/about/license.txt"' in body
+    # Notices tab: SBOM note + the rendered notices document.
+    assert "A Software Bill of Materials (SPDX) is included" in body
+    assert "Third-Party Notices" in body
+    assert "<table" in body
+    # Offer tab.
+    assert "Written Offer for Source Code" in body
+    assert "three (3) years" in body
+
+
+def test_about_page_carries_the_support_card(live_server) -> None:
+    """The full card, linking the website's stable address and never a payment page:
+    a station keeps this release's text and address for as long as it runs it."""
+    _, base = live_server
+    status, body = _get(base, "/about")
+    assert status == 200
+    card = body[body.index('<aside class="support-card"') :]
+    card = card[: card.index("</aside>")]
+    assert "support-card--compact" not in card
+    assert 'href="https://openfollow.app/support-openfollow"' in card
+    assert ">openfollow.app/support-openfollow</a>" in card
+    assert "Contributions pay for the hardware we test on and for hosting." in card
+    assert 'class="qr"' in card
+    assert "buymeacoffee" not in card
+    assert "own money" not in card
+    # Offline contract: nothing in it loads from anywhere.
+    assert "src=" not in card
+
+
+def test_the_support_qr_steps_aside_on_a_phone(live_server) -> None:
+    """On a phone the code would be scanned by the screen showing it; the link stays."""
+    _, base = live_server
+    _, body = _get(base, "/about")
+    rule = re.search(r"@media \(max-width: (\d+)px\) \{ \.support-card \.qr \{ display: none; \} \}", body)
+    assert rule and int(rule.group(1)) <= 640
+    assert ".support-card-url { display: none" not in body
+
+
+def test_about_page_exposes_no_config_state(live_server) -> None:
+    _, base = live_server
+    status, body = _get(base, "/about")
+    assert status == 200
+    # The pill *element* (which would render config.psn_system_name) must
+    # not appear. Match the element's class attribute, not the bare class
+    # name – the latter also occurs in base.tpl's CSS, which is always
+    # present regardless of whether ``config`` was passed.
+    assert 'class="station-name-pill hero-station-pill"' not in body
+
+
+def test_about_license_txt_serves_plain_text(live_server) -> None:
+    """/about/license.txt serves the bundled AGPLv3 text as plain text."""
+    _, base = live_server
+    with urllib.request.urlopen(f"{base}/about/license.txt", timeout=5) as r:
+        status = r.status
+        content_type = r.headers.get("Content-Type", "")
+        body = r.read().decode()
+    assert status == 200
+    assert content_type.startswith("text/plain")
+    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in body
+
+
+def test_about_license_txt_redirects_to_gnu_when_unbundled(live_server, monkeypatch) -> None:
+    """No bundled LICENSE -> /about/license.txt redirects to the FSF copy."""
+    import openfollow.web.routes as routes_module
+
+    _, base = live_server
+    monkeypatch.setattr(routes_module, "_license_file_path", lambda: None)
+    opener = _no_redirect_opener()
+    try:
+        with opener.open(f"{base}/about/license.txt", timeout=5) as resp:
+            status = resp.status
+            location = resp.headers.get("Location", "")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        location = e.headers.get("Location", "")
+    assert status in (301, 302, 303, 307, 308)
+    assert "gnu.org" in location
+
+
+def test_about_license_tab_fallback_when_unbundled(live_server, monkeypatch) -> None:
+    """No bundled LICENSE -> the License tab shows the gnu.org link."""
+    import openfollow.web.routes as routes_module
+
+    _, base = live_server
+    monkeypatch.setattr(routes_module, "_read_license_text", lambda: None)
+    status, body = _get(base, "/about")
+    assert status == 200
+    assert "gnu.org/licenses/agpl-3.0" in body
+
+
+def test_about_page_accessible_without_auth(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    status, body = _get(base, "/about")
+    assert status == 200
+    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in body  # license tab content inline
+    status, _ = _get(base, "/about/license.txt")
+    assert status == 200
+
+
+def test_license_footer_present_on_index(live_server) -> None:
+    """Every page rebases base.tpl, so the clean license/version footer
+    (with its link to /about) renders on the index page."""
+    _, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert 'class="license-footer"' in body
+    assert "OpenFollow v" in body
+    assert 'href="/about"' in body
+
+
+_WHATS_NEW_LINK = (
+    '<button type="button" class="whats-new-link" onclick="openfollowShowWhatsNew()">(What\'s new)</button>'
+)
+
+
+@pytest.mark.parametrize("path", ["/", "/wizard"])
+def test_the_footer_reopens_whats_new_on_a_signed_in_page_at_any_time(live_server, path: str) -> None:
+    """No update pending, yet the link is there and the opener it calls is on the page."""
+    server, base = live_server
+    assert server.whats_new_pending() is False
+    status, body = _get(base, path)
+    assert status == 200
+    footer = body[body.index('<footer class="license-footer"') :]
+    assert _WHATS_NEW_LINK in footer[: footer.index("</footer>")]
+    assert "async function openfollowShowWhatsNew()" in body
+
+
+def test_the_whats_new_link_is_not_on_a_page_before_sign_in(pin_protected_server) -> None:
+    """Its notes come from a signed-in route, so the login and About pages leave it out."""
+    _, base, _ = pin_protected_server
+    for path in ("/login", "/about"):
+        status, body = _get(base, path)
+        assert status == 200
+        assert "whats-new-link" not in body.split("</style>")[-1]
+
+
+def test_hero_logo_links_to_overview(live_server) -> None:
+    """base.tpl wraps the hero logo in a link back to the overview ("/"),
+    so the logo is a clickable way home on every page."""
+    _, base = live_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert 'class="hero-logo-link" href="/"' in body
+    assert '<img class="hero-logo"' in body
+
+
+def test_about_page_has_back_to_overview_link(live_server) -> None:
+    """/about offers an explicit way back to the overview – both the textual
+    back link and the clickable hero logo from base.tpl."""
+    _, base = live_server
+    status, body = _get(base, "/about")
+    assert status == 200
+    assert 'class="about-back-link" href="/"' in body
+    assert "Back to overview" in body
+    assert 'class="hero-logo-link" href="/"' in body
+
+
+def test_about_doc_tabs_fallback_when_unbundled(live_server, monkeypatch) -> None:
+    """No bundled notices/offer -> those tabs degrade to a link, page still 200."""
+    import openfollow.web.routes as routes_module
+
+    _, base = live_server
+    monkeypatch.setattr(routes_module, "_third_party_notices_html", lambda: None)
+    monkeypatch.setattr(routes_module, "_written_offer_html", lambda: None)
+    status, body = _get(base, "/about")
+    assert status == 200
+    assert "isn't bundled" in body
+    assert "openfollow.app" in body
+
+
+def test_api_rejects_signed_request_over_body_size_cap(pin_protected_server, monkeypatch) -> None:
+    _, base, pin = pin_protected_server
+    monkeypatch.setattr(peer_auth, "MAX_SIGNED_BODY_SIZE", 100)
+
+    body = b"x" * 500  # > cap, with a valid Content-Length header
+    timestamp, signature = peer_auth.sign(pin, "POST", "/api/config/camera", body)
+    req = urllib.request.Request(
+        f"{base}/api/config/camera",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            peer_auth.TIMESTAMP_HEADER: str(timestamp),
+            peer_auth.SIGNATURE_HEADER: signature,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+
+    assert status == 413
+
+
+def test_successful_login_sets_samesite_strict_cookie(pin_protected_server) -> None:
+    """Auth cookie must carry SameSite=Strict to prevent CSRF attacks.
+    Without it, a malicious page could trigger config changes."""
+    _, base, pin = pin_protected_server
+    req = urllib.request.Request(
+        f"{base}/login",
+        data=urllib.parse.urlencode({"pin": pin}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    # urllib follows redirects by default; we need the raw 303 response
+    # so we can inspect the Set-Cookie header.
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_a, **_kw):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+
+    try:
+        resp = opener.open(req, timeout=5)
+        headers = resp.headers
+    except urllib.error.HTTPError as e:
+        headers = e.headers
+
+    cookie_headers = headers.get_all("Set-Cookie") or []
+    auth_cookies = [c for c in cookie_headers if c.startswith("_openfollow_auth=")]
+    assert auth_cookies, f"No auth cookie in response headers: {cookie_headers}"
+
+    attrs = auth_cookies[0].lower()
+    assert "samesite=strict" in attrs, f"Auth cookie missing SameSite=Strict: {auth_cookies[0]}"
+    assert "httponly" in attrs, f"Auth cookie missing HttpOnly: {auth_cookies[0]}"
+
+
+# ---------------------------------------------------------------------------
+# Threaded WSGI + parallel peer fan-out
+# ---------------------------------------------------------------------------
+
+
+def test_threaded_server_handles_concurrent_requests(live_server, monkeypatch) -> None:
+    import concurrent.futures
+    import time as _time
+
+    from openfollow.web import routes as routes_mod
+
+    _, base = live_server
+
+    original_asdict = routes_mod.asdict
+
+    def _slow_asdict(obj):
+        _time.sleep(1.0)
+        return original_asdict(obj)
+
+    monkeypatch.setattr(routes_mod, "asdict", _slow_asdict)
+
+    def _hit(path: str) -> tuple[float, int]:
+        t0 = _time.monotonic()
+        status, _ = _get(base, path)
+        return _time.monotonic() - t0, status
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(_hit, "/api/config")
+        # Give the slow request a head-start so it's definitely mid-sleep
+        # before the fast request arrives. With 0.05 s the slow request
+        # has ~0.95 s of sleep remaining when the fast one is issued.
+        _time.sleep(0.05)
+        fast = pool.submit(_hit, "/api/info")
+
+        fast_elapsed, fast_status = fast.result(timeout=3.0)
+        slow_elapsed, slow_status = slow.result(timeout=3.0)
+
+    assert slow_status == 200 and fast_status == 200
+    # Under the single-threaded server, fast would be queued behind slow
+    # (>= 0.95 s). With the threaded server it should complete well
+    # within 0.5 s. Margin generous enough to stay robust on busy CI.
+    assert fast_elapsed < 0.5, (
+        f"/api/info took {fast_elapsed:.3f}s while /api/config was in flight – "
+        "WSGI server is not processing requests concurrently."
+    )
+
+
+def test_threading_wsgi_server_rejects_when_handler_cap_exhausted(live_server, monkeypatch) -> None:
+    import threading as _threading
+    import time as _time
+
+    from openfollow.web import server as server_module
+
+    _, base = live_server
+
+    cap = server_module._REQUEST_MAX_CONCURRENT
+    sem = _threading.BoundedSemaphore(cap)
+    monkeypatch.setattr(server_module, "_request_semaphore", sem)
+
+    # Exhaust every slot on the fresh semaphore.
+    held = 0
+    try:
+        for _ in range(cap):
+            assert sem.acquire(blocking=False), "fresh semaphore must start fully free"
+            held += 1
+
+        t0 = _time.monotonic()
+        status, body = _get(base, "/api/info")
+        elapsed = _time.monotonic() - t0
+
+        assert status == 503, f"expected 503 when handler cap exhausted, got {status}: {body!r}"
+        # Rejection must be fast – the whole point is that threads don't
+        # accumulate. A proper reject sends immediately and closes.
+        assert elapsed < 2.0, f"rejection took {elapsed:.2f}s – rejected requests must terminate quickly"
+    finally:
+        for _ in range(held):
+            sem.release()
+
+    # Sanity: after releasing all slots, the server handles requests normally.
+    status, _ = _get(base, "/api/info")
+    assert status == 200
+
+
+def test_broadcast_to_peers_runs_sends_in_parallel(monkeypatch) -> None:
+    import time as _time
+
+    from openfollow.web.discovery import PeerInfo
+    from openfollow.web.routes import _broadcast_to_peers
+
+    peers = [
+        PeerInfo(name=f"P{i}", ip=f"10.0.0.{10 + i}", web_port=80, version="0.1.0", last_seen=_time.time())
+        for i in range(10)
+    ]
+
+    def _send(_peer: PeerInfo) -> bool:
+        _time.sleep(0.3)
+        return True
+
+    t0 = _time.monotonic()
+    results = _broadcast_to_peers(peers, _send, overall_timeout=5.0)
+    elapsed = _time.monotonic() - t0
+
+    assert len(results) == len(peers)
+    assert all(r["success"] for r in results)
+    # A conservative upper bound: 10 sends sequentially would take 3.0s;
+    # parallel should finish in ~0.3s + thread overhead. 1.5s leaves lots
+    # of slack for busy CI without weakening the assertion.
+    assert elapsed < 1.5, f"fan-out took {elapsed:.2f}s – likely serial"
+
+
+def test_broadcast_to_peers_honours_overall_timeout(monkeypatch) -> None:
+    """Slow peers beyond the overall timeout are reported as failed rather
+    than holding the request thread open indefinitely.
+    """
+    import time as _time
+
+    from openfollow.web.discovery import PeerInfo
+    from openfollow.web.routes import _broadcast_to_peers
+
+    fast = PeerInfo("Fast", "10.0.0.10", 80, "0.1.0", _time.time())
+    slow = PeerInfo("Slow", "10.0.0.11", 80, "0.1.0", _time.time())
+
+    def _send(peer: PeerInfo) -> bool:
+        if peer.name == "Slow":
+            _time.sleep(2.0)
+        return True
+
+    t0 = _time.monotonic()
+    results = _broadcast_to_peers([fast, slow], _send, overall_timeout=0.3)
+    elapsed = _time.monotonic() - t0
+
+    assert elapsed < 1.5, "broadcast must return without waiting out the slow peer"
+    by_name = {r["name"]: r for r in results}
+    assert by_name["Fast"]["success"] is True
+    assert by_name["Slow"]["success"] is False
+
+
+def test_broadcast_to_peers_reports_exception_as_failure() -> None:
+    import time as _time
+
+    from openfollow.web.discovery import PeerInfo
+    from openfollow.web.routes import _broadcast_to_peers
+
+    good = PeerInfo("Good", "10.0.0.10", 80, "0.1.0", _time.time())
+    bad = PeerInfo("Bad", "10.0.0.11", 80, "0.1.0", _time.time())
+
+    def _send(peer: PeerInfo) -> bool:
+        if peer.name == "Bad":
+            raise RuntimeError("simulated peer error")
+        return True
+
+    results = _broadcast_to_peers([good, bad], _send, overall_timeout=2.0)
+
+    by_name = {r["name"]: r for r in results}
+    assert by_name["Good"]["success"] is True
+    assert by_name["Bad"]["success"] is False
+
+
+def test_broadcast_to_peers_returns_empty_for_empty_peer_list() -> None:
+    from openfollow.web.routes import _broadcast_to_peers
+
+    called = {"n": 0}
+
+    def _send(_peer):
+        called["n"] += 1
+        return True
+
+    assert _broadcast_to_peers([], _send, overall_timeout=1.0) == []
+    assert called["n"] == 0
+
+
+def test_broadcast_to_peers_caps_max_workers() -> None:
+    import threading as _threading
+    import time as _time
+
+    from openfollow.web.discovery import PeerInfo
+    from openfollow.web.routes import _BROADCAST_MAX_WORKERS, _broadcast_to_peers
+
+    peer_count = _BROADCAST_MAX_WORKERS + 8
+    peers = [
+        PeerInfo(name=f"P{i}", ip=f"10.0.0.{10 + i}", web_port=80, version="0.1.0", last_seen=_time.time())
+        for i in range(peer_count)
+    ]
+
+    live = 0
+    peak = 0
+    counter_lock = _threading.Lock()
+
+    def _send(_peer: PeerInfo) -> bool:
+        nonlocal live, peak
+        with counter_lock:
+            live += 1
+            peak = max(peak, live)
+        _time.sleep(0.2)
+        with counter_lock:
+            live -= 1
+        return True
+
+    results = _broadcast_to_peers(peers, _send, overall_timeout=10.0)
+
+    assert len(results) == peer_count
+    assert all(r["success"] for r in results)
+    assert peak <= _BROADCAST_MAX_WORKERS, (
+        f"peak concurrency {peak} exceeded cap {_BROADCAST_MAX_WORKERS} – worker pool is not bounded"
+    )
+
+
+def test_broadcast_to_peers_caps_max_peers() -> None:
+    import threading as _threading
+    import time as _time
+
+    from openfollow.web.discovery import PeerInfo
+    from openfollow.web.routes import _BROADCAST_MAX_PEERS, _broadcast_to_peers
+
+    overflow = 5
+    peer_count = _BROADCAST_MAX_PEERS + overflow
+    peers = [
+        PeerInfo(
+            name=f"P{i}", ip=f"10.0.{(i // 256) % 256}.{i % 256}", web_port=80, version="0.1.0", last_seen=_time.time()
+        )
+        for i in range(peer_count)
+    ]
+
+    calls: list[str] = []
+    calls_lock = _threading.Lock()
+
+    def _send(peer: PeerInfo) -> bool:
+        with calls_lock:
+            calls.append(peer.ip)
+        return True
+
+    results = _broadcast_to_peers(peers, _send, overall_timeout=5.0)
+
+    assert len(results) == peer_count, "result list must match input peer list length"
+    # Order must match input list so UI rendering is stable.
+    assert [r["ip"] for r in results] == [p.ip for p in peers]
+
+    successes = [r for r in results if r["success"]]
+    failures = [r for r in results if not r["success"]]
+    assert len(successes) == _BROADCAST_MAX_PEERS, (
+        f"expected exactly {_BROADCAST_MAX_PEERS} successes (the cap), got {len(successes)}"
+    )
+    assert len(failures) == overflow, (
+        f"expected {overflow} peers beyond the cap to be reported failed, got {len(failures)}"
+    )
+    # Skipped peers must be the trailing slice – confirms deterministic truncation.
+    skipped_ips = {r["ip"] for r in failures}
+    assert skipped_ips == {p.ip for p in peers[_BROADCAST_MAX_PEERS:]}
+
+    # Crucially: _send must never be called for skipped peers.
+    assert len(calls) == _BROADCAST_MAX_PEERS
+    assert set(calls).isdisjoint(skipped_ips)
+
+
+def test_broadcast_to_peers_total_thread_count_bounded_under_rapid_broadcasts() -> None:
+    import threading as _threading
+    import time as _time
+
+    from openfollow.web.discovery import PeerInfo
+    from openfollow.web.routes import _BROADCAST_MAX_WORKERS, _broadcast_to_peers
+
+    # Hold each send long enough that many broadcasts overlap.
+    send_release = _threading.Event()
+
+    def _send(_peer: PeerInfo) -> bool:
+        send_release.wait(timeout=5.0)
+        return True
+
+    peers_per_broadcast = 32  # well above _BROADCAST_MAX_WORKERS
+    broadcasts = 6  # 6 × 32 = 192 peers scheduled while blocked
+
+    def _do_broadcast(idx: int) -> None:
+        peers = [
+            PeerInfo(
+                name=f"P{i}", ip=f"10.{idx}.{i // 256}.{i % 256}", web_port=80, version="0.1.0", last_seen=_time.time()
+            )
+            for i in range(peers_per_broadcast)
+        ]
+        _broadcast_to_peers(peers, _send, overall_timeout=10.0)
+
+    callers: list[_threading.Thread] = []
+    try:
+        for broadcast_idx in range(broadcasts):
+            t = _threading.Thread(
+                target=_do_broadcast,
+                args=(broadcast_idx,),
+                daemon=True,
+                name=f"broadcast-caller-{broadcast_idx}",
+            )
+            t.start()
+            callers.append(t)
+
+        # Give broadcasts time to spawn as many workers as they can before
+        # we measure. Without the fix, each broadcast would spawn 32
+        # threads up front (192 total) that then block on the semaphore.
+        # With the fix, spawning is gated on slot acquisition, so at most
+        # _BROADCAST_MAX_WORKERS worker threads are live.
+        _time.sleep(0.3)
+
+        live_workers = [t for t in _threading.enumerate() if t.name.startswith("peer-broadcast-")]
+        assert len(live_workers) <= _BROADCAST_MAX_WORKERS, (
+            f"live broadcast threads {len(live_workers)} exceed cap "
+            f"{_BROADCAST_MAX_WORKERS} – rapid broadcasts are accumulating "
+            "blocked threads (acquire-before-spawn regression)"
+        )
+    finally:
+        send_release.set()
+        for t in callers:
+            t.join(timeout=10.0)
+
+
+def test_broadcast_to_peers_releases_slot_when_thread_spawn_fails(monkeypatch) -> None:
+    import threading as _threading
+    import time as _time
+
+    from openfollow.web import routes as _routes
+    from openfollow.web.discovery import PeerInfo
+
+    # Snapshot the current available slot count via non-blocking acquires,
+    # then release them back.
+    def _available_slots() -> int:
+        taken = 0
+        while _routes._broadcast_semaphore.acquire(blocking=False):
+            taken += 1
+        for _ in range(taken):
+            _routes._broadcast_semaphore.release()
+        return taken
+
+    # Other tests in this file may have left slow background workers
+    # still holding a slot (e.g. overall-timeout tests return before
+    # their slow peer completes). Snapshot the current available count
+    # and assert the delta rather than an absolute value.
+    before = _available_slots()
+
+    # Force Thread.start() to raise on every spawn attempt. The peer send
+    # should never be invoked, and every acquired slot must be released.
+    real_thread = _threading.Thread
+
+    def _boom_thread(*args, **kwargs):
+        t = real_thread(*args, **kwargs)
+
+        def _failing_start() -> None:
+            raise RuntimeError("simulated: can't start new thread")
+
+        t.start = _failing_start  # type: ignore[method-assign]
+        return t
+
+    monkeypatch.setattr(_threading, "Thread", _boom_thread)
+    monkeypatch.setattr(_routes.threading, "Thread", _boom_thread)
+
+    send_calls = {"n": 0}
+
+    def _send(_peer: PeerInfo) -> bool:
+        send_calls["n"] += 1
+        return True
+
+    peers = [
+        PeerInfo(name=f"P{i}", ip=f"10.0.0.{10 + i}", web_port=80, version="0.1.0", last_seen=_time.time())
+        for i in range(5)
+    ]
+
+    results = _routes._broadcast_to_peers(peers, _send, overall_timeout=2.0)
+
+    assert len(results) == len(peers)
+    assert all(r["success"] is False for r in results), "all peers must be reported failed when spawn fails"
+    assert send_calls["n"] == 0, "send must not be invoked when spawn fails"
+
+    after = _available_slots()
+    assert after == before, f"semaphore slot leaked: {before - after} slots permanently consumed after spawn failures"
+
+
+def test_broadcast_to_peers_workers_are_daemon_threads() -> None:
+    import threading as _threading
+    import time as _time
+
+    from openfollow.web.discovery import PeerInfo
+    from openfollow.web.routes import _broadcast_to_peers
+
+    captured: list[_threading.Thread] = []
+    captured_lock = _threading.Lock()
+
+    def _send(_peer: PeerInfo) -> bool:
+        with captured_lock:
+            captured.append(_threading.current_thread())
+        return True
+
+    peers = [
+        PeerInfo(name=f"P{i}", ip=f"10.0.0.{10 + i}", web_port=80, version="0.1.0", last_seen=_time.time())
+        for i in range(3)
+    ]
+
+    results = _broadcast_to_peers(peers, _send, overall_timeout=5.0)
+
+    assert all(r["success"] for r in results)
+    assert len(captured) == len(peers)
+    for t in captured:
+        assert t.daemon, (
+            f"broadcast worker {t.name!r} is not a daemon thread – in-flight sends would delay interpreter shutdown"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Detection install / uninstall endpoints
+# ---------------------------------------------------------------------------
+
+
+def _stub_package_command(monkeypatch, fake_fn):
+    """Replace ``routes._run_package_command`` with ``fake_fn``.
+
+    The helper is the only way the install/uninstall routes touch
+    ``subprocess`` – stubbing it keeps tests from monkeypatching
+    ``subprocess.Popen`` globally, which used to catch unrelated calls
+    (e.g. the discovery thread shelling out to ``git``).
+
+    ``fake_fn(argv, *, timeout)`` must return ``(returncode, tail_text)``
+    or raise ``subprocess.TimeoutExpired`` / ``OSError`` to exercise the
+    failure branches.
+    """
+    from openfollow.web import routes as routes_mod
+
+    monkeypatch.setattr(routes_mod, "_run_package_command", fake_fn)
+
+
+def _wait_for_install_terminal(server, *, timeout: float = 3.0) -> dict:
+    """Block up to ``timeout`` seconds until the detection install
+    worker publishes a terminal state, then return that snapshot.
+
+    The install/uninstall routes run pip on a background daemon
+    thread. Tests that exercise
+    a stubbed ``_run_package_command`` need to wait for the worker
+    to publish its result before asserting on the section render –
+    polling the in-memory state is faster and more reliable than
+    polling the HTTP endpoint.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snapshot = server.get_detection_install_status()
+        if snapshot.get("state") in {"success", "error"}:
+            return snapshot
+        time.sleep(0.02)
+    return server.get_detection_install_status()
+
+
+def test_detection_section_has_no_dependency_view(live_server) -> None:
+    """The Dependencies install/uninstall view was removed – deps come from
+    install-detection.sh. Neither the buttons nor their routes appear."""
+    _, base = live_server
+    status, body = _get(base, "/section/detection")
+    assert status == 200
+    assert "/section/detection/install" not in body
+    assert "/section/detection/uninstall" not in body
+    assert ">Dependencies</h3>" not in body
+    assert 'name="storage_path"' not in body
+
+
+def test_detection_section_running_state_emits_polling_div(live_server) -> None:
+    server, base = live_server
+    server.try_claim_detection_install(
+        action="export",
+        extra="yolo11n.onnx",
+        message="Exporting `yolo11n.onnx`...",
+    )
+    try:
+        status, body = _get(base, "/section/detection")
+    finally:
+        server.set_detection_install_status(state="idle")
+
+    assert status == 200
+    assert 'hx-trigger="every 1s"' in body
+    assert "Exporting `yolo11n.onnx`" in body
+
+
+def test_detection_section_polling_dismisses_terminal_state(live_server) -> None:
+    """The polling endpoint clears the status slot after rendering a terminal
+    banner so subsequent re-renders don't keep showing it forever."""
+    server, base = live_server
+    server.try_claim_detection_install(action="export", extra="yolo11n.onnx")
+    server.set_detection_install_status(
+        state="success",
+        message="Exported `yolo11n.onnx`.",
+        tail="ok",
+    )
+    status, body = _get(base, "/section/detection")
+    assert status == 200
+    assert "Exported `yolo11n.onnx`" in body
+    # State is auto-cleared after a polling render of a terminal state.
+    assert server.get_detection_install_status()["state"] == "idle"
+
+
+def test_detection_section_renders_pin_marker_id_dropdown(live_server) -> None:
+    """The Pin To Marker dropdown lists each controlled marker plus the
+    ``Currently selected (controller)`` sentinel option."""
+    from openfollow.configuration import load_config, save_config
+
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.controlled_marker_ids = [1, 3, 7]
+    save_config(cfg, server.config_path)
+
+    status, body = _get(base, "/section/detection")
+    assert status == 200
+    assert 'name="pin_marker_id"' in body
+    assert 'value="-1"' in body  # the "Currently selected" sentinel
+    # Each controlled marker shows up as an explicit option.
+    for marker_id in (1, 3, 7):
+        assert f'value="{marker_id}"' in body
+
+
+def test_detection_section_surfaces_pin_marker_id_when_not_in_controlled_ids(
+    live_server,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from openfollow.configuration import load_config, save_config
+
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.controlled_marker_ids = [1, 3]
+    cfg.detection.pin_marker_id = 9  # not in controlled_marker_ids
+    save_config(cfg, server.config_path)
+
+    status, body = _get(base, "/section/detection")
+    assert status == 200
+    # Narrow to the pin_marker_id select to avoid matching the
+    # ``Marker {{marker_id}}`` strings in other sections.
+    select_start = body.index('<select name="pin_marker_id">')
+    select_end = body.index("</select>", select_start)
+    select_html = body[select_start:select_end]
+    assert 'value="9" selected disabled' in select_html
+    assert "Marker 9 (unavailable)" in select_html
+    # The sentinel option must NOT be selected when an unavailable
+    # explicit ID survives.
+    assert 'value="-1" >' in select_html or 'value="-1">' in select_html
+
+
+# ---------------------------------------------------------------------------
+# Model export endpoint
+# ---------------------------------------------------------------------------
+
+
+def _config_with_storage(storage: str):
+    from openfollow.configuration import AppConfig
+
+    cfg = AppConfig()
+    cfg.detection.storage_path = storage
+    return cfg
+
+
+def test_export_rejects_unknown_model(live_server) -> None:
+    _, base = live_server
+    status, body = _post_form(base, "/section/detection/export", {"export_model": "totally-made-up"})
+    assert status == 200
+    assert "Unknown model" in body
+    assert "totally-made-up" in body
+
+
+def test_export_requires_export_tools(live_server, monkeypatch) -> None:
+    from openfollow.web import routes as routes_mod
+
+    _, base = live_server
+    monkeypatch.setattr(routes_mod, "_export_tools_available", lambda: False)
+    status, body = _post_form(base, "/section/detection/export", {"export_model": "yolov8n.onnx"})
+    assert status == 200
+    assert "model export tools" in body.lower()
+
+
+def test_export_reports_missing_script(live_server, monkeypatch) -> None:
+    from openfollow.web import routes as routes_mod
+
+    _, base = live_server
+    monkeypatch.setattr(routes_mod, "_export_tools_available", lambda: True)
+    monkeypatch.setattr(routes_mod, "_detection_export_script", lambda: None)
+    status, body = _post_form(base, "/section/detection/export", {"export_model": "yolov8n.onnx"})
+    assert status == 200
+    assert "Export script not found" in body
+
+
+def _stub_export_script(monkeypatch, tmp_path):
+    """Point the export at a stub script + an explicit storage path so the
+    kickoff reaches the worker without an NVMe or a real ultralytics."""
+    from openfollow.web import routes as routes_mod
+
+    script = tmp_path / "export_onnx.py"
+    script.write_text("# stub\n")
+    storage = tmp_path / "store"
+    storage.mkdir()
+    monkeypatch.setattr(routes_mod, "_export_tools_available", lambda: True)
+    monkeypatch.setattr(routes_mod, "_detection_export_script", lambda: script)
+    monkeypatch.setattr(routes_mod, "load_config", lambda _p: _config_with_storage(str(storage)))
+    return script, storage
+
+
+def test_export_kicks_off_worker_and_reports_success(live_server, monkeypatch, tmp_path) -> None:
+    server, base = live_server
+    script, storage = _stub_export_script(monkeypatch, tmp_path)
+
+    captured: dict = {}
+
+    def _fake(argv, *, timeout):
+        captured["argv"] = list(argv)
+        return 0, "export ok"
+
+    _stub_package_command(monkeypatch, _fake)
+
+    status, _ = _post_form(
+        base,
+        "/section/detection/export",
+        {"export_model": "yolov8n.onnx", "imgsz": "320", "opset": "17"},
+    )
+    assert status == 200
+    snapshot = _wait_for_install_terminal(server)
+    assert snapshot["state"] == "success"
+    assert "Exported" in snapshot["message"] and "yolov8n.onnx" in snapshot["message"]
+    # The export targets the .pt source, the requested imgsz/opset, and the
+    # storage models dir, via the interpreter running the web process.
+    argv = captured["argv"]
+    assert argv[0] == sys.executable
+    assert argv[1] == str(script)
+    assert argv[2] == "yolov8n.pt"
+    assert "--imgsz" in argv and "320" in argv
+    assert "--opset" in argv and "17" in argv
+    assert str(storage / "models") in argv
+
+
+def test_export_reports_subprocess_failure(live_server, monkeypatch, tmp_path) -> None:
+    server, base = live_server
+    _stub_export_script(monkeypatch, tmp_path)
+    _stub_package_command(monkeypatch, lambda _argv, *, timeout: (1, "ultralytics blew up\ntraceback"))
+
+    status, _ = _post_form(base, "/section/detection/export", {"export_model": "yolov8n.onnx"})
+    assert status == 200
+    snapshot = _wait_for_install_terminal(server)
+    assert snapshot["state"] == "error"
+    assert "exit 1" in snapshot["message"]
+    assert "traceback" in snapshot["tail"]
+
+
+def test_export_reports_timeout(live_server, monkeypatch, tmp_path) -> None:
+    import subprocess as _real_subprocess
+
+    server, base = live_server
+    _stub_export_script(monkeypatch, tmp_path)
+
+    def _boom(_argv, *, timeout):
+        raise _real_subprocess.TimeoutExpired(cmd="export", timeout=timeout)
+
+    _stub_package_command(monkeypatch, _boom)
+    status, _ = _post_form(base, "/section/detection/export", {"export_model": "yolov8n.onnx"})
+    assert status == 200
+    snapshot = _wait_for_install_terminal(server)
+    assert snapshot["state"] == "error"
+    assert "timed out" in snapshot["message"].lower()
+
+
+def test_export_reports_launch_failure(live_server, monkeypatch, tmp_path) -> None:
+    server, base = live_server
+    _stub_export_script(monkeypatch, tmp_path)
+
+    def _boom(_argv, *, timeout):
+        raise OSError("no such file")
+
+    _stub_package_command(monkeypatch, _boom)
+    status, _ = _post_form(base, "/section/detection/export", {"export_model": "yolov8n.onnx"})
+    assert status == 200
+    snapshot = _wait_for_install_terminal(server)
+    assert snapshot["state"] == "error"
+    assert "Failed to launch the export" in snapshot["message"]
+
+
+def test_export_handles_unexpected_worker_exception(live_server, monkeypatch, tmp_path) -> None:
+    server, base = live_server
+    _stub_export_script(monkeypatch, tmp_path)
+
+    def _boom(_argv, *, timeout):
+        raise RuntimeError("unexpected blow-up inside the worker")
+
+    _stub_package_command(monkeypatch, _boom)
+    status, _ = _post_form(base, "/section/detection/export", {"export_model": "yolov8n.onnx"})
+    assert status == 200
+    snapshot = _wait_for_install_terminal(server)
+    assert snapshot["state"] == "error"
+    assert "unexpected error" in snapshot["message"].lower()
+    assert server.try_claim_detection_install(action="export", extra="yolov8n.onnx") is True
+
+
+def test_export_releases_slot_when_worker_spawn_fails(live_server, monkeypatch, tmp_path) -> None:
+    """If ``Thread.start()`` raises, the export must publish a terminal error
+    and release the shared slot rather than wedge at ``running``."""
+    import types
+
+    from openfollow.web import routes as routes_mod
+
+    server, base = live_server
+    _stub_export_script(monkeypatch, tmp_path)
+
+    class _RaisingThread:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(routes_mod, "threading", types.SimpleNamespace(Thread=_RaisingThread))
+
+    status, body = _post_form(base, "/section/detection/export", {"export_model": "yolov8n.onnx"})
+    assert status == 200
+    assert "worker" in body.lower()
+    snapshot = server.get_detection_install_status()
+    assert snapshot["state"] == "error"
+    assert server.try_claim_detection_install(action="export", extra="yolov8n.onnx") is True
+
+
+def test_export_rejected_while_another_export_in_progress(live_server, monkeypatch, tmp_path) -> None:
+    server, base = live_server
+    _stub_export_script(monkeypatch, tmp_path)
+    # Occupy the shared slot so a second export can't claim it.
+    assert server.try_claim_detection_install(action="export", extra="yolo11n.onnx") is True
+    try:
+        status, body = _post_form(base, "/section/detection/export", {"export_model": "yolov8n.onnx"})
+        assert status == 200
+        assert "in progress" in body
+    finally:
+        server.set_detection_install_status(state="idle")
+
+
+def _seed_storage_model(monkeypatch, tmp_path, name: str = "yolo11n.onnx"):
+    """Create <tmp>/store/models/<name> and point load_config at that storage."""
+    from openfollow.web import routes as routes_mod
+
+    storage = tmp_path / "store"
+    (storage / "models").mkdir(parents=True)
+    model = storage / "models" / name
+    model.write_bytes(b"stub-onnx")
+    monkeypatch.setattr(routes_mod, "load_config", lambda _p: _config_with_storage(str(storage)))
+    return model
+
+
+def test_delete_model_removes_file_and_reports(live_server, monkeypatch, tmp_path) -> None:
+    _, base = live_server
+    model = _seed_storage_model(monkeypatch, tmp_path)
+
+    status, body = _post_form(base, "/section/detection/models/delete", {"model": "yolo11n.onnx"})
+    assert status == 200
+    assert "Deleted" in body and "yolo11n.onnx" in body
+    assert not model.exists()
+
+
+def test_delete_model_rejects_unknown_name(live_server, monkeypatch, tmp_path) -> None:
+    _, base = live_server
+    model = _seed_storage_model(monkeypatch, tmp_path)
+
+    status, body = _post_form(base, "/section/detection/models/delete", {"model": "ghost.onnx"})
+    assert status == 200
+    assert "Cannot delete unknown model" in body
+    assert model.exists()  # the real model is untouched
+
+
+def test_delete_model_rejects_path_traversal(live_server, monkeypatch, tmp_path) -> None:
+    _, base = live_server
+    # A file outside the models dir that a traversal would try to reach.
+    secret = tmp_path / "store" / "secret.txt"
+    _seed_storage_model(monkeypatch, tmp_path)
+    secret.write_text("keep me")
+
+    status, body = _post_form(base, "/section/detection/models/delete", {"model": "../secret.txt"})
+    assert status == 200
+    assert "Cannot delete unknown model" in body
+    assert secret.exists()  # traversal refused
+
+
+def test_delete_model_reports_unlink_failure(live_server, monkeypatch, tmp_path) -> None:
+    """A filesystem error during the actual delete surfaces as a banner, not a
+    500 – the model stays on disk."""
+    import pathlib
+
+    _, base = live_server
+    model = _seed_storage_model(monkeypatch, tmp_path)
+
+    def boom(self, *_a, **_kw):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(pathlib.Path, "unlink", boom)
+
+    status, body = _post_form(base, "/section/detection/models/delete", {"model": "yolo11n.onnx"})
+    assert status == 200
+    assert "Could not delete" in body and "yolo11n.onnx" in body
+    assert model.exists()  # the failed delete left the file in place
+
+
+def test_run_package_command_returns_rc_and_tail() -> None:
+    from openfollow.web.routes import _run_package_command
+
+    rc, tail = _run_package_command(
+        [sys.executable, "-c", "print('hello'); print('world')"],
+        timeout=10,
+    )
+    assert rc == 0
+    # Split because the helper joins with "\n"; both lines must survive.
+    lines = tail.splitlines()
+    assert "hello" in lines
+    assert "world" in lines
+
+
+def test_run_package_command_raises_on_timeout() -> None:
+    import subprocess as _real_subprocess
+
+    from openfollow.web.routes import _run_package_command
+
+    with pytest.raises(_real_subprocess.TimeoutExpired):
+        _run_package_command(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout=1,
+        )
+
+
+def test_run_package_command_does_not_hang_when_child_ignores_kill(monkeypatch) -> None:
+    import subprocess as _real_subprocess
+
+    from openfollow.web import routes as routes_mod
+
+    class _StubStdout:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __iter__(self):
+            # Yields nothing so the drainer thread exits immediately. The real
+            # wedge would block on read(); the code calls ``close()`` regardless.
+            return iter(())
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _StubProc:
+        def __init__(self) -> None:
+            self.stdout = _StubStdout()
+            self.kill_called = False
+            self._wait_calls = 0
+
+        def wait(self, timeout=None):
+            self._wait_calls += 1
+            raise _real_subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0)
+
+        def kill(self) -> None:
+            self.kill_called = True
+
+    stub = _StubProc()
+
+    def _fake_popen(argv, **kwargs):
+        return stub
+
+    monkeypatch.setattr(routes_mod.subprocess, "Popen", _fake_popen)
+
+    with pytest.raises(_real_subprocess.TimeoutExpired):
+        routes_mod._run_package_command(["fake"], timeout=1)
+
+    assert stub.kill_called is True
+    # stdout must be closed on the wedged-child path so the drainer thread
+    # can exit and the bounded join in ``finally`` returns.
+    assert stub.stdout.closed is True
+
+
+def test_run_package_command_truncates_to_bounded_tail(monkeypatch) -> None:
+    from openfollow.web import routes as routes_mod
+
+    monkeypatch.setattr(routes_mod, "_SUBPROCESS_TAIL_LINES", 5)
+
+    rc, tail = routes_mod._run_package_command(
+        [
+            sys.executable,
+            "-c",
+            "import sys\nfor i in range(200):\n    sys.stdout.write(f'line-{i}\\n')\n",
+        ],
+        timeout=10,
+    )
+    assert rc == 0
+    lines = tail.splitlines()
+    assert len(lines) == 5
+    # Last N lines are retained; earlier lines must be dropped.
+    assert lines[-1] == "line-199"
+    assert lines[0] == "line-195"
+
+
+# ---------------------------------------------------------------------------
+# Config export / import endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_api_config_export_returns_json_attachment(live_server) -> None:
+    """/api/config/export returns the full config as a JSON-bodied attachment
+    named ``<psn_system_name>.ofsettings`` (content-type stays JSON;
+    only the download extension is custom)."""
+    server, base = live_server
+    # The filename comes from the on-disk config's psn_system_name, not the
+    # ConfigWebServer constructor arg. Persist an explicit name so the test
+    # asserts on real behaviour rather than the AppConfig default.
+    cfg = load_config(server.config_path)
+    cfg.psn_system_name = "ExportedName"
+    save_config(cfg, server.config_path)
+
+    req = urllib.request.Request(f"{base}/api/config/export", method="GET")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type", "").startswith("application/json")
+        disposition = resp.headers.get("Content-Disposition", "")
+        assert "attachment" in disposition
+        # Full filename token, tightly pinned: the sanitised system name plus the extension.
+        assert 'filename="ExportedName.ofsettings"' in disposition
+        body = json.loads(resp.read().decode())
+    # Exported config must contain the top-level sections.
+    assert "camera" in body
+    assert "grid" in body
+
+
+def test_import_picker_accepts_both_settings_extensions(live_server) -> None:
+    """Stations exported ``.openfollowsettings`` before ``.ofsettings``; those files must keep importing."""
+    _, base = live_server
+    _, body = _get(base, "/")
+    assert 'id="config-import-file" accept=".ofsettings,.openfollowsettings"' in body
+
+
+def test_api_config_export_sanitises_unsafe_system_name(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(discovery_module.BeaconSender, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconSender, "stop", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "stop", lambda self: None)
+
+    config_path = tmp_path / "config.toml"
+
+    # Write config with a risky system name.
+    cfg = AppConfig()
+    cfg.psn_system_name = "Name with / and ; chars"
+    save_config(cfg, str(config_path))
+
+    with live_on_free_port(
+        lambda port: ConfigWebServer(
+            config_path=str(config_path),
+            host="127.0.0.1",
+            port=port,
+            system_name=cfg.psn_system_name,
+        )
+    ) as (_server, base):
+        with urllib.request.urlopen(f"{base}/api/config/export", timeout=5) as resp:
+            disposition = resp.headers.get("Content-Disposition", "")
+            resp.read()
+
+        # Forward slash and semicolon must be replaced with '-'.
+        assert "/" not in disposition.split('filename="', 1)[1].split('"')[0]
+        assert ";" not in disposition.split('filename="', 1)[1].split('"')[0]
+
+
+def test_api_config_import_rejects_non_object_json(live_server) -> None:
+    _, base = live_server
+    status, body = _post_raw_json(
+        base,
+        "/api/config/import",
+        ["not", "a", "dict"],
+    )
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_config_import_rejects_null_body(live_server) -> None:
+    _, base = live_server
+    status, body = _post_raw_json(base, "/api/config/import", None)
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_config_import_rejects_malformed_json(live_server) -> None:
+    _, base = live_server
+    req = urllib.request.Request(
+        f"{base}/api/config/import",
+        data=b"{not valid",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+
+
+def test_api_config_import_saves_changes_immediately(live_server) -> None:
+    server, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/config/import",
+        {"camera": {"pos_x": 7.25}, "psn_system_name": "Imported"},
+    )
+    assert status == 200
+    assert body.get("success") is True
+
+    saved = load_config(server.config_path)
+    assert saved.camera.pos_x == pytest.approx(7.25)
+    assert saved.psn_system_name == "Imported"
+
+
+def test_api_config_import_detection_off_to_on_saves_live(
+    live_server,
+) -> None:
+    server, base = live_server
+    before = load_config(server.config_path)
+    original_detection = before.detection.enabled
+
+    status, body = _post_json(
+        base,
+        "/api/config/import",
+        {"detection": {"enabled": not original_detection}},
+    )
+    assert status == 200
+    assert body.get("success") is True
+
+    saved = load_config(server.config_path)
+    assert saved.detection.enabled == (not original_detection)
+
+
+def test_api_config_import_otp_change_saves_live(
+    live_server,
+) -> None:
+    server, base = live_server
+    before = load_config(server.config_path)
+    original_enabled = before.otp_output.enabled
+
+    status, body = _post_json(
+        base,
+        "/api/config/import",
+        {"otp_output": {"enabled": not original_enabled, "priority": 42}},
+    )
+    assert status == 200
+    assert body.get("success") is True
+
+    saved = load_config(server.config_path)
+    assert saved.otp_output.enabled == (not original_enabled)
+    assert saved.otp_output.priority == 42
+
+
+def test_api_config_import_applies_a_push_from_an_older_station(live_server) -> None:
+    """Stations on 0.5.0-rc1 and earlier push Broadcast All to ``?skip_restart=1``."""
+    server, base = live_server
+    before = load_config(server.config_path)
+
+    status, body = _post_json(
+        base,
+        "/api/config/import?skip_restart=1",
+        {
+            "detection": {"enabled": not before.detection.enabled},
+            "camera": {"pos_x": 99.0},
+        },
+    )
+    assert status == 200
+    assert body.get("success") is True
+
+    saved = load_config(server.config_path)
+    assert saved.detection.enabled == (not before.detection.enabled)
+    assert saved.camera.pos_x == pytest.approx(99.0)
+
+
+def _archived_config(server: ConfigWebServer, archive: str) -> dict[str, Any]:
+    """The ``config.toml`` inside one of the web UI's settings backups."""
+    path = Path(server.config_path).parent / "backups" / "web" / archive
+    with tarfile.open(path, "r:gz") as tar:
+        member = tar.extractfile("config.toml")
+        assert member is not None
+        return tomllib.loads(member.read().decode())
+
+
+def _block_backups(server: ConfigWebServer) -> None:
+    """A file where the backups folder goes, so no backup can be written."""
+    (Path(server.config_path).parent / "backups").write_text("not a folder")
+
+
+def test_api_config_import_backs_up_the_settings_it_replaces(live_server) -> None:
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.camera.pos_x = 1.5
+    save_config(cfg, server.config_path)
+
+    status, body = _post_json(base, "/api/config/import", {"camera": {"pos_x": 7.25}})
+    assert status == 200
+    assert body.get("success") is True
+    assert "-import-" in body["backup"]
+    assert "backup_error" not in body
+    assert _archived_config(server, body["backup"])["camera"]["pos_x"] == pytest.approx(1.5)
+    assert load_config(server.config_path).camera.pos_x == pytest.approx(7.25)
+
+
+@pytest.mark.parametrize("path", ["/api/config/import", "/api/config/reset"])
+def test_the_backup_does_not_wait_for_the_write_lock(live_server, path: str) -> None:
+    """The main loop takes the lock too, so a slow archive must not be written under it."""
+    import threading
+
+    from openfollow.configuration import config_write_lock
+
+    server, base = live_server
+    web = Path(server.config_path).parent / "backups" / "web"
+    answers: list[tuple[int, dict]] = []
+    with config_write_lock:
+        sender = threading.Thread(target=lambda: answers.append(_post_json(base, path, {})))
+        sender.start()
+        deadline = time.monotonic() + 5
+        while not (web.is_dir() and any(web.iterdir())) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert web.is_dir() and any(web.iterdir())
+        assert answers == []
+    sender.join(5)
+    assert answers[0][0] == 200
+
+
+def test_api_config_import_goes_ahead_when_no_backup_can_be_made(live_server) -> None:
+    server, base = live_server
+    _block_backups(server)
+
+    status, body = _post_json(base, "/api/config/import", {"camera": {"pos_x": 7.25}})
+    assert status == 200
+    assert body.get("success") is True
+    assert body["backup_error"]
+    assert "backup" not in body
+    assert load_config(server.config_path).camera.pos_x == pytest.approx(7.25)
+
+
+# ---------------------------------------------------------------------------
+# Settings another station pushed here
+# ---------------------------------------------------------------------------
+
+
+def _push(base: str, path: str, data: dict, sender: str = "Stage Left") -> tuple[int, dict]:
+    return _post_json(base, f"{path}?from={urllib.parse.quote(sender, safe='')}", data)
+
+
+def _pushes(server: ConfigWebServer) -> list[tuple[str, str, str, str]]:
+    return [(p.station, p.address, p.what, p.backup_error) for p in server.pushed_settings.snapshot()[0]]
+
+
+def test_a_pushed_import_is_recorded_and_backed_up_as_a_push(live_server) -> None:
+    server, base = live_server
+    status, body = _push(base, "/api/config/import", {"camera": {"pos_x": 7.25}})
+    assert status == 200
+    assert "-push-" in body["backup"]
+    assert _pushes(server) == [("Stage Left", "127.0.0.1", "every shared setting", "")]
+    assert load_config(server.config_path).camera.pos_x == pytest.approx(7.25)
+
+
+def test_a_push_names_the_address_it_came_from_not_a_forwarded_one(live_server) -> None:
+    server, base = live_server
+    req = urllib.request.Request(
+        f"{base}/api/config/grid?from=Stage%20Left",
+        data=json.dumps({"width": 12.0}).encode(),
+        headers={"Content-Type": "application/json", "X-Forwarded-For": "203.0.113.9"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+    assert _pushes(server)[0][1] == "127.0.0.1"
+
+
+@pytest.mark.parametrize("path", ["/api/config/grid", "/api/config/no_such_section"])
+def test_a_pushed_section_backup_does_not_wait_for_the_write_lock(live_server, path: str) -> None:
+    """A known section is archived before the lock; an unknown one is refused before any archive."""
+    import threading
+
+    from openfollow.configuration import config_write_lock
+
+    server, base = live_server
+    web = Path(server.config_path).parent / "backups" / "web"
+    answers: list[tuple[int, dict]] = []
+    known = path.endswith("grid")
+    with config_write_lock:
+        sender = threading.Thread(target=lambda: answers.append(_push(base, path, {"width": 12.0})))
+        sender.start()
+        if known:
+            deadline = time.monotonic() + 5
+            while not (web.is_dir() and any(web.iterdir())) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert web.is_dir() and any(web.iterdir())
+        else:
+            sender.join(5)
+            assert answers and answers[0][0] == 404
+            assert not web.exists()
+    sender.join(5)
+    assert answers[0][0] == (200 if known else 404)
+
+
+def test_an_import_from_this_page_is_no_push(live_server) -> None:
+    server, base = live_server
+    status, body = _post_json(base, "/api/config/import", {"camera": {"pos_x": 7.25}})
+    assert status == 200
+    assert "-import-" in body["backup"]
+    assert _pushes(server) == []
+
+
+def test_a_pushed_section_is_recorded_and_backed_up_as_a_push(live_server) -> None:
+    server, base = live_server
+    status, body = _push(base, "/api/config/grid", {"width": 12.0})
+    assert status == 200
+    assert "-push-" in body["backup"]
+    assert _pushes(server) == [("Stage Left", "127.0.0.1", "Grid", "")]
+    assert load_config(server.config_path).grid.width == pytest.approx(12.0)
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/config/import", {"psn_system_name": "Stage Left", "camera": {"pos_x": 7.25}}),
+        ("/api/config/psn", {"psn_system_name": "Stage Left", "psn_mcast_ip": "236.10.10.11"}),
+    ],
+)
+def test_a_push_never_renames_the_station_it_lands_on(live_server, path: str, payload: dict) -> None:
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_system_name = "Front of House"
+    save_config(cfg, server.config_path)
+
+    status, _body = _push(base, path, payload)
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.psn_system_name == "Front of House"
+    # The rest of the push still applies.
+    assert (saved.camera.pos_x, saved.psn_mcast_ip) != (AppConfig().camera.pos_x, AppConfig().psn_mcast_ip)
+
+
+def test_a_push_from_an_older_station_is_recorded_unnamed_and_keeps_the_name(live_server) -> None:
+    """Stations on 0.5.0-rc1 and earlier push every setting to ``?skip_restart=1``, their name included."""
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_system_name = "Front of House"
+    save_config(cfg, server.config_path)
+
+    status, body = _post_json(
+        base, "/api/config/import?skip_restart=1", {"psn_system_name": "Stage Left", "camera": {"pos_x": 7.25}}
+    )
+    assert status == 200
+    assert "-push-" in body["backup"]
+    assert _pushes(server) == [("", "127.0.0.1", "every shared setting", "")]
+    saved = load_config(server.config_path)
+    assert saved.psn_system_name == "Front of House"
+    assert saved.camera.pos_x == pytest.approx(7.25)
+
+
+@pytest.mark.parametrize(
+    ("section", "label"),
+    [
+        ("osc", "OSC"),
+        ("otp_output", "OTP output"),
+        ("rttrpm_output", "RTTrPM output"),
+        ("psn", "PSN"),
+        ("mouse3d", "3D mouse"),
+        ("video_source", "Video source"),
+    ],
+)
+def test_a_pushed_section_is_named_as_the_operator_knows_it(live_server, section: str, label: str) -> None:
+    server, base = live_server
+    status, _body = _push(base, f"/api/config/{section}", {"unused": 1})
+    assert status == 200
+    assert _pushes(server)[0][2] == label
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/config/interface_assignment", {"psn": "eth0"}),
+        ("/api/config/psn", {"psn_system_name": "Stage Left"}),
+    ],
+)
+def test_a_push_carrying_nothing_this_station_shares_is_no_push(live_server, path: str, payload: dict) -> None:
+    # A device-local section, or a station name alone, is stripped to nothing.
+    server, base = live_server
+    status, body = _push(base, path, payload)
+    assert status == 200
+    assert "backup" not in body
+    assert _pushes(server) == []
+    assert not (Path(server.config_path).parent / "backups").exists()
+
+
+def test_a_section_write_that_is_no_push_records_and_backs_up_nothing(live_server) -> None:
+    server, base = live_server
+    status, body = _post_json(base, "/api/config/camera", {"pos_x": 2.0})
+    assert status == 200
+    assert body == {"success": True}
+    assert _pushes(server) == []
+    assert not (Path(server.config_path).parent / "backups").exists()
+
+
+def test_a_push_to_an_unknown_section_records_nothing(live_server) -> None:
+    server, base = live_server
+    status, _body = _push(base, "/api/config/no_such_section", {"x": 1})
+    assert status == 404
+    assert _pushes(server) == []
+
+
+def test_a_push_whose_backup_failed_carries_the_reason(live_server) -> None:
+    server, base = live_server
+    _block_backups(server)
+    status, body = _push(base, "/api/config/import", {"camera": {"pos_x": 7.25}})
+    assert status == 200
+    assert _pushes(server)[0][3] == body["backup_error"] != ""
+
+
+@pytest.mark.parametrize(
+    ("sent", "shown"),
+    [
+        ("Bühne Links", "Bühne Links"),
+        ("Stage\nLeft\x1b[31m", "StageLeft[31m"),
+        ("x" * 200, "x" * 128),
+        ("  ", ""),
+    ],
+)
+def test_the_pushing_station_name_is_cleaned(live_server, sent: str, shown: str) -> None:
+    server, base = live_server
+    status, _body = _push(base, "/api/config/import", {}, sender=sent)
+    assert status == 200
+    assert _pushes(server)[0][0] == shown
+
+
+@pytest.mark.parametrize("sender", ["send_config_import", "send_config_section"])
+def test_a_signed_push_from_the_real_sender_is_verified_and_recorded(pin_protected_server, sender: str) -> None:
+    from openfollow.web import routes as routes_mod
+
+    server, base, _pin = pin_protected_server
+    port = int(base.rsplit(":", 1)[1])
+    if sender == "send_config_import":
+        ok = routes_mod._send_config_import_to_peer(
+            "127.0.0.1", port, {"camera": {"pos_x": 3.0}}, pin="sekret", expected_port=port, sender="Bühne Links"
+        )
+        what = "every shared setting"
+    else:
+        ok = routes_mod._send_config_to_peer(
+            "127.0.0.1", port, "grid", {"width": 9.0}, pin="sekret", expected_port=port, sender="Bühne Links"
+        )
+        what = "Grid"
+    assert ok is True
+    assert _pushes(server) == [("Bühne Links", "127.0.0.1", what, "")]
+
+
+def test_a_push_signed_with_the_wrong_pin_is_refused_and_not_recorded(pin_protected_server) -> None:
+    from openfollow.web import routes as routes_mod
+
+    server, base, _pin = pin_protected_server
+    port = int(base.rsplit(":", 1)[1])
+    ok = routes_mod._send_config_import_to_peer("127.0.0.1", port, {}, pin="wrong", expected_port=port, sender="X")
+    assert ok is False
+    assert _pushes(server) == []
+
+
+def test_the_pushed_settings_api_lists_newest_first(live_server) -> None:
+    server, base = live_server
+    server.pushed_settings.record("A", "198.51.100.1", "Grid")
+    second = server.pushed_settings.record("B", "198.51.100.2", "every setting", "No space left on device")
+    status, body = _get_json(base, "/api/pushed-settings")
+    assert status == 200
+    assert body["earlier"] == 0
+    newest = body["pushes"][0]
+    assert re.fullmatch(r"\d\d:\d\d", newest.pop("time"))
+    assert newest == {
+        "id": second.id,
+        "station": "B",
+        "address": "198.51.100.2",
+        "what": "every setting",
+        "backup_error": "No space left on device",
+    }
+    assert [p["station"] for p in body["pushes"]] == ["B", "A"]
+    assert body["run"] == server.pushed_settings.run
+    assert body["received"] == 2
+
+
+def test_removing_the_warning_keeps_a_push_that_arrived_since(live_server) -> None:
+    server, base = live_server
+    server.pushed_settings.record("A", "198.51.100.1", "Grid")
+    seen = server.pushed_settings.record("B", "198.51.100.2", "Grid")
+    server.pushed_settings.record("C", "198.51.100.3", "Camera")
+    status, body = _post_json(base, "/api/pushed-settings/remove", {"upto": seen.id, "run": server.pushed_settings.run})
+    assert (status, body) == (200, {"success": True})
+    assert [p[0] for p in _pushes(server)] == ["C"]
+
+
+@pytest.mark.parametrize("payload", [{"upto": 5, "run": "an-earlier-run"}, {"upto": 5}])
+def test_a_removal_read_from_another_run_is_refused(live_server, payload) -> None:
+    # Ids start at 1 on every run: an id from before a restart names a push the page never showed.
+    server, base = live_server
+    server.pushed_settings.record("A", "198.51.100.1", "Grid")
+    status, body = _post_json(base, "/api/pushed-settings/remove", payload)
+    assert status == 409
+    assert body["error"]
+    assert [p[0] for p in _pushes(server)] == ["A"]
+
+
+@pytest.mark.parametrize("payload", [{}, {"upto": "3"}, {"upto": True}, {"upto": None}, [1]])
+def test_removing_the_warning_needs_a_push_id(live_server, payload) -> None:
+    server, base = live_server
+    server.pushed_settings.record("A", "198.51.100.1", "Grid")
+    status, body = _post_json(base, "/api/pushed-settings/remove", payload)
+    assert status == 400
+    assert body["error"]
+    assert [p[0] for p in _pushes(server)] == ["A"]
+
+
+# ---------------------------------------------------------------------------
+# Restore defaults
+# ---------------------------------------------------------------------------
+
+
+def test_api_config_reset_restores_defaults_and_keeps_device_fields(live_server) -> None:
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.camera.pos_x = 9.5
+    cfg.grid.width = 42.0
+    cfg.controlled_marker_ids = [1, 2]
+    cfg.psn_system_name = "Front of House"
+    # Device-local: must survive so the operator keeps the station on the air.
+    cfg.web_port = 8123
+    cfg.psn_source_iface = "eth0"
+    cfg.detection.storage_path = "/mnt/nvme/openfollow/yolo"
+    save_config(cfg, server.config_path)
+
+    status, body = _post_json(base, "/api/config/reset", {})
+    assert status == 200
+    assert body.get("success") is True
+    # A reset also touches fields the hot-reload dispatcher never applies, so
+    # it only completes across a restart.
+    assert body.get("needs_restart") is True
+    assert body.get("restarting") is True
+    assert server.check_restart_requested() is True
+
+    defaults = AppConfig()
+    saved = load_config(server.config_path)
+    assert saved.camera.pos_x == pytest.approx(defaults.camera.pos_x)
+    assert saved.grid.width == pytest.approx(defaults.grid.width)
+    assert saved.controlled_marker_ids == []
+    assert saved.psn_system_name != "Front of House"
+    assert saved.web_port == 8123
+    assert saved.psn_source_iface == "eth0"
+    assert saved.detection.storage_path == "/mnt/nvme/openfollow/yolo"
+
+
+def test_api_config_reset_backs_up_the_settings_it_replaces(live_server) -> None:
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.grid.width = 42.0
+    save_config(cfg, server.config_path)
+
+    status, body = _post_json(base, "/api/config/reset", {})
+    assert status == 200
+    assert body.get("success") is True
+    assert "-defaults-" in body["backup"]
+    assert _archived_config(server, body["backup"])["grid"]["width"] == pytest.approx(42.0)
+    assert load_config(server.config_path).grid.width == pytest.approx(AppConfig().grid.width)
+
+
+def test_api_config_reset_goes_ahead_when_no_backup_can_be_made(live_server) -> None:
+    server, base = live_server
+    _block_backups(server)
+
+    status, body = _post_json(base, "/api/config/reset", {})
+    assert status == 200
+    assert body.get("success") is True
+    assert body["backup_error"]
+    assert server.check_restart_requested() is True
+
+
+def test_api_config_reset_keeps_the_web_pin_authenticating(pin_protected_server) -> None:
+    """A reset that cleared the PIN would lock the operator out of the only
+    interface an offline show LAN has."""
+    server, base, pin = pin_protected_server
+
+    assert _signed_post(base, "/api/config/reset", b"", pin) == 200
+
+    assert load_config(server.config_path).web_pin == pin
+    assert _post_json_status(base, "/api/config/camera", {"pos_x": 1.0}) == 401
+
+
+def test_api_config_reset_refuses_a_cross_origin_form_post(live_server) -> None:
+    """A reset is bodyless, so without an origin check a plain auto-submitting
+    form on an attacker page would wipe an unprotected station - no preflight
+    and no read of the response needed. This server has no PIN set."""
+    server, base = live_server
+    before = load_config(server.config_path)
+    before.camera.pos_x = 7.5
+    save_config(before, server.config_path)
+
+    req = urllib.request.Request(
+        f"{base}/api/config/reset",
+        data=b"",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "http://attacker.example",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+
+    assert status == 403
+    # Nothing was written, so the station is untouched.
+    assert load_config(server.config_path).camera.pos_x == pytest.approx(7.5)
+    assert server.check_restart_requested() is False
+
+
+# ---------------------------------------------------------------------------
+# Wizard endpoints – error-path coverage
+# ---------------------------------------------------------------------------
+
+
+def _wizard_camera_payload(**overrides) -> dict[str, object]:
+    base = {
+        "pos_x": 0.0,
+        "pos_y": -5.0,
+        "pos_z": 3.0,
+        "pitch": 10.0,
+        "yaw": 0.0,
+        "roll": 0.0,
+        "fov": 45.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_api_wizard_project_happy_path(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/project",
+        {
+            "camera": _wizard_camera_payload(),
+            "grid": {"width": 10.0, "depth": 8.0},
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 200
+    assert "corners" in body
+    for key in ("DSL", "DSR", "USR", "USL"):
+        assert key in body["corners"]
+    # With z_offset=0 there should not be an elevated reference point.
+    assert "reference_elevated" not in body
+    assert "reference" in body
+
+
+def test_api_wizard_project_includes_elevated_ref_when_z_offset(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/project",
+        {
+            "camera": _wizard_camera_payload(),
+            "grid": {"width": 10.0, "depth": 8.0, "z_offset": 1.5},
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 200
+    assert "reference_elevated" in body
+    assert body.get("z_offset") == pytest.approx(1.5)
+
+
+def test_api_wizard_project_rejects_non_dict_camera(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/project",
+        {
+            "camera": [1, 2, 3],  # not a dict
+            "grid": {"width": 10.0, "depth": 8.0},
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_wizard_project_rejects_missing_camera_fields(live_server) -> None:
+    _, base = live_server
+    cam = _wizard_camera_payload()
+    cam.pop("fov")  # omit a required field
+
+    status, body = _post_json(
+        base,
+        "/api/wizard/project",
+        {
+            "camera": cam,
+            "grid": {"width": 10.0, "depth": 8.0},
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_wizard_project_rejects_malformed_json(live_server) -> None:
+    _, base = live_server
+    req = urllib.request.Request(
+        f"{base}/api/wizard/project",
+        data=b"{not json",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+
+
+def test_api_wizard_unproject_rejects_empty_screen_points(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/unproject",
+        {
+            "camera": _wizard_camera_payload(),
+            "screen_points": [],  # empty list -> 400
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "non-empty" in str(body.get("error", ""))
+
+
+def test_api_wizard_unproject_rejects_non_list_screen_points(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/unproject",
+        {
+            "camera": _wizard_camera_payload(),
+            "screen_points": "not a list",
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_wizard_unproject_rejects_wrong_point_shape(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/unproject",
+        {
+            "camera": _wizard_camera_payload(),
+            "screen_points": [[1.0, 2.0, 3.0]],  # 3-tuple instead of [x, y]
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "[x, y]" in str(body.get("error", ""))
+
+
+def test_api_wizard_unproject_rejects_non_numeric_coord(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/unproject",
+        {
+            "camera": _wizard_camera_payload(),
+            "screen_points": [["a", "b"]],
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_wizard_unproject_returns_delta_for_two_points(live_server) -> None:
+    _, base = live_server
+    # Camera looking down (pitch=-30) from 5 m high – both screen points
+    # project onto the ground plane, so the endpoint produces a real delta.
+    # The default _wizard_camera_payload() pitches up and would yield NaN.
+    status, body = _post_json(
+        base,
+        "/api/wizard/unproject",
+        {
+            "camera": _wizard_camera_payload(pos_z=5.0, pitch=-30.0),
+            "screen_points": [[960.0, 540.0], [1000.0, 540.0]],
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 200
+    assert "world_points" in body
+    # Two points must produce a delta payload (x/y distances).
+    assert "delta" in body
+    assert "x" in body["delta"] and "y" in body["delta"]
+
+
+def test_api_wizard_solve_rejects_wrong_corner_counts(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/solve",
+        {
+            "world_corners": [[0, 0, 0]],  # only 1, expected 4
+            "screen_corners": [[0, 0], [1, 0], [1, 1], [0, 1]],
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "exactly 4" in str(body.get("error", ""))
+
+
+def test_api_wizard_solve_rejects_non_list_screen_corners(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/solve",
+        {
+            "world_corners": [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
+            "screen_corners": "not a list",
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_wizard_solve_rejects_malformed_world_corner(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/solve",
+        {
+            "world_corners": [[0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],  # missing z on first
+            "screen_corners": [[0, 0], [1, 0], [1, 1], [0, 1]],
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "[x, y, z]" in str(body.get("error", ""))
+
+
+def test_api_wizard_solve_rejects_non_numeric_screen_coord(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/solve",
+        {
+            "world_corners": [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
+            "screen_corners": [[0, 0], [1, 0], [1, 1], [0, "not-a-number"]],
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "error" in body
+
+
+# ---------------------------------------------------------------------------
+# Auth hook: HX-Redirect for browser htmx requests, body-size cap, cookie
+# ---------------------------------------------------------------------------
+
+
+def test_auth_hx_request_returns_hx_redirect_header(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    req = urllib.request.Request(
+        f"{base}/section/camera",
+        headers={"HX-Request": "true"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+            hx_redirect = r.headers.get("HX-Redirect", "")
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        status = e.code
+        hx_redirect = e.headers.get("HX-Redirect", "")
+        body = e.read()
+
+    # Empty body with HX-Redirect set to /login.
+    assert status == 200 or status == 204
+    assert hx_redirect == "/login"
+    assert body in (b"", b"{}")
+
+
+def test_auth_non_htmx_browser_redirects_to_login(pin_protected_server) -> None:
+    """Plain GET without cookie or signature must 302 → /login for browser UX."""
+    _, base, _ = pin_protected_server
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **kw):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(f"{base}/", method="GET")
+    try:
+        resp = opener.open(req, timeout=5)
+        location = resp.headers.get("Location", "")
+        status = resp.status
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location", "")
+        status = e.code
+
+    assert status in (302, 303)
+    assert "/login" in location
+
+
+def test_auth_api_path_returns_401_not_redirect(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    req = urllib.request.Request(f"{base}/api/config", method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 401
+
+
+def test_auth_assets_path_bypasses_auth(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    # Any asset path – the route serves static files; we just need to see
+    # auth doesn't 401/redirect before the route runs. 404 is acceptable
+    # because the requested asset may not exist; 401/302 is NOT.
+    req = urllib.request.Request(
+        f"{base}/assets/does-not-exist.css",
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status not in (401, 302, 303)
+
+
+@pytest.mark.parametrize("path", ["/section/statistics", "/section/statistics/alerts"])
+def test_auth_statistics_needs_the_pin(pin_protected_server, path: str) -> None:
+    """Station state (video source, errors, controller names) is not shown before login."""
+    _, base, _ = pin_protected_server
+    req = urllib.request.Request(f"{base}{path}", headers={"HX-Request": "true"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            hx_redirect = r.headers.get("HX-Redirect", "")
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        hx_redirect = e.headers.get("HX-Redirect", "")
+        body = e.read()
+    assert hx_redirect == "/login"
+    assert b'class="stat-panel"' not in body
+
+
+def test_auth_signed_request_over_declared_content_length_is_rejected(
+    pin_protected_server,
+    monkeypatch,
+) -> None:
+    """Body size cap must be enforced – oversize declarations are rejected."""
+    _, base, pin = pin_protected_server
+    # Shrink the cap to something we can exceed with a small payload.
+    monkeypatch.setattr(peer_auth, "MAX_SIGNED_BODY_SIZE", 16)
+
+    body = json.dumps({"pos_x": 2.5, "field": "x" * 32}).encode("utf-8")
+    assert len(body) > 16
+    timestamp, signature = peer_auth.sign(pin, "POST", "/api/config/camera", body)
+    req = urllib.request.Request(
+        f"{base}/api/config/camera",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            peer_auth.TIMESTAMP_HEADER: str(timestamp),
+            peer_auth.SIGNATURE_HEADER: signature,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 413
+
+
+def test_auth_cookie_authenticates_subsequent_requests(pin_protected_server) -> None:
+    _, base, pin = pin_protected_server
+    req = urllib.request.Request(
+        f"{base}/login",
+        data=urllib.parse.urlencode({"pin": pin}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_a, **_kw):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        resp = opener.open(req, timeout=5)
+        set_cookies = resp.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as e:
+        set_cookies = e.headers.get_all("Set-Cookie") or []
+
+    auth_cookie = next(
+        (c for c in set_cookies if c.startswith("_openfollow_auth=")),
+        None,
+    )
+    assert auth_cookie is not None
+    cookie_value = auth_cookie.split(";", 1)[0]  # e.g., _openfollow_auth=<encoded>
+
+    # Reuse the cookie on a protected GET.
+    req2 = urllib.request.Request(
+        f"{base}/api/config",
+        headers={"Cookie": cookie_value},
+        method="GET",
+    )
+    with urllib.request.urlopen(req2, timeout=5) as r:
+        assert r.status == 200
+        json.loads(r.read().decode())  # valid JSON body
+
+
+def test_auth_invalid_signature_fails_closed(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    body = b'{"pos_x": 2.5}'
+    # Valid-looking timestamp with a bogus signature.
+    req = urllib.request.Request(
+        f"{base}/api/config/camera",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            peer_auth.TIMESTAMP_HEADER: str(int(time.time())),
+            peer_auth.SIGNATURE_HEADER: "00" * 32,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 401
+
+
+def test_post_general_ignores_removed_git_pull_fields(live_server, monkeypatch) -> None:
+    """A crafted POST /section/general carrying the removed git-pull fields
+    must be accepted without error and persist none of them – only the
+    surviving .deb fields are honoured."""
+    from openfollow.video import inputs as inputs_module
+
+    monkeypatch.setattr(inputs_module, "get_available_input_ids", lambda: ["rtsp", "srt"])
+    monkeypatch.setattr(inputs_module, "get_input_class", lambda _id: None)
+
+    server, base = live_server
+    cfg = load_config(server.config_path)
+
+    status, _body = _post_form(
+        base,
+        "/section/general",
+        {
+            "psn_system_name": cfg.psn_system_name,
+            "psn_mcast_ip": cfg.psn_mcast_ip,
+            "web_port": str(cfg.web_port),
+            "update_source_url": "git@evil.example.com:bad.git",
+            "update_repo_branch": "attacker",
+            "update_allowed_hosts": "evil.example.com",
+            "update_service_name": "openfollow",
+        },
+    )
+    assert status == 200
+
+    after = load_config(server.config_path)
+    assert not hasattr(after, "update_source_url")
+    assert not hasattr(after, "update_repo_branch")
+    assert not hasattr(after, "update_allowed_hosts")
+
+
+def test_post_general_updates_github_repo_only_when_valid(live_server, monkeypatch) -> None:
+    """POST /section/general with ``update_github_repo`` persists a valid
+    ``owner/repo`` slug but ignores a malformed one (keeping the existing
+    value), exercising both arms of the ``_is_valid_github_repo`` guard."""
+    from openfollow.video import inputs as inputs_module
+
+    monkeypatch.setattr(inputs_module, "get_available_input_ids", lambda: ["rtsp"])
+    monkeypatch.setattr(inputs_module, "get_input_class", lambda _id: None)
+
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.update_github_repo = "owner/old-repo"
+    save_config(cfg, server.config_path)
+
+    base_form = {
+        "psn_system_name": cfg.psn_system_name,
+        "psn_mcast_ip": cfg.psn_mcast_ip,
+        "web_port": str(cfg.web_port),
+    }
+
+    # A valid slug replaces the stored value.
+    status, _ = _post_form(base, "/section/general", {**base_form, "update_github_repo": "owner/new-repo"})
+    assert status == 200
+    assert load_config(server.config_path).update_github_repo == "owner/new-repo"
+
+    # A malformed slug is rejected and the previous value is kept.
+    status, _ = _post_form(base, "/section/general", {**base_form, "update_github_repo": "not a repo!"})
+    assert status == 200
+    assert load_config(server.config_path).update_github_repo == "owner/new-repo"
+
+
+# ---------------------------------------------------------------------------
+# Section / general / login / update lifecycle handlers
+# ---------------------------------------------------------------------------
+
+
+def test_login_page_redirects_when_no_pin_configured(live_server) -> None:
+    _, base = live_server
+
+    opener = _no_redirect_opener()
+    try:
+        with opener.open(f"{base}/login", timeout=5) as resp:
+            status = resp.status
+            location = resp.headers.get("Location", "")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        location = e.headers.get("Location", "")
+
+    assert status in (302, 303)
+    assert location.endswith("/")
+
+
+def test_login_submit_redirects_when_no_pin_configured(live_server) -> None:
+    _, base = live_server
+
+    opener = _no_redirect_opener()
+    req = urllib.request.Request(
+        f"{base}/login",
+        data=urllib.parse.urlencode({"pin": "anything"}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with opener.open(req, timeout=5) as resp:
+            status = resp.status
+            location = resp.headers.get("Location", "")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        location = e.headers.get("Location", "")
+
+    assert status in (302, 303)
+    assert location.endswith("/")
+
+
+def test_login_submit_renders_error_template_on_invalid_pin(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+
+    status, body = _post_form(base, "/login", {"pin": "definitely-wrong"})
+
+    assert status == 200
+    # The template renders *something* indicating the PIN was rejected.
+    # The exact wording is in the bundled template, not the route, so
+    # asserting "incorrect"/"invalid" would couple to copy. Asserting the
+    # form is re-rendered (still has the pin input) covers the branch.
+    assert 'name="pin"' in body or "PIN" in body
+    assert '<div class="notice error" role="alert">' in body
+
+
+def test_repeated_wrong_pin_locks_out_with_retry_after(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+
+    status1, _, _ = _post_form_full(base, "/login", {"pin": "wrong-1"})
+    assert status1 == 200  # first failure renders template, no penalty yet
+
+    status2, _, headers2 = _post_form_full(base, "/login", {"pin": "wrong-2"})
+    assert status2 == 429
+    # ``Retry-After`` is part of the 429 contract – without it a polite
+    # client can't tell when to come back, defeating the UX rationale
+    # for a graceful lockout vs a hard ban.
+    assert "Retry-After" in headers2
+    assert int(headers2["Retry-After"]) >= 1
+
+
+def test_lockout_blocks_correct_pin_during_window(pin_protected_server) -> None:
+    """Even the correct PIN is rejected with 429 while the IP is locked
+    out. Otherwise an attacker could probe whether their *guess* matches
+    by timing the response – a 200 vs 429 split would leak whether they
+    happened to guess right just before being locked out."""
+    _, base, pin = pin_protected_server
+
+    _post_form_full(base, "/login", {"pin": "wrong-1"})
+    status, _, _ = _post_form_full(base, "/login", {"pin": pin})
+
+    assert status == 429
+
+
+def test_successful_login_clears_lockout_counter(pin_protected_server) -> None:
+    _, base, pin = pin_protected_server
+
+    # Fail once, wait out the 1 s lockout, then succeed. The success is
+    # a 303 to ``/`` which urllib would auto-follow into a 200 from the
+    # protected index – so use a non-following opener to observe the
+    # actual login response.
+    _post_form_full(base, "/login", {"pin": "wrong"})
+    time.sleep(1.1)
+    opener = _no_redirect_opener()
+    req = urllib.request.Request(
+        f"{base}/login",
+        data=urllib.parse.urlencode({"pin": pin}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with opener.open(req, timeout=5) as r:
+            status_ok = r.status
+    except urllib.error.HTTPError as e:
+        status_ok = e.code
+    assert status_ok in (302, 303)
+
+    # Fresh sequence: first failure renders template (counter = 1).
+    status1, _, _ = _post_form_full(base, "/login", {"pin": "wrong-again"})
+    assert status1 == 200
+    # Second failure is the one that triggers 429 – same as the first
+    # test. If the success had failed to clear history, we'd be deep in
+    # the curve and the second wrong attempt would lock for >1 s.
+    _, _, headers2 = _post_form_full(base, "/login", {"pin": "wrong-again-2"})
+    assert int(headers2["Retry-After"]) <= 2
+
+
+def _signed_post_full(
+    base: str,
+    path: str,
+    body_bytes: bytes,
+    *,
+    signature: str,
+    timestamp: str,
+) -> tuple[int, dict]:
+    """Send a signed POST with a caller-supplied signature/timestamp pair.
+
+    Lets tests forge invalid signatures to exercise the throttle's
+    peer-auth-failure path without the cooperation of ``peer_auth.sign``.
+    """
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=body_bytes,
+        headers={
+            "Content-Type": "application/json",
+            peer_auth.TIMESTAMP_HEADER: timestamp,
+            peer_auth.SIGNATURE_HEADER: signature,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, dict(r.headers.items())
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers.items())
+
+
+def test_peer_auth_signature_failure_locks_out(pin_protected_server) -> None:
+    """Peer-auth signature path is subject to rate-limit throttle like login."""
+    _, base, _ = pin_protected_server
+
+    body = b'{"pos_x": 1.0}'
+    bogus_sig = "0" * 64  # SHA-256 hex length, but never a valid HMAC
+
+    # Use a current timestamp so we trip the signature-mismatch path,
+    # not the timestamp-window-exceeded path.
+    ts = str(int(time.time()))
+
+    status1, _ = _signed_post_full(
+        base,
+        "/api/config/camera",
+        body,
+        signature=bogus_sig,
+        timestamp=ts,
+    )
+    assert status1 == 401  # first bogus signature → 401, throttle armed
+
+    status2, headers2 = _signed_post_full(
+        base,
+        "/api/config/camera",
+        body,
+        signature=bogus_sig,
+        timestamp=ts,
+    )
+    assert status2 == 429
+    assert "Retry-After" in headers2
+
+
+def test_logout_clears_cookie_and_redirects_to_login(live_server) -> None:
+    """POST /logout deletes the auth cookie and 303s to /login. Even on a
+    PIN-less server the route must exist and behave. ``delete_cookie``
+    works by emitting a Set-Cookie with an expired Max-Age/Expires –
+    asserting on cookie *name* alone wouldn't catch a regression where
+    the route stopped emitting the expiry."""
+    _, base = live_server
+
+    opener = _no_redirect_opener()
+    req = urllib.request.Request(f"{base}/logout", data=b"", method="POST")
+    try:
+        with opener.open(req, timeout=5) as resp:
+            status = resp.status
+            location = resp.headers.get("Location", "")
+            set_cookies = resp.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as e:
+        status = e.code
+        location = e.headers.get("Location", "")
+        set_cookies = e.headers.get_all("Set-Cookie") or []
+
+    assert status in (302, 303)
+    assert location.endswith("/login")
+
+    auth_cookies = [c for c in set_cookies if "_openfollow_auth=" in c]
+    assert auth_cookies, "logout must emit a Set-Cookie for _openfollow_auth"
+    # An expired cookie is the actual deletion signal – ``Max-Age=0``,
+    # negative Max-Age, or an ``Expires=`` date in the past. A regression
+    # that drops the expiry would still produce a Set-Cookie header but
+    # leave the cookie alive on the browser.
+    assert any("max-age=0" in c.lower() or "max-age=-" in c.lower() or "expires=" in c.lower() for c in auth_cookies)
+
+
+def test_update_video_source_post_renders_video_source_partial(live_server) -> None:
+    """Form POST without ?restart=1 saves and re-renders the video source partial.
+    Asserts on stable IDs to catch regressions in partial rendering."""
+    server, base = live_server
+    status, body = _post_form(
+        base,
+        "/section/video_source",
+        {"video_source_type": "rtsp"},
+    )
+    assert status == 200
+    assert 'id="video-source-section"' in body
+    assert 'id="general-network-section"' not in body
+    assert 'id="general-software-update-section"' not in body
+
+    saved = load_config(server.config_path)
+    assert saved.video_source_type == "rtsp"
+
+
+def test_update_video_source_post_with_restart_renders_general_partial(live_server) -> None:
+    """``?restart=1`` flips into the restart-confirmation branch, which
+    requests an app restart and renders the general partial instead of
+    the video-source one. Asserting on stable section IDs (rather than
+    just the restart flag) catches a regression where the handler
+    returns the wrong template."""
+    server, base = live_server
+    assert server.check_restart_requested() is False
+
+    status, body = _post_form(
+        base,
+        "/section/video_source?restart=1",
+        {"video_source_type": "rtsp"},
+    )
+    assert status == 200
+    assert server.check_restart_requested() is True
+    # Verify the general partial rendered (not the video-source one) via
+    # stable, platform-independent section markers. The Software Update
+    # section is gated on the host platform, so don't key on it here.
+    assert 'id="general-network-section"' in body
+    assert 'data-fold-key="general-station"' in body
+    assert 'id="video-source-section"' not in body
+
+
+def test_update_general_blocks_restart_while_update_is_running(live_server) -> None:
+    server, base = live_server
+    server.set_update_status(state="running", message="Pulling...", error="")
+
+    assert server.check_restart_requested() is False
+    status, body = _post_form(base, "/section/general?restart=1", {})
+    assert status == 200
+    assert server.check_restart_requested() is False
+    assert "Restart is blocked" in body or "currently running" in body
+
+
+def test_deb_update_dispatches_request(live_server, monkeypatch) -> None:
+    """POST /section/general/deb-update queues a deb update when idle."""
+    from openfollow.web import server as server_module
+
+    server, base = live_server
+    captured: dict = {}
+
+    def _fake_request_deb_update(self, service_name):
+        captured["service_name"] = service_name
+        return True
+
+    monkeypatch.setattr(
+        server_module.ConfigWebServer,
+        "request_deb_update",
+        _fake_request_deb_update,
+    )
+
+    status, body = _post_form(base, "/section/general/deb-update", {})
+    assert status == 200
+    assert captured["service_name"] == "openfollow"
+
+
+def test_deb_update_falls_back_to_default_when_service_name_invalid(live_server, monkeypatch) -> None:
+    """An invalid update_service_name in config must not block the update –
+    the route falls back to 'openfollow' so the button always works."""
+    from openfollow.web import server as server_module
+
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.update_service_name = "--no-block"
+    save_config(cfg, server.config_path)
+
+    captured: dict = {}
+
+    def _fake_request_deb_update(self, service_name):
+        captured["service_name"] = service_name
+        return True
+
+    monkeypatch.setattr(
+        server_module.ConfigWebServer,
+        "request_deb_update",
+        _fake_request_deb_update,
+    )
+
+    status, body = _post_form(base, "/section/general/deb-update", {})
+    assert status == 200
+    assert captured.get("service_name") == "openfollow"
+
+
+def test_deb_update_reports_when_already_running(live_server, monkeypatch) -> None:
+    """request_deb_update returns False when another update is in flight;
+    the route must surface an 'already running' message."""
+    from openfollow.web import server as server_module
+
+    server, base = live_server
+    monkeypatch.setattr(
+        server_module.ConfigWebServer,
+        "request_deb_update",
+        lambda *_a, **_kw: False,
+    )
+
+    status, body = _post_form(base, "/section/general/deb-update", {})
+    assert status == 200
+    assert "already running" in body
+
+
+def test_deb_update_check_returns_json_available(live_server, monkeypatch) -> None:
+    """GET /section/general/deb-update/check returns JSON the General-tab
+    modal uses to decide whether to offer the install."""
+    import openfollow.runtime.deb_update as deb_update_mod
+
+    _, base = live_server
+    monkeypatch.setattr(
+        deb_update_mod,
+        "_fetch_latest_release",
+        lambda repo, **kw: {"tag_name": "v99.0.0", "assets": []},
+    )
+    status, body = _get_json(base, "/section/general/deb-update/check")
+    assert status == 200
+    assert body["ok"] is True
+    assert body["available"] is True
+    assert body["latest"] == "99.0.0"
+
+
+def test_deb_update_check_surfaces_error_as_json(live_server, monkeypatch) -> None:
+    """A network/API failure during check returns ok=False with the error
+    message rather than a 500 – the modal shows it as feedback."""
+    import openfollow.runtime.deb_update as deb_update_mod
+
+    _, base = live_server
+
+    def _raise(repo, **kw):
+        raise RuntimeError("GitHub unreachable")
+
+    monkeypatch.setattr(deb_update_mod, "_fetch_latest_release", _raise)
+    status, body = _get_json(base, "/section/general/deb-update/check")
+    assert status == 200
+    assert body["ok"] is False
+    assert "GitHub unreachable" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# Offline upload install – POST /section/general/deb-upload
+# ---------------------------------------------------------------------------
+
+
+def _post_upload(
+    base: str,
+    path: str,
+    *,
+    filename: str | None = "openfollow_0.2.4_arm64.ofupdate",
+    content: bytes = b"FAKEBUNDLE",
+) -> tuple[int, dict]:
+    """POST a file as the raw request body and parse the JSON reply.
+
+    The route reads the filename from a ``?filename=`` query param and streams
+    the body straight to disk (no multipart). ``filename=None`` omits the param
+    (covers the 'No file selected' branch)."""
+    url = f"{base}{path}"
+    if filename is not None:
+        url += f"?filename={urllib.parse.quote(filename)}"
+    req = urllib.request.Request(
+        url,
+        data=content,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def test_deb_upload_rejects_when_no_file(live_server) -> None:
+    _, base = live_server
+    status, body = _post_upload(base, "/section/general/deb-upload", filename=None)
+    assert status == 200
+    assert body["ok"] is False
+    assert "No file" in body["error"]
+
+
+def test_deb_upload_rejects_unsupported_extension(live_server) -> None:
+    _, base = live_server
+    status, body = _post_upload(base, "/section/general/deb-upload", filename="evil.exe")
+    assert status == 200
+    assert body["ok"] is False
+    assert "Unsupported file type" in body["error"]
+
+
+def test_deb_upload_rejects_raw_deb(live_server) -> None:
+    # A bare .deb (no signature wrapper) is no longer installable – only the
+    # signed .ofupdate bundle is accepted.
+    _, base = live_server
+    status, body = _post_upload(base, "/section/general/deb-upload", filename="openfollow_0.2.4_arm64.deb")
+    assert status == 200
+    assert body["ok"] is False
+    assert "Unsupported file type" in body["error"]
+
+
+def test_deb_upload_rejects_oversized_body(live_server, monkeypatch) -> None:
+    import openfollow.web.routes as routes_mod
+
+    _, base = live_server
+    monkeypatch.setattr(routes_mod, "_MAX_UPLOAD_BYTES", 4)  # smaller than our body
+    status, body = _post_upload(base, "/section/general/deb-upload", content=b"way too big")
+    assert status == 200
+    assert body["ok"] is False
+    assert "too large" in body["error"]
+
+
+def test_deb_upload_rejects_empty_body(live_server) -> None:
+    _, base = live_server
+    status, body = _post_upload(base, "/section/general/deb-upload", content=b"")
+    assert status == 200
+    assert body["ok"] is False
+    assert "Empty" in body["error"]
+
+
+def test_deb_upload_plain_deb_stages_and_queues(live_server, monkeypatch) -> None:
+    """A valid bundle is staged under the temp prefix, verified, and queued;
+    a newer version is not flagged as a downgrade."""
+    import openfollow.runtime.deb_update as deb_update_mod
+    from openfollow.web import server as server_module
+
+    server, base = live_server
+    captured: dict = {}
+
+    monkeypatch.setattr(
+        deb_update_mod,
+        "verify_and_extract_bundle",
+        lambda bundle, staging: bundle + ".d/openfollow_0.2.4_arm64.deb",
+    )
+    monkeypatch.setattr(
+        deb_update_mod,
+        "validate_uploaded_deb",
+        lambda path, arch: {"Package": "openfollow", "Version": "99.0.0", "Architecture": arch},
+    )
+
+    def _fake_queue(self, service_name, *, deb_path=None):
+        captured["service_name"] = service_name
+        captured["deb_path"] = deb_path
+        return True
+
+    monkeypatch.setattr(server_module.ConfigWebServer, "request_local_update", _fake_queue)
+
+    status, body = _post_upload(base, "/section/general/deb-upload")
+    assert status == 200
+    assert body["ok"] is True
+    assert body["version"] == "99.0.0"
+    assert body["downgrade"] is False
+    # Staged under the temp prefix so the existing sudoers rule applies.
+    assert captured["deb_path"].startswith("/tmp/openfollow-update-")
+    # Cleanup the staged file (the worker would normally do this).
+    try:
+        os.unlink(captured["deb_path"])
+    except OSError:
+        pass
+
+
+def test_deb_upload_flags_downgrade(live_server, monkeypatch) -> None:
+    import openfollow
+    import openfollow.runtime.deb_update as deb_update_mod
+    from openfollow.web import server as server_module
+
+    _, base = live_server
+    # Pin the installed version so the comparison is independent of the
+    # dev/CI version stamp.
+    monkeypatch.setattr(openfollow, "__version__", "9.9.9")
+    monkeypatch.setattr(
+        deb_update_mod,
+        "verify_and_extract_bundle",
+        lambda bundle, staging: bundle + ".d/openfollow_0.0.1_arm64.deb",
+    )
+    monkeypatch.setattr(
+        deb_update_mod,
+        "validate_uploaded_deb",
+        lambda path, arch: {"Package": "openfollow", "Version": "0.0.1", "Architecture": arch},
+    )
+    staged: dict = {}
+
+    def _fake_queue(self, service_name, *, deb_path=None):
+        staged["deb_path"] = deb_path
+        return True
+
+    monkeypatch.setattr(server_module.ConfigWebServer, "request_local_update", _fake_queue)
+
+    status, body = _post_upload(base, "/section/general/deb-upload")
+    assert status == 200
+    assert body["ok"] is True
+    assert body["downgrade"] is True
+    try:
+        os.unlink(staged["deb_path"])
+    except (OSError, KeyError):
+        pass
+
+
+def test_deb_upload_invalid_deb_returns_error(live_server, monkeypatch) -> None:
+    import openfollow.runtime.deb_update as deb_update_mod
+
+    _, base = live_server
+
+    def _bad(path, arch):
+        raise RuntimeError("Uploaded package is 'vlc', expected 'openfollow'.")
+
+    monkeypatch.setattr(
+        deb_update_mod,
+        "verify_and_extract_bundle",
+        lambda bundle, staging: bundle + ".d/openfollow_0.2.4_arm64.deb",
+    )
+    monkeypatch.setattr(deb_update_mod, "validate_uploaded_deb", _bad)
+    status, body = _post_upload(base, "/section/general/deb-upload")
+    assert status == 200
+    assert body["ok"] is False
+    assert "expected 'openfollow'" in body["error"]
+
+
+def test_deb_upload_reports_when_already_running(live_server, monkeypatch) -> None:
+    import openfollow.runtime.deb_update as deb_update_mod
+    from openfollow.web import server as server_module
+
+    _, base = live_server
+    monkeypatch.setattr(
+        deb_update_mod,
+        "verify_and_extract_bundle",
+        lambda bundle, staging: bundle + ".d/openfollow_0.2.4_arm64.deb",
+    )
+    monkeypatch.setattr(
+        deb_update_mod,
+        "validate_uploaded_deb",
+        lambda path, arch: {"Package": "openfollow", "Version": "99.0.0", "Architecture": arch},
+    )
+    monkeypatch.setattr(server_module.ConfigWebServer, "request_local_update", lambda *a, **kw: False)
+    status, body = _post_upload(base, "/section/general/deb-upload")
+    assert status == 200
+    assert body["ok"] is False
+    assert "already running" in body["error"]
+
+
+def test_deb_upload_falls_back_to_default_service_name(live_server, monkeypatch) -> None:
+    """An invalid update_service_name in config must not block the upload –
+    the route falls back to 'openfollow' (mirrors the online updater)."""
+    import openfollow.runtime.deb_update as deb_update_mod
+    from openfollow.web import server as server_module
+
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.update_service_name = "--no-block"
+    save_config(cfg, server.config_path)
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        deb_update_mod,
+        "verify_and_extract_bundle",
+        lambda bundle, staging: bundle + ".d/openfollow_0.2.4_arm64.deb",
+    )
+    monkeypatch.setattr(
+        deb_update_mod,
+        "validate_uploaded_deb",
+        lambda path, arch: {"Package": "openfollow", "Version": "99.0.0", "Architecture": arch},
+    )
+
+    def _fake_queue(self, service_name, *, deb_path=None):
+        captured["service_name"] = service_name
+        captured["deb_path"] = deb_path
+        return True
+
+    monkeypatch.setattr(server_module.ConfigWebServer, "request_local_update", _fake_queue)
+
+    status, body = _post_upload(base, "/section/general/deb-upload")
+    assert status == 200
+    assert body["ok"] is True
+    assert captured["service_name"] == "openfollow"
+    try:
+        os.unlink(captured["deb_path"])
+    except (OSError, KeyError):
+        pass
+
+
+def test_update_psn_persists_and_renders_partial(live_server) -> None:
+    """Form POST to /section/psn updates the PSN transport fields and
+    re-renders the partial – exercises the dedicated PSN update route
+    (separate from /section/general which also accepts those keys)."""
+    server, base = live_server
+    status, body = _post_form(
+        base,
+        "/section/psn",
+        {
+            "psn_system_name": "PSN-A",
+            "psn_mcast_ip": "236.10.10.20",
+            "psn_source_iface": "  eth0  ",
+        },
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.psn_system_name == "PSN-A"
+    assert saved.psn_mcast_ip == "236.10.10.20"
+    assert saved.psn_source_iface == "eth0"
+
+
+def test_update_psn_with_restart_flag_queues_restart(live_server) -> None:
+    """Same restart contract as /section/general: ``?restart=1`` triggers a
+    restart request via the command queue."""
+    server, base = live_server
+    assert server.check_restart_requested() is False
+
+    status, _ = _post_form(base, "/section/psn?restart=1", {})
+    assert status == 200
+    assert server.check_restart_requested() is True
+
+
+def test_psn_section_renders_source_advisory_when_pin_missed(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """When pinned interface is unavailable, PSN section renders advisory banner with auto-detected IP."""
+    banner = "Pinned network interface 'wlan0_gone' is not available. Using auto-detected 192.168.178.61."
+    server, base = _live_server_with_zone_providers(
+        tmp_path,
+        monkeypatch,
+        psn_source_advisory_provider=lambda: {
+            "status": "primary",
+            "banner": banner,
+            "resolved_ip": "192.168.178.61",
+        },
+    )
+    try:
+        status, body = _get(base, "/section/psn")
+        assert status == 200
+        # Assert on a quote-free slice – bottle HTML-escapes the
+        # apostrophes around the iface name (``&#039;``) in the live body.
+        assert "is not available. Using auto-detected 192.168.178.61." in body
+        assert 'class="notice warning"' in body
+    finally:
+        server.stop()
+
+
+def test_psn_section_no_advisory_when_pin_honoured(live_server) -> None:
+    server, base = live_server
+    status, body = _get(base, "/section/psn")
+    assert status == 200
+    assert "is not available" not in body
+
+
+def test_get_psn_source_advisory_empty_without_provider(tmp_path) -> None:
+    """No provider wired (tests / dev hosts) → all-empty advisory so the
+    PSN partial renders no banner."""
+    server = ConfigWebServer(config_path=str(tmp_path / "config.toml"))
+    assert server.get_psn_source_advisory() == {
+        "status": "",
+        "banner": "",
+        "resolved_ip": "",
+    }
+
+
+def test_latest_mouse3d_button_uses_provider(tmp_path) -> None:
+    """The 3D Mouse Detect bridge returns the live handler's held button."""
+    server = ConfigWebServer(
+        config_path=str(tmp_path / "config.toml"),
+        mouse3d_button_provider=lambda: 2,
+    )
+    assert server.latest_mouse3d_button() == 2
+
+
+def test_latest_mouse3d_button_none_without_provider(tmp_path) -> None:
+    server = ConfigWebServer(config_path=str(tmp_path / "config.toml"))
+    assert server.latest_mouse3d_button() is None
+
+
+def test_section_mouse3d_detect_route_returns_json(live_server) -> None:
+    _server, base = live_server
+    with urllib.request.urlopen(f"{base}/section/mouse3d/detect", timeout=5) as r:
+        status, body = r.status, r.read().decode()
+        # Live per-click data must not be served from a browser/proxy cache.
+        cache_control = r.headers.get("Cache-Control")
+    assert status == 200
+    assert cache_control == "no-store"
+    # No provider wired in the live server -> button is null.
+    assert json.loads(body) == {"button": None}
+
+
+def test_section_mouse3d_post_saves(live_server) -> None:
+    _server, base = live_server
+    data = urllib.parse.urlencode({"enabled": "on", "curve": "linear", "sens_pan_x": "2.0"}).encode()
+    req = urllib.request.Request(
+        f"{base}/section/mouse3d",
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        status, body = r.status, r.read().decode()
+    assert status == 200
+    assert "3D Mouse Input" in body  # the re-rendered partial
+
+
+def test_get_psn_source_advisory_swallows_provider_error(tmp_path) -> None:
+
+    def boom() -> dict:
+        raise RuntimeError("app gone")
+
+    server = ConfigWebServer(
+        config_path=str(tmp_path / "config.toml"),
+        psn_source_advisory_provider=boom,
+    )
+    assert server.get_psn_source_advisory() == {
+        "status": "",
+        "banner": "",
+        "resolved_ip": "",
+    }
+
+
+def test_start_button_detection_calls_command_queue(live_server, monkeypatch) -> None:
+    """The wizard kick-off endpoint forwards to ``request_button_detection``
+    on the server and re-renders the gamepad partial with
+    ``detection_started=True``. Spy on the request method so a regression
+    that drops the call would fail the test, and assert on the stable
+    "Wizard running on app display" template token that only renders
+    when ``detection_started`` is set."""
+    server, base = live_server
+
+    request_calls: list[bool] = []
+    monkeypatch.setattr(
+        server,
+        "request_button_detection",
+        lambda: request_calls.append(True),
+    )
+
+    status, body = _post_form(base, "/section/gamepad/detect-buttons", {})
+    assert status == 200
+    assert request_calls == [True]
+    # Stable template token gated on ``detection_started=True``.
+    assert "Wizard running on app display" in body
+
+
+def test_cancel_button_detection_calls_command_queue(live_server, monkeypatch) -> None:
+    """Cancel endpoint forwards to cancel_button_detection and re-renders the gamepad partial."""
+    server, base = live_server
+
+    cancel_calls: list[bool] = []
+    monkeypatch.setattr(
+        server,
+        "cancel_button_detection",
+        lambda: cancel_calls.append(True),
+    )
+    # The re-render reads the live active flag; force it on so the
+    # response still carries the in-progress status + Cancel button
+    # (the cancel is async – drained on the next main-loop tick).
+    monkeypatch.setattr(server, "is_button_detection_active", lambda: True)
+
+    status, body = _post_form(
+        base,
+        "/section/gamepad/cancel-button-detection",
+        {},
+    )
+    assert status == 200
+    assert cancel_calls == [True]
+    assert "Cancel wizard" in body
+
+
+def test_update_otp_output_post_renders_partial(live_server) -> None:
+    server, base = live_server
+    status, body = _post_form(
+        base,
+        "/section/otp_output",
+        {"enabled": "on", "port": "5570"},
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.otp_output.enabled is True
+    assert saved.otp_output.port == 5570
+
+
+def test_update_rttrpm_output_post_renders_partial(live_server) -> None:
+    """RTTrPM output partial route – same bool-fields contract as OTP."""
+    server, base = live_server
+    status, body = _post_form(
+        base,
+        "/section/rttrpm_output",
+        {"enabled": "on", "fps": "30"},
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.rttrpm_output.enabled is True
+    assert saved.rttrpm_output.fps == 30
+
+
+def test_update_trigger_zones_post_renders_partial(live_server) -> None:
+    server, base = live_server
+    status, _ = _post_form(
+        base,
+        "/section/trigger_zones",
+        {"enabled": "on", "debounce_ms": "150"},
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.trigger_zones.enabled is True
+    # ``show_overlay`` was not in the form, so the bool-fields treatment
+    # must clear it to False rather than leave it stale.
+    assert saved.trigger_zones.show_overlay is False
+    assert saved.trigger_zones.debounce_ms == 150
+
+
+def test_osc_destinations_crud_round_trip(live_server) -> None:
+    """Add → save → duplicate → delete a destination through the web routes."""
+    server, base = live_server
+
+    # Add: a fresh destination lands on top of the seeded "Default".
+    status, body = _post_form(base, "/section/osc_destinations/add", {})
+    assert status == 200
+    cfg = load_config(server.config_path)
+    assert len(cfg.osc_destinations.destinations) == 2
+    new_id = cfg.osc_destinations.destinations[-1].id
+
+    # Save: edit the new destination's connection.
+    status, _ = _post_form(
+        base,
+        f"/section/osc_destination/{new_id}",
+        {"name": "Console", "host": "10.0.0.9", "port": "9001", "protocol": "tcp", "framing": "slip"},
+    )
+    assert status == 200
+    saved = load_config(server.config_path).osc_destinations.get(new_id)
+    assert saved is not None
+    assert saved.name == "Console"
+    assert saved.host == "10.0.0.9"
+    assert saved.port == 9001
+    assert saved.protocol == "tcp"
+
+    # Duplicate then delete.
+    status, _ = _post_form(base, f"/section/osc_destination/{new_id}/duplicate", {})
+    assert status == 200
+    assert len(load_config(server.config_path).osc_destinations.destinations) == 3
+    status, _ = _post_form(base, f"/section/osc_destination/{new_id}/delete", {})
+    assert status == 200
+    after = load_config(server.config_path).osc_destinations
+    assert after.get(new_id) is None
+
+
+def test_api_zones_includes_live_destinations(live_server) -> None:
+    """The zone-editor poll carries the shared destinations, so adding one in
+    the OSC Destinations section reaches the zone dropdown without a reload."""
+    server, base = live_server
+
+    # The seeded "Default" destination is present from the start, with the
+    # endpoint fields the dropdown renders.
+    status, body = _get_json(base, "/api/zones")
+    assert status == 200
+    default = next(d for d in body["destinations"] if d["id"] == "default")
+    assert set(default) == {"id", "name", "host", "port", "protocol", "framing"}
+
+    # Add a destination via the section route; the next poll reflects it.
+    status, _ = _post_form(base, "/section/osc_destinations/add", {})
+    assert status == 200
+    new_id = load_config(server.config_path).osc_destinations.destinations[-1].id
+    status, body2 = _get_json(base, "/api/zones")
+    assert status == 200
+    assert new_id in [d["id"] for d in body2["destinations"]]
+
+
+def test_osc_destinations_section_get_renders(live_server) -> None:
+    """``GET /section/osc_destinations`` renders the destinations partial."""
+    _, base = live_server
+    status, body = _get(base, "/section/osc_destinations")
+    assert status == 200
+    assert "OSC Destinations" in body
+
+
+def test_osc_destination_save_partial_form_leaves_absent_fields_untouched(
+    live_server,
+) -> None:
+    """A save that omits fields updates only what's posted – the parser loop
+    skips absent fields rather than clobbering them with defaults."""
+    server, base = live_server
+    seeded = load_config(server.config_path).osc_destinations.destinations[0]
+    original_name = seeded.name
+    status, _ = _post_form(
+        base,
+        f"/section/osc_destination/{seeded.id}",
+        {"host": "10.1.2.3"},  # only host – name/port/protocol/framing absent
+    )
+    assert status == 200
+    saved = load_config(server.config_path).osc_destinations.get(seeded.id)
+    assert saved is not None
+    assert saved.host == "10.1.2.3"
+    assert saved.name == original_name
+
+
+def test_osc_destination_save_unknown_id_404(live_server) -> None:
+    _, base = live_server
+    status, _ = _post_form(base, "/section/osc_destination/no-such", {"host": "1.2.3.4"})
+    assert status == 404
+
+
+def test_osc_destination_duplicate_unknown_id_404(live_server) -> None:
+    _, base = live_server
+    status, _ = _post_form(base, "/section/osc_destination/no-such/duplicate", {})
+    assert status == 404
+
+
+def test_osc_destination_delete_unknown_id_is_noop(live_server) -> None:
+    server, base = live_server
+    before = len(load_config(server.config_path).osc_destinations.destinations)
+    status, body = _post_form(base, "/section/osc_destination/no-such/delete", {})
+    assert status == 200
+    assert "OSC Destinations" in body
+    after = len(load_config(server.config_path).osc_destinations.destinations)
+    assert after == before
+
+
+def test_osc_destination_move_reorders_and_guards_edges(live_server) -> None:
+    """move up/down swaps neighbours; edge moves and an unknown direction are
+    no-ops; an unknown id is a 404."""
+    server, base = live_server
+    # Seeded "Default" sits at index 0; add two more for a clear ordering.
+    _post_form(base, "/section/osc_destinations/add", {})
+    _post_form(base, "/section/osc_destinations/add", {})
+    dests = load_config(server.config_path).osc_destinations.destinations
+    assert len(dests) == 3
+    first_id, second_id, third_id = (d.id for d in dests)
+
+    def _order() -> list[str]:
+        return [d.id for d in load_config(server.config_path).osc_destinations.destinations]
+
+    _post_form(base, f"/section/osc_destination/{second_id}/move", {"direction": "up"})
+    assert _order()[:2] == [second_id, first_id]
+
+    _post_form(base, f"/section/osc_destination/{second_id}/move", {"direction": "down"})
+    assert _order()[:2] == [first_id, second_id]
+
+    # Top-up and bottom-down: target == idx → no swap, no save.
+    _post_form(base, f"/section/osc_destination/{first_id}/move", {"direction": "up"})
+    _post_form(base, f"/section/osc_destination/{third_id}/move", {"direction": "down"})
+    assert _order() == [first_id, second_id, third_id]
+
+    # Unknown direction → no-op.
+    _post_form(base, f"/section/osc_destination/{first_id}/move", {"direction": "sideways"})
+    assert _order() == [first_id, second_id, third_id]
+
+    status, _ = _post_form(
+        base,
+        "/section/osc_destination/no-such/move",
+        {"direction": "up"},
+    )
+    assert status == 404
+
+
+def test_osc_destination_noop_move_does_not_flash_saved(live_server) -> None:
+    """A boundary move (top row up) changes nothing, so the re-render must NOT
+    carry the 'saved' state – an operator shouldn't see a saved flash for an
+    action that did nothing. A real move does flash saved."""
+    server, base = live_server
+    first_id = load_config(server.config_path).osc_destinations.destinations[0].id
+    _post_form(base, "/section/osc_destinations/add", {})
+    second_id = load_config(server.config_path).osc_destinations.destinations[-1].id
+
+    # No-op: top row up → no swap, no 'saved'.
+    _status, body = _post_form(base, f"/section/osc_destination/{first_id}/move", {"direction": "up"})
+    assert "osc-destinations-section" in body
+    assert "section saved" not in body
+
+    # Real move: second row up → flashes saved.
+    _status, body = _post_form(base, f"/section/osc_destination/{second_id}/move", {"direction": "up"})
+    assert "section saved" in body
+
+
+def test_osc_binding_dangling_destination_shows_missing_option(live_server) -> None:
+    """A row whose ``destination_id`` points at a deleted destination renders a
+    selected '(missing destination)' option, so the dropdown reflects the
+    stored dangling id instead of silently falling back to '(none)'."""
+    server, base = live_server
+    _post_form(base, "/section/osc_bindings/add", {})
+    row_id = load_config(server.config_path).osc_transmitters.transmitters[0].id
+    _post_form(base, f"/section/osc_binding/{row_id}", {"destination_id": "ghost-id"})
+
+    status, body = _get(base, "/section/osc_bindings")
+    assert status == 200
+    assert "(missing destination)" in body
+
+
+def test_osc_destinations_use_drag_handle_not_arrow_buttons(live_server) -> None:
+    """Destinations reorder via the same ⋮⋮ drag handle as transmitters; the
+    per-row ↑/↓ arrow buttons are gone from the UI (the /move route stays as a
+    stable JSON-API surface)."""
+    _, base = live_server
+    status, body = _get(base, "/section/osc_destinations")
+    assert status == 200
+    assert "osc-destination-drag-handle" in body
+    assert 'data-reorder-url="/section/osc_destinations/reorder"' in body
+    assert "↑" not in body
+    assert "↓" not in body
+
+
+def test_osc_destinations_reorder_applies_full_ordering(live_server) -> None:
+    """The drag-handle UI POSTs the complete id ordering: [A,B,C] -> [C,A,B]."""
+    server, base = live_server
+    _post_form(base, "/section/osc_destinations/add", {})
+    _post_form(base, "/section/osc_destinations/add", {})
+    a, b, c = (d.id for d in load_config(server.config_path).osc_destinations.destinations)
+    status, _ = _post_form(base, "/section/osc_destinations/reorder", {"order": f"{c},{a},{b}"})
+    assert status == 200
+    after = [d.id for d in load_config(server.config_path).osc_destinations.destinations]
+    assert after == [c, a, b]
+
+
+def test_osc_destinations_reorder_drops_unknown_keeps_missing(live_server) -> None:
+    """A stale post with a phantom id and an omitted real id: phantom dropped,
+    omitted destination appended so nothing is lost."""
+    server, base = live_server
+    _post_form(base, "/section/osc_destinations/add", {})
+    _post_form(base, "/section/osc_destinations/add", {})
+    a, b, c = (d.id for d in load_config(server.config_path).osc_destinations.destinations)
+    _post_form(base, "/section/osc_destinations/reorder", {"order": f"{c},ghost-id,{a}"})
+    after = [d.id for d in load_config(server.config_path).osc_destinations.destinations]
+    assert after == [c, a, b]
+
+
+def test_osc_destinations_reorder_empty_order_is_noop(live_server) -> None:
+    """Empty / whitespace ``order`` must not drop destinations."""
+    server, base = live_server
+    _post_form(base, "/section/osc_destinations/add", {})
+    before = [d.id for d in load_config(server.config_path).osc_destinations.destinations]
+    status, _ = _post_form(base, "/section/osc_destinations/reorder", {"order": "  "})
+    assert status == 200
+    after = [d.id for d in load_config(server.config_path).osc_destinations.destinations]
+    assert after == before
+
+
+def test_osc_destinations_reorder_no_change_is_idempotent(live_server) -> None:
+    """Posting the existing order is a no-op (the permutation matches what's on
+    disk, so no save) while still re-rendering successfully."""
+    server, base = live_server
+    _post_form(base, "/section/osc_destinations/add", {})
+    before = [d.id for d in load_config(server.config_path).osc_destinations.destinations]
+    status, _ = _post_form(base, "/section/osc_destinations/reorder", {"order": ",".join(before)})
+    assert status == 200
+    after = [d.id for d in load_config(server.config_path).osc_destinations.destinations]
+    assert after == before
+
+
+def test_osc_destinations_collapsed_summary_shows_host_port(live_server) -> None:
+    """The collapsed destination row shows host:port right after the name plus a
+    protocol badge, so a folded destination stays identifiable at a glance."""
+    server, base = live_server
+    seeded = load_config(server.config_path).osc_destinations.destinations[0]
+    _post_form(
+        base,
+        f"/section/osc_destination/{seeded.id}",
+        {"name": "Console", "host": "10.5.5.5", "port": "9001", "protocol": "udp", "framing": "slip"},
+    )
+    _, body = _get(base, "/section/osc_destinations")
+    assert "osc-destination-addr" in body
+    assert "10.5.5.5:9001" in body
+    assert "osc-destination-proto-badge" in body
+    assert "UDP" in body
+
+
+def test_broadcast_section_rejects_non_shareable_sections(live_server) -> None:
+    """OSC routing + zones travel by file only – a section broadcast of them
+    is refused with 403, never pushed to peers."""
+    _, base = live_server
+    for section in ("osc_destinations", "osc_transmitters", "trigger_zones"):
+        status, payload = _post_json(base, f"/api/config/{section}/broadcast", {"enabled": True})
+        assert status == 403, f"{section} should not be broadcastable"
+        assert "not shareable" in payload.get("error", "").lower()
+
+
+def test_update_detection_inference_toggles_only_display_bools(live_server) -> None:
+    """The Sensitivity & Overlay box owns only ``show_boxes`` / ``show_labels``
+    as bool fields. Saving it must not flip ``enabled`` (tracking owns that):
+    an absent checkbox coerces to False, a present one to True, and the
+    detection enabled state is untouched."""
+    server, base = live_server
+
+    # Enable detection via the tracking box first; the inference save below
+    # must leave that state alone.
+    _post_form(base, "/section/detection/tracking", {"tracking_state": "replace"})
+
+    status, _ = _post_form(
+        base,
+        "/section/detection/inference",
+        {
+            "confidence": "0.42",
+            "show_boxes": "on",
+        },
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.detection.confidence == pytest.approx(0.42)
+    # Present checkbox → True; absent checkbox → False.
+    assert saved.detection.show_boxes is True
+    assert saved.detection.show_labels is False
+    # The inference box does not own ``enabled`` – tracking's state survives.
+    assert saved.detection.enabled is True
+
+
+def test_update_detection_models_saves_selected_model(live_server) -> None:
+    """The Detection Model box's quality-tier radios POST ``model``; the chosen
+    value persists and does not disturb the tracking state owned by another box."""
+    server, base = live_server
+    # Turn detection on via the tracking box first.
+    _post_form(base, "/section/detection/tracking", {"tracking_state": "assist"})
+
+    status, _ = _post_form(base, "/section/detection/models", {"model": "yolo26m.onnx"})
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.detection.model == "yolo26m.onnx"
+    # Saving the Models box leaves the tracking state alone.
+    assert saved.detection.enabled is True
+    assert saved.detection.pin_mode == "assist"
+
+
+def test_update_detection_tracking_assist_enables_with_assist_mode(live_server) -> None:
+    """``tracking_state=assist`` enables detection and selects assist mode."""
+    server, base = live_server
+    status, _ = _post_form(base, "/section/detection/tracking", {"tracking_state": "assist"})
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.detection.enabled is True
+    assert saved.detection.pin_mode == "assist"
+
+
+def test_update_detection_tracking_replace_enables_with_replace_mode(live_server) -> None:
+    """``tracking_state=replace`` enables detection and selects replace mode."""
+    server, base = live_server
+    status, _ = _post_form(base, "/section/detection/tracking", {"tracking_state": "replace"})
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.detection.enabled is True
+    assert saved.detection.pin_mode == "replace"
+
+
+def test_update_detection_tracking_off_disables_and_keeps_last_mode(live_server) -> None:
+    """``tracking_state=off`` disables detection but leaves ``pin_mode`` intact
+    so re-enabling restores the operator's last mode."""
+    server, base = live_server
+    # Establish a non-default mode, then turn tracking off.
+    _post_form(base, "/section/detection/tracking", {"tracking_state": "replace"})
+    status, _ = _post_form(base, "/section/detection/tracking", {"tracking_state": "off"})
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.detection.enabled is False
+    # ``off`` does not touch pin_mode.
+    assert saved.detection.pin_mode == "replace"
+
+
+def test_api_video_snapshot_returns_503_when_no_preview_provider(live_server) -> None:
+    _, base = live_server
+    status, _ = _get(base, "/api/video/snapshot")
+    assert status == 503
+
+
+def test_api_video_snapshot_full_returns_503_when_no_full_provider(live_server) -> None:
+    """Same contract as the preview snapshot for the wizard-only full-res
+    endpoint."""
+    _, base = live_server
+    status, _ = _get(base, "/api/video/snapshot/full")
+    assert status == 503
+
+
+def test_api_restart_post_requests_restart_via_command_queue(live_server) -> None:
+    """The JSON /api/restart endpoint must enqueue a restart and return
+    success – used by the web UI's "Apply & Restart" buttons."""
+    server, base = live_server
+    assert server.check_restart_requested() is False
+
+    status, body = _post_json(base, "/api/restart", {})
+    assert status == 200
+    assert body.get("success") is True
+    assert server.check_restart_requested() is True
+
+
+# ---------------------------------------------------------------------------
+# Zones CRUD success paths + import confirm/skip + broadcast
+# ---------------------------------------------------------------------------
+
+
+def _put_json(base: str, path: str, data: dict) -> tuple[int, dict]:
+    return _post_raw_json(base, path, data, method="PUT")
+
+
+def _delete(base: str, path: str) -> tuple[int, dict]:
+    req = urllib.request.Request(f"{base}{path}", method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def test_api_create_zone_appends_with_index_in_response(live_server) -> None:
+    """POST /api/zones appends a new zone and returns its index. Without
+    this, the editor can't map the new row to a server-side zone for
+    follow-up PUTs."""
+    server, base = live_server
+
+    status, body = _post_json(base, "/api/zones", {"name": "ZoneOne"})
+    assert status == 200
+    assert body.get("success") is True
+    assert isinstance(body.get("index"), int) and body["index"] >= 0
+
+    saved = load_config(server.config_path)
+    assert saved.trigger_zones.zones[body["index"]].name == "ZoneOne"
+
+
+def test_api_update_zone_replaces_fields_for_existing_index(live_server) -> None:
+    """PUT /api/zones/<i> applies the field subset in-place (no full-zone
+    replacement) so partial edits don't blank fields the editor didn't
+    send."""
+    server, base = live_server
+    create_status, create_body = _post_json(base, "/api/zones", {"name": "Original"})
+    assert create_status == 200
+    idx = create_body["index"]
+
+    update_status, update_body = _put_json(
+        base,
+        f"/api/zones/{idx}",
+        {"name": "Renamed"},
+    )
+    assert update_status == 200
+    assert update_body.get("success") is True
+
+    saved = load_config(server.config_path)
+    assert saved.trigger_zones.zones[idx].name == "Renamed"
+
+
+def test_api_update_zone_returns_404_for_out_of_range_index(live_server) -> None:
+    _, base = live_server
+    status, body = _put_json(base, "/api/zones/9999", {"name": "Phantom"})
+    assert status == 404
+    assert "out of range" in str(body.get("error", "")).lower()
+
+
+def test_api_update_zone_returns_404_for_negative_index(live_server) -> None:
+    _, base = live_server
+    status, body = _put_json(base, "/api/zones/-1", {"name": "Phantom"})
+    assert status == 404
+    assert "out of range" in str(body.get("error", "")).lower()
+
+
+# ---------------------------------------------------------------------------
+# ``triggered_by`` round-trip, Duplicate, Test send and Diagnostics in /api/zones GET
+# ---------------------------------------------------------------------------
+
+
+def test_api_create_zone_persists_triggered_by_list(live_server) -> None:
+    """POST /api/zones with a ``triggered_by`` list saves a coerced
+    ``list[int]`` – strings get coerced silently per ``_parse_triggered_by``."""
+    server, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/zones",
+        {
+            "name": "Filtered",
+            "triggered_by": [0, "1", 5],
+        },
+    )
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.trigger_zones.zones[body["index"]].triggered_by == [0, 1, 5]
+
+
+def test_api_update_zone_round_trips_triggered_by(live_server) -> None:
+    server, base = live_server
+    _, c = _post_json(base, "/api/zones", {"name": "Z"})
+    idx = c["index"]
+    status, body = _put_json(
+        base,
+        f"/api/zones/{idx}",
+        {"triggered_by": [3, 7]},
+    )
+    assert status == 200
+    assert body.get("success") is True
+    saved = load_config(server.config_path)
+    assert saved.trigger_zones.zones[idx].triggered_by == [3, 7]
+
+
+def test_api_update_zone_triggered_by_omitted_preserves_filter(live_server) -> None:
+    server, base = live_server
+    _, c = _post_json(
+        base,
+        "/api/zones",
+        {
+            "name": "Z",
+            "triggered_by": [4],
+        },
+    )
+    idx = c["index"]
+    _put_json(base, f"/api/zones/{idx}", {"enabled": False})
+    saved = load_config(server.config_path)
+    assert saved.trigger_zones.zones[idx].triggered_by == [4]
+
+
+def test_api_list_zones_exposes_triggered_by_and_diagnostics(live_server) -> None:
+    server, base = live_server
+    _, c = _post_json(base, "/api/zones", {"name": "Z"})
+    idx = c["index"]
+
+    status, payload = _get_json(base, "/api/zones")
+    assert status == 200
+    zone_payload = next(z for z in payload["zones"] if z["index"] == idx)
+    assert zone_payload["triggered_by"] == []
+    diag = zone_payload["diagnostics"]
+    assert diag["is_occupied"] is False
+    assert diag["count"] == 0
+    assert diag["occupants"] == []
+    assert diag["last_event_address"] == ""
+
+
+def test_api_zone_duplicate_clones_in_place(live_server) -> None:
+    server, base = live_server
+    _, c = _post_json(
+        base,
+        "/api/zones",
+        {
+            "name": "Original",
+            "triggered_by": [1, 2],
+            "osc_address_first_entry": "/orig/enter",
+        },
+    )
+    idx = c["index"]
+
+    req = urllib.request.Request(f"{base}/api/zones/{idx}/duplicate", method="POST")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        body = json.loads(r.read().decode() or "{}")
+    assert body.get("success") is True
+    new_idx = body["index"]
+    saved = load_config(server.config_path)
+    assert saved.trigger_zones.zones[new_idx].name == "Original (copy)"
+    assert saved.trigger_zones.zones[new_idx].triggered_by == [1, 2]
+    assert saved.trigger_zones.zones[new_idx].osc_address_first_entry == "/orig/enter"
+
+
+def test_api_zone_duplicate_404_for_unknown_index(live_server) -> None:
+    _, base = live_server
+    req = urllib.request.Request(f"{base}/api/zones/9999/duplicate", method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+        raise AssertionError("expected 404")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+
+
+def test_api_zone_test_send_400_for_unknown_which(live_server) -> None:
+    _, base = live_server
+    _, c = _post_json(base, "/api/zones", {"name": "Z"})
+    idx = c["index"]
+    req = urllib.request.Request(
+        f"{base}/api/zones/{idx}/test_send?which=bogus",
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+        raise AssertionError("expected 400")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+
+
+def test_api_zone_test_send_503_when_no_provider_attached(live_server) -> None:
+    _, base = live_server
+    _, c = _post_json(base, "/api/zones", {"name": "Z"})
+    idx = c["index"]
+    req = urllib.request.Request(
+        f"{base}/api/zones/{idx}/test_send?which=first",
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+        raise AssertionError("expected 503")
+    except urllib.error.HTTPError as e:
+        assert e.code == 503
+
+
+def _live_server_with_zone_providers(tmp_path, monkeypatch, **providers):
+    """Server fixture variant that wires zone diagnostics + test-send
+    providers so the positive-path code in ``server.py`` and ``routes.py``
+    is exercised. Mirrors the OSC-bindings ``_live_server_with_providers``
+    helper but stays scoped to this file (no cross-import)."""
+    monkeypatch.setattr(discovery_module.BeaconSender, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconSender, "stop", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "stop", lambda self: None)
+    config_path = tmp_path / "config.toml"
+    return start_on_free_port(
+        lambda port: ConfigWebServer(
+            config_path=str(config_path),
+            host="127.0.0.1",
+            port=port,
+            system_name="TestSystem",
+            **providers,
+        )
+    )
+
+
+def test_api_list_zones_uses_diagnostics_provider_when_attached(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """When a ``zone_diagnostics_provider`` is wired, the GET response
+    surfaces its dict for each zone instead of the zero-state fallback.
+    Pins both the server-layer pass-through and the route-layer ``diag
+    is not None`` branch."""
+    captured: list[int] = []
+
+    def diag_provider(idx: int) -> dict:
+        captured.append(idx)
+        return {
+            "is_occupied": True,
+            "count": 2,
+            "occupants": [{"kind": "marker", "id": 0}, {"kind": "detection", "id": 5}],
+            "last_event_time": 12.5,
+            "last_event_address": "/zone/enter",
+        }
+
+    server, base = _live_server_with_zone_providers(
+        tmp_path,
+        monkeypatch,
+        zone_diagnostics_provider=diag_provider,
+    )
+    try:
+        _, c = _post_json(base, "/api/zones", {"name": "Z"})
+        idx = c["index"]
+        status, payload = _get_json(base, "/api/zones")
+        assert status == 200
+        zone_payload = next(z for z in payload["zones"] if z["index"] == idx)
+        assert zone_payload["diagnostics"]["last_event_address"] == "/zone/enter"
+        assert zone_payload["diagnostics"]["count"] == 2
+        assert idx in captured
+    finally:
+        server.stop()
+
+
+def test_api_zone_test_send_invokes_provider_and_returns_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """When a ``zone_test_send`` provider is wired, the route forwards
+    ``which`` to it and ships the provider's dict back. Exercises both
+    the server-layer pass-through and the route-layer non-empty
+    success path (``return json.dumps(result)``)."""
+    calls: list[tuple[int, str]] = []
+
+    def fake_send(idx: int, which: str) -> dict:
+        calls.append((idx, which))
+        return {"success": True, "address": "/zone/enter", "args": [1]}
+
+    server, base = _live_server_with_zone_providers(
+        tmp_path,
+        monkeypatch,
+        zone_test_send=fake_send,
+    )
+    try:
+        _, c = _post_json(base, "/api/zones", {"name": "Z"})
+        idx = c["index"]
+        req = urllib.request.Request(
+            f"{base}/api/zones/{idx}/test_send?which=first",
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            body = json.loads(r.read().decode())
+        assert body == {"success": True, "address": "/zone/enter", "args": [1]}
+        assert calls == [(idx, "first")]
+    finally:
+        server.stop()
+
+
+def test_api_zone_test_send_404_when_provider_reports_out_of_range(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Zone provider errors are mapped to 404 response instead of 200."""
+
+    def fake_send(idx: int, which: str) -> dict:
+        return {"error": "Zone index out of range"}
+
+    server, base = _live_server_with_zone_providers(
+        tmp_path,
+        monkeypatch,
+        zone_test_send=fake_send,
+    )
+    try:
+        # Index 0 is fine for the route's URL routing; the provider
+        # decides the response.
+        _, c = _post_json(base, "/api/zones", {"name": "Z"})
+        idx = c["index"]
+        req = urllib.request.Request(
+            f"{base}/api/zones/{idx}/test_send?which=first",
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                r.read()
+            raise AssertionError("expected 404")
+        except urllib.error.HTTPError as e:
+            assert e.code == 404
+            body = json.loads(e.read().decode())
+            assert "out of range" in body["error"].lower()
+    finally:
+        server.stop()
+
+
+def test_api_zone_test_send_400_when_provider_reports_payload_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Provider returns ``{"error": "unclosed quote in field: ..."}``
+    when the configured field has malformed shlex syntax. That's a
+    400 (bad config payload), not a 200 success."""
+
+    def fake_send(idx: int, which: str) -> dict:
+        return {"error": "unclosed quote in field: No closing quotation"}
+
+    server, base = _live_server_with_zone_providers(
+        tmp_path,
+        monkeypatch,
+        zone_test_send=fake_send,
+    )
+    try:
+        _, c = _post_json(base, "/api/zones", {"name": "Z"})
+        idx = c["index"]
+        req = urllib.request.Request(
+            f"{base}/api/zones/{idx}/test_send?which=first",
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                r.read()
+            raise AssertionError("expected 400")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+            body = json.loads(e.read().decode())
+            assert "unclosed" in body["error"].lower()
+    finally:
+        server.stop()
+
+
+def test_parse_triggered_by_non_list_value_returns_current() -> None:
+    """A scalar / dict / null payload must fall back to ``current`` –
+    same defensive shape as ``_parse_vertices``. Without this guard a
+    malformed POST (e.g. ``{"triggered_by": null}``) would silently
+    nuke the filter."""
+    from openfollow.web.routes import _parse_triggered_by
+
+    assert _parse_triggered_by(None, [1, 2]) == [1, 2]
+    assert _parse_triggered_by("not a list", [3]) == [3]
+    assert _parse_triggered_by({"x": 1}, []) == []
+
+
+def test_parse_triggered_by_drops_non_coercible_entries() -> None:
+    """A permissive client may smuggle un-coercible entries (``None`` /
+    non-numeric strings); drop them rather than reject the whole list,
+    so a partially-bad payload still applies the salvageable filter."""
+    from openfollow.web.routes import _parse_triggered_by
+
+    assert _parse_triggered_by([0, "abc", None, "1"], []) == [0, 1]
+
+
+def test_api_delete_zone_removes_existing_zone(live_server) -> None:
+    """Happy delete path – the zones list shrinks by one; subsequent gets
+    don't surface the removed zone."""
+    server, base = live_server
+    _, c1 = _post_json(base, "/api/zones", {"name": "ToKeep"})
+    _, c2 = _post_json(base, "/api/zones", {"name": "ToDelete"})
+    target_idx = c2["index"]
+
+    status, body = _delete(base, f"/api/zones/{target_idx}")
+    assert status == 200
+    assert body.get("success") is True
+
+    saved = load_config(server.config_path)
+    names = [z.name for z in saved.trigger_zones.zones]
+    assert "ToKeep" in names
+    assert "ToDelete" not in names
+
+
+def test_api_delete_zone_returns_404_for_out_of_range_index(live_server) -> None:
+    """Symmetric guard with the PUT route – out-of-range deletes 404 rather
+    than silently no-op'ing."""
+    _, base = live_server
+    status, body = _delete(base, "/api/zones/9999")
+    assert status == 404
+    assert "out of range" in str(body.get("error", "")).lower()
+
+
+def test_api_delete_zone_returns_404_for_negative_index(live_server) -> None:
+    """Same negative-index guard as the PUT route."""
+    _, base = live_server
+    status, body = _delete(base, "/api/zones/-1")
+    assert status == 404
+    assert "out of range" in str(body.get("error", "")).lower()
+
+
+def test_api_list_zones_returns_globals_grid_zones_and_markers(live_server) -> None:
+    _, base = live_server
+    status, data = _get_json(base, "/api/zones")
+    assert status == 200
+    assert {"globals", "grid", "zones", "markers"}.issubset(set(data.keys()))
+    # Markers come from the marker_positions provider – empty in the
+    # default fixture (no provider wired).
+    assert data["markers"] == []
+
+
+# ---------------------------------------------------------------------------
+# Detection mask CRUD (/api/detection/masks)
+# ---------------------------------------------------------------------------
+
+
+def test_api_create_detection_mask_appends_with_index(live_server) -> None:
+    server, base = live_server
+    verts = [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]]
+    status, body = _post_json(base, "/api/detection/masks", {"name": "Stage", "vertices": verts})
+    assert status == 200
+    assert body.get("success") is True
+    idx = body.get("index")
+    assert isinstance(idx, int) and idx >= 0
+
+    saved = load_config(server.config_path)
+    assert saved.detection.masks[idx].name == "Stage"
+    assert saved.detection.masks[idx].vertices == verts
+
+
+def test_api_list_detection_masks_round_trips(live_server) -> None:
+    _, base = live_server
+    _post_json(base, "/api/detection/masks", {"name": "M0", "vertices": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]})
+    status, data = _get_json(base, "/api/detection/masks")
+    assert status == 200
+    assert isinstance(data.get("masks"), list)
+    assert data["masks"][0]["name"] == "M0"
+    assert data["masks"][0]["enabled"] is True
+    assert data["masks"][0]["vertices"] == [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
+
+
+def test_api_update_detection_mask_applies_partial_fields(live_server) -> None:
+    server, base = live_server
+    _, c = _post_json(base, "/api/detection/masks", {"name": "Orig", "vertices": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]})
+    idx = c["index"]
+    status, body = _put_json(base, f"/api/detection/masks/{idx}", {"enabled": False})
+    assert status == 200
+    assert body.get("success") is True
+
+    saved = load_config(server.config_path)
+    assert saved.detection.masks[idx].enabled is False
+    # Partial PUT must not blank the polygon it didn't send.
+    assert saved.detection.masks[idx].vertices == [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
+
+
+def test_api_update_detection_mask_404_for_out_of_range(live_server) -> None:
+    _, base = live_server
+    status, body = _put_json(base, "/api/detection/masks/9999", {"name": "Phantom"})
+    assert status == 404
+    assert "out of range" in str(body.get("error", "")).lower()
+
+
+def test_api_delete_detection_mask_removes_existing(live_server) -> None:
+    server, base = live_server
+    _, c1 = _post_json(base, "/api/detection/masks", {"name": "Keep"})
+    _, c2 = _post_json(base, "/api/detection/masks", {"name": "Drop"})
+    status, body = _delete(base, f"/api/detection/masks/{c2['index']}")
+    assert status == 200
+    assert body.get("success") is True
+
+    names = [m.name for m in load_config(server.config_path).detection.masks]
+    assert names == ["Keep"]
+
+
+def test_api_delete_detection_mask_404_for_out_of_range(live_server) -> None:
+    _, base = live_server
+    status, body = _delete(base, "/api/detection/masks/-1")
+    assert status == 404
+    assert "out of range" in str(body.get("error", "")).lower()
+
+
+def test_api_create_detection_mask_rejects_non_object_body(live_server) -> None:
+    _, base = live_server
+    status, body = _post_raw_json(base, "/api/detection/masks", ["not", "a", "dict"])
+    assert status == 400
+    assert "object" in str(body.get("error", "")).lower()
+
+
+def test_api_list_detection_masks_includes_master_flag(live_server) -> None:
+    _, base = live_server
+    status, data = _get_json(base, "/api/detection/masks")
+    assert status == 200
+    # The masking master switch ships off.
+    assert data.get("masks_enabled") is False
+
+
+def test_api_set_detection_masks_enabled_persists(live_server) -> None:
+    server, base = live_server
+    status, body = _post_json(base, "/api/detection/masks/enabled", {"enabled": True})
+    assert status == 200
+    assert body.get("masks_enabled") is True
+    assert load_config(server.config_path).detection.masks_enabled is True
+
+    status, body = _post_json(base, "/api/detection/masks/enabled", {"enabled": False})
+    assert status == 200
+    assert body.get("masks_enabled") is False
+    assert load_config(server.config_path).detection.masks_enabled is False
+
+
+def test_api_set_detection_masks_enabled_rejects_non_object_body(live_server) -> None:
+    _, base = live_server
+    status, body = _post_raw_json(base, "/api/detection/masks/enabled", ["nope"])
+    assert status == 400
+    assert "object" in str(body.get("error", "")).lower()
+
+
+def test_api_set_detection_masks_enabled_rejects_null_body(live_server) -> None:
+    _, base = live_server
+    status, body = _post_raw_json(base, "/api/detection/masks/enabled", None)
+    assert status == 400
+    assert "Invalid JSON" in str(body.get("error", ""))
+
+
+def test_api_create_detection_mask_rejects_null_body(live_server) -> None:
+    _, base = live_server
+    status, body = _post_raw_json(base, "/api/detection/masks", None)
+    assert status == 400
+    assert "Invalid JSON" in str(body.get("error", ""))
+
+
+def test_api_update_detection_mask_rejects_null_body(live_server) -> None:
+    _, base = live_server
+    status, body = _post_raw_json(base, "/api/detection/masks/0", None, method="PUT")
+    assert status == 400
+    assert "Invalid JSON" in str(body.get("error", ""))
+
+
+def test_api_update_detection_mask_rejects_non_object_body(live_server) -> None:
+    _, base = live_server
+    status, body = _post_raw_json(base, "/api/detection/masks/0", "a string", method="PUT")
+    assert status == 400
+    assert "object" in str(body.get("error", "")).lower()
+
+
+def test_api_create_detection_mask_drops_garbage_vertices(live_server) -> None:
+    server, base = live_server
+    # A crafted payload with non-numeric, short, and wrong-type vertices:
+    # the shared parser drops them before persistence.
+    payload = {"name": "M", "vertices": [[0.0, 0.0], ["x", 1], [0.5], "nope", [1.0, 1.0]]}
+    status, body = _post_json(base, "/api/detection/masks", payload)
+    assert status == 200
+    saved = load_config(server.config_path)
+    assert saved.detection.masks[body["index"]].vertices == [[0.0, 0.0], [1.0, 1.0]]
+
+
+def test_api_broadcast_all_marks_the_push_with_this_station_name(live_server, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from openfollow.web import routes as routes_mod
+
+    senders: list[str] = []
+    payloads: list[dict] = []
+
+    def _fake_send(ip: str, port: int, data: dict, pin: str = "", *, expected_port: int, sender: str) -> bool:
+        senders.append(sender)
+        payloads.append(data)
+        return True
+
+    monkeypatch.setattr(routes_mod, "_send_config_import_to_peer", _fake_send)
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_system_name = "Front of House"
+    save_config(cfg, server.config_path)
+    monkeypatch.setattr(server, "get_peers", lambda: [SimpleNamespace(name="peer", ip="10.0.0.99", web_port=80)])
+
+    status, _body = _post_json(base, "/api/config/broadcast-all", {})
+    assert status == 200
+    assert senders == ["Front of House"]
+    # Each peer keeps its own station name.
+    assert "psn_system_name" not in payloads[0]
+    assert "camera" in payloads[0]
+
+
+def test_api_broadcast_all_returns_empty_results_when_no_peers(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(base, "/api/config/broadcast-all", {})
+    assert status == 200
+    assert body.get("success") is True
+    assert body.get("peer_results") == []
+
+
+def test_api_broadcast_section_returns_empty_results_when_no_peers(live_server) -> None:
+    server, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/config/camera/broadcast",
+        {"pos_x": 4.5},
+    )
+    assert status == 200
+    assert body.get("success") is True
+    assert body.get("local_updated") is True
+    assert body.get("peer_results") == []
+
+    saved = load_config(server.config_path)
+    assert saved.camera.pos_x == pytest.approx(4.5)
+
+
+def test_api_update_section_psn_ignores_psn_source_iface(live_server) -> None:
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.psn_source_iface = "eth0"
+    save_config(cfg, server.config_path)
+
+    status, body = _post_json(
+        base,
+        "/api/config/psn",
+        {
+            "psn_system_name": "Broadcast Stage",
+            "psn_source_iface": "wlan0",  # MUST NOT take effect locally
+        },
+    )
+    assert status == 200
+    assert body.get("success") is True
+
+    after = load_config(server.config_path)
+    # Local iface pin preserved.
+    assert after.psn_source_iface == "eth0"
+    # Non-device-local PSN fields applied as expected.
+    assert after.psn_system_name == "Broadcast Stage"
+
+
+def test_api_broadcast_section_psn_strips_iface_from_peer_payload(
+    live_server,
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from openfollow.web import routes as routes_mod
+
+    captured_payloads: list[dict] = []
+
+    def _fake_send(
+        ip: str, port: int, section: str, data: dict, pin: str = "", *, expected_port: int, sender: str
+    ) -> bool:
+        captured_payloads.append({"section": section, "data": dict(data), "sender": sender})
+        return True
+
+    monkeypatch.setattr(routes_mod, "_send_config_to_peer", _fake_send)
+
+    # Inject a fake peer so the broadcaster actually forwards.
+    server, base = live_server
+    fake_peer = SimpleNamespace(
+        name="fake-peer",
+        ip="10.0.0.99",
+        web_port=80,
+    )
+    monkeypatch.setattr(server, "get_peers", lambda: [fake_peer])
+
+    status, body = _post_json(
+        base,
+        "/api/config/psn/broadcast",
+        {
+            "psn_system_name": "Broadcasted",
+            "psn_mcast_ip": "236.10.10.10",
+            "psn_source_iface": "eth0",
+        },
+    )
+    assert status == 200
+    assert body.get("success") is True
+
+    # Local-apply path uses the unscrubbed data – broadcaster IS saving
+    # their own PSN form, so their local iface gets set.
+    after = load_config(server.config_path)
+    assert after.psn_source_iface == "eth0"
+    assert after.psn_system_name == "Broadcasted"
+
+    # Peer-forward payload had ``psn_source_iface`` stripped.
+    assert len(captured_payloads) == 1
+    sent = captured_payloads[0]
+    assert sent["section"] == "psn"
+    assert "psn_source_iface" not in sent["data"]
+    # Each peer keeps its own station name.
+    assert "psn_system_name" not in sent["data"]
+    assert sent["data"]["psn_mcast_ip"] == "236.10.10.10"
+    # Marked as a push from this station, under the name it now has.
+    assert sent["sender"] == "Broadcasted"
+
+
+def test_api_broadcast_section_returns_404_for_unknown_section(live_server) -> None:
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/config/no-such-section/broadcast",
+        {"x": 1},
+    )
+    assert status == 404
+    assert "error" in body
+
+
+def test_get_section_psn_partial_includes_local_ips(live_server) -> None:
+    """GET /section/psn must inject ``local_ips`` into the template – the
+    template needs the list to render the source-IP dropdown. A regression
+    here would render an empty selector."""
+    _, base = live_server
+    status, body = _get(base, "/section/psn")
+    assert status == 200
+    # Section template includes the PSN field labels.
+    assert "psn" in body.lower()
+
+
+def test_get_section_video_source_partial_includes_input_fragments(live_server) -> None:
+    """GET /section/video_source merges in plugin-provided HTML fragments
+    via ``_build_input_template_data`` – without that branch the per-input
+    config UI would never render."""
+    _, base = live_server
+    status, body = _get(base, "/section/video_source")
+    assert status == 200
+    # Must mention at least one registered input by name.
+    assert "rtsp" in body.lower() or "video" in body.lower()
+
+
+def test_update_grid_post_persists_and_renders_partial(live_server) -> None:
+    server, base = live_server
+    status, body = _post_form(
+        base,
+        "/section/grid",
+        {"width": "25", "depth": "15", "origin_visible": "on"},
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.grid.width == pytest.approx(25.0)
+    assert saved.grid.depth == pytest.approx(15.0)
+    assert saved.grid.origin_visible is True
+
+
+def test_update_grid_post_toggles_visible(live_server) -> None:
+    """The Show Grid checkbox: ticked -> True, omitted -> False. Omitting it
+    must hide the grid, not silently preserve the prior True default."""
+    server, base = live_server
+
+    status, _ = _post_form(base, "/section/grid", {"width": "25"})
+    assert status == 200
+    assert load_config(server.config_path).grid.visible is False
+
+    status, _ = _post_form(base, "/section/grid", {"width": "25", "visible": "on"})
+    assert status == 200
+    assert load_config(server.config_path).grid.visible is True
+
+
+def test_update_marker_post_persists_visual_booleans(live_server) -> None:
+    """POST /section/marker exercises the longest bool-fields list in the
+    routes module. Boxes ticked → True, omitted → False."""
+    server, base = live_server
+    status, _ = _post_form(
+        base,
+        "/section/marker",
+        {
+            "ball_visible": "on",
+            "crosshair_visible": "on",
+            # z_line + ground_circle + ground_circle_filled all omitted
+            # -> coerced to False.
+        },
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.marker.ball_visible is True
+    assert saved.marker.crosshair_visible is True
+    assert saved.marker.z_line is False
+    assert saved.marker.ground_circle is False
+
+
+def test_marker_form_accepts_the_former_z_line_checkbox_name(live_server) -> None:
+    """A page rendered before the rename posts the checkbox under its former name.
+
+    The bool fields are synthesised from what the form did *not* send, so without
+    translating first the synthesised ``False`` would win over the ticked box and
+    silently switch the line off - while the thickness beside it, not being a
+    bool, would translate and carry over. The two halves of one rename must not
+    disagree on the same POST.
+    """
+    server, base = live_server
+    status, _ = _post_form(
+        base,
+        "/section/marker",
+        {"drop_line": "on", "drop_line_thickness": "7"},
+    )
+    assert status == 200
+
+    saved = load_config(server.config_path)
+    assert saved.marker.z_line is True
+    assert saved.marker.z_line_thickness == 7
+
+
+def test_marker_save_preserves_invert_control_direction(live_server) -> None:
+    """``invert_control_direction`` lives on MarkerConfig but is rendered by the
+    *movement* section, so the marker (visuals) form never posts it. It must not
+    appear in this route's bool fields, or saving a visual toggle would silently
+    reverse the operator's controls."""
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.marker.invert_control_direction = True
+    save_config(cfg, server.config_path)
+
+    status, _ = _post_form(base, "/section/marker", {"ball_visible": "on"})
+    assert status == 200
+    assert load_config(server.config_path).marker.invert_control_direction is True
+
+
+def test_api_video_snapshot_returns_jpeg_when_provider_yields_bytes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Happy path for the preview snapshot endpoint: when a provider is
+    wired and returns bytes, the route returns image/jpeg with cache-busting
+    headers. Use a fresh ConfigWebServer (the live_server fixture wires no
+    snapshot provider)."""
+    monkeypatch.setattr(discovery_module.BeaconSender, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconSender, "stop", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "stop", lambda self: None)
+
+    config_path = tmp_path / "config.toml"
+    with live_on_free_port(
+        lambda port: ConfigWebServer(
+            config_path=str(config_path),
+            host="127.0.0.1",
+            port=port,
+            system_name="SnapTest",
+            preview_snapshot_provider=lambda: b"\xff\xd8\xff\xe0jpegbody",
+            full_snapshot_provider=lambda: b"\xff\xd8\xff\xe0fulljpeg",
+        )
+    ) as (_server, base):
+        with urllib.request.urlopen(f"{base}/api/video/snapshot", timeout=5) as r:
+            assert r.status == 200
+            assert r.headers.get("Content-Type", "").startswith("image/jpeg")
+            assert r.headers.get("Cache-Control") == "no-store"
+            assert r.read() == b"\xff\xd8\xff\xe0jpegbody"
+
+        with urllib.request.urlopen(f"{base}/api/video/snapshot/full", timeout=5) as r:
+            assert r.status == 200
+            assert r.headers.get("Content-Type", "").startswith("image/jpeg")
+            assert r.read() == b"\xff\xd8\xff\xe0fulljpeg"
+
+
+def test_api_wizard_solve_returns_camera_and_reprojected_corners(live_server) -> None:
+    """Happy-path DLT solve: four well-conditioned corner correspondences
+    yield a camera dict (pos/rot/fov) plus a reprojected corner array of
+    the same shape. Generate the screen corners by projecting through a
+    known camera pose so the DLT is guaranteed to succeed (a hand-picked
+    trapezoid can fall into the degenerate branch and return 422)."""
+    import numpy as np
+
+    from openfollow.scene.solver import project_points
+
+    _, base = live_server
+
+    img_w, img_h = 1280.0, 720.0
+    params = np.array([0.0, -10.0, 5.0, -28.0, 8.0, 1.0, 65.0], dtype=np.float64)
+    world = np.array(
+        [
+            [-5.0, -5.0, 0.0],
+            [5.0, -5.0, 0.0],
+            [5.0, 5.0, 0.0],
+            [-5.0, 5.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    screen = project_points(params, world, img_w, img_h)
+
+    status, body = _post_json(
+        base,
+        "/api/wizard/solve",
+        {
+            "world_corners": [list(p) for p in world],
+            "screen_corners": [list(p) for p in screen],
+            "image_width": img_w,
+            "image_height": img_h,
+        },
+    )
+    assert status == 200
+    assert "camera" in body
+    assert {"pos_x", "pos_y", "pos_z", "pitch", "yaw", "roll", "fov"}.issubset(set(body["camera"].keys()))
+    reprojected = body.get("reprojected_corners")
+    assert isinstance(reprojected, list)
+    assert len(reprojected) == 4
+
+
+def test_api_wizard_solve_returns_422_for_degenerate_corners(live_server) -> None:
+    """When the four screen corners can't be matched to a valid camera pose,
+    the route returns 422 with an "Invalid perspective" hint instead of
+    serving a NaN-laced camera dict the editor would render as garbage."""
+    _, base = live_server
+    # All four screen corners collapsed to a single point – the DLT
+    # has no perspective to fit.
+    status, body = _post_json(
+        base,
+        "/api/wizard/solve",
+        {
+            "world_corners": [
+                [-5.0, -5.0, 0.0],
+                [5.0, -5.0, 0.0],
+                [5.0, 5.0, 0.0],
+                [-5.0, 5.0, 0.0],
+            ],
+            "screen_corners": [
+                [640.0, 360.0],
+                [640.0, 360.0],
+                [640.0, 360.0],
+                [640.0, 360.0],
+            ],
+            "image_width": 1280,
+            "image_height": 720,
+        },
+    )
+    assert status == 422
+    assert "Invalid perspective" in str(body.get("error", ""))
+
+
+def test_api_wizard_unproject_single_point_returns_world_only(live_server) -> None:
+    """When only one screen point is sent, the route returns ``world_points``
+    but no ``delta`` (delta is meaningless for a single point). This is
+    the fall-through arm at the bottom of api_wizard_unproject."""
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/unproject",
+        {
+            "camera": _wizard_camera_payload(pos_z=5.0, pitch=-30.0),
+            "screen_points": [[960.0, 540.0]],
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 200
+    assert "world_points" in body
+    assert "delta" not in body
+
+
+def test_get_wizard_page_renders(live_server) -> None:
+    _, base = live_server
+    status, body = _get(base, "/wizard")
+    assert status == 200
+    assert len(body) > 200
+
+
+def test_api_broadcast_section_rejects_malformed_json(live_server) -> None:
+    _, base = live_server
+    req = urllib.request.Request(
+        f"{base}/api/config/camera/broadcast",
+        data=b"{not json",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+            body = json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        body = json.loads(e.read().decode() or "{}")
+    assert status == 400
+    assert "error" in body
+
+
+def test_api_wizard_unproject_rejects_malformed_json(live_server) -> None:
+    """Same _load_json_body short-circuit on the unproject route – without
+    this guard the route would 500 on the next ``data["camera"]`` deref."""
+    _, base = live_server
+    req = urllib.request.Request(
+        f"{base}/api/wizard/unproject",
+        data=b"\x00garbage",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+
+
+def test_api_wizard_solve_rejects_malformed_json(live_server) -> None:
+    """Same _load_json_body short-circuit on the solve route."""
+    _, base = live_server
+    req = urllib.request.Request(
+        f"{base}/api/wizard/solve",
+        data=b"not json at all",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+
+
+def test_api_wizard_solve_rejects_screen_corner_with_wrong_shape(live_server) -> None:
+    """A screen_corner that isn't [x, y] (e.g. [x, y, z]) must surface as
+    400 with an ``[x, y]`` hint – the world_corner-shape check fires
+    first only if both are malformed in the same payload."""
+    _, base = live_server
+    status, body = _post_json(
+        base,
+        "/api/wizard/solve",
+        {
+            "world_corners": [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
+            "screen_corners": [
+                [0, 0, 999],  # extra coord – must be rejected
+                [1, 0],
+                [1, 1],
+                [0, 1],
+            ],
+            "image_width": 1920,
+            "image_height": 1080,
+        },
+    )
+    assert status == 400
+    assert "[x, y]" in str(body.get("error", ""))
+
+
+def test_ndi_video_input_plugin_route_is_registered_and_callable(live_server) -> None:
+    from openfollow.video.inputs import get_registry
+
+    _, base = live_server
+
+    registry = get_registry()
+    if "ndi" not in registry:
+        pytest.skip("NDI input plugin not registered in this build")
+
+    status, body = _get(base, "/video-input/ndi/sources")
+    assert status == 200
+    # The handler renders an <option> for each discovered NDI source.
+    # Empty source lists still emit the placeholder option, so the
+    # tag presence is a stable assertion across hosts.
+    assert "<option" in body
+
+
+# ---------------------------------------------------------------------------
+# /api/validate/<section>/<field> – on-blur validation
+# ---------------------------------------------------------------------------
+
+
+def test_validate_endpoint_valid_returns_empty_body(live_server) -> None:
+    """A coercible value within bounds → 200 + empty body."""
+    _, base = live_server
+    status, body = _get(base, "/api/validate/camera/fov?fov=60")
+    assert status == 200
+    assert body == ""
+
+
+def test_validate_endpoint_invalid_returns_error_span(live_server) -> None:
+    """Out-of-range value → 200 + ``<span class="field-error-msg">…</span>``."""
+    _, base = live_server
+    status, body = _get(base, "/api/validate/camera/fov?fov=200")
+    assert status == 200
+    assert 'class="field-error-msg"' in body
+    assert "FOV" in body
+
+
+def test_validate_endpoint_type_error(live_server) -> None:
+    _, base = live_server
+    status, body = _get(base, "/api/validate/camera/fov?fov=wide")
+    assert status == 200
+    assert 'class="field-error-msg"' in body
+
+
+def test_validate_endpoint_advisory_note(live_server) -> None:
+    """Cross-field auto-correct surfaces as a ``field-note-msg`` span."""
+    _, base = live_server
+    status, body = _get(
+        base,
+        "/api/validate/movement/max_speed?max_speed=0.5&min_speed=2.0",
+    )
+    assert status == 200
+    assert 'class="field-note-msg"' in body
+    assert "Min Speed" in body
+
+
+def test_validate_endpoint_inference_size_snap_note(live_server) -> None:
+    _, base = live_server
+    status, body = _get(
+        base,
+        "/api/validate/detection/inference_size?inference_size=200",
+    )
+    assert status == 200
+    assert 'class="field-note-msg"' in body
+
+
+def _get_checked(base: str, path: str, query: dict[str, str]) -> tuple[str, dict | None]:
+    """Body plus the ``bindingChecked`` event of an ``HX-Trigger`` header, if any."""
+    with urllib.request.urlopen(f"{base}{path}?{urllib.parse.urlencode(query)}", timeout=5) as r:
+        header = r.headers.get("HX-Trigger")
+        return r.read().decode(), (json.loads(header)["bindingChecked"] if header else None)
+
+
+def test_validate_binding_takes_a_shared_button_and_names_both_fields(live_server) -> None:
+    _, base = live_server
+    body, event = _get_checked(
+        base, "/api/validate/gamepad/btn_reset", {"btn_reset": "Y", "btn_toggle_help": "Y", "btn_settings": "BACK"}
+    )
+    assert 'class="field-note-msg"' in body
+    assert "Y taken from Toggle Help" in body
+    assert event["field"] == "btn_reset"
+    [moved] = event["moved"]
+    assert (moved["field"], moved["unbound"]) == ("btn_toggle_help", "")
+    assert 'class="field-warn-msg"' in moved["html"]
+    assert "Y moved to Reset Marker" in moved["html"]
+    assert 'data-moved-to="btn_reset"' in moved["html"]
+    assert 'data-lost-text="Y was taken"' in moved["html"]
+
+
+@pytest.mark.parametrize(
+    ("path", "query"),
+    [
+        ("/api/validate/gamepad/btn_reset", {"btn_reset": "START", "btn_toggle_help": "Y"}),
+        ("/api/validate/gamepad/btn_menu_cancel", {"btn_menu_cancel": "B", "btn_toggle_zones": "B"}),
+    ],
+)
+def test_validate_binding_without_a_clash_takes_nothing(live_server, path: str, query: dict[str, str]) -> None:
+    _, base = live_server
+    body, event = _get_checked(base, path, query)
+    assert body == ""
+    assert event["moved"] == []
+
+
+def test_validate_binding_key_takes_the_key(live_server) -> None:
+    _, base = live_server
+    body, event = _get_checked(base, "/api/validate/keyboard/key_reset", {"key_reset": "h", "key_toggle_help": "h"})
+    assert "H taken from Toggle Help" in body
+    assert event["moved"][0]["field"] == "key_toggle_help"
+
+
+def test_validate_binding_invalid_key_is_an_error_and_takes_nothing(live_server) -> None:
+    _, base = live_server
+    body, event = _get_checked(base, "/api/validate/keyboard/key_reset", {"key_reset": "w", "key_toggle_help": "w"})
+    assert 'class="field-error-msg"' in body
+    assert event is None
+
+
+def test_validate_binding_mouse3d_button_takes_the_index(live_server) -> None:
+    _, base = live_server
+    body, event = _get_checked(
+        base, "/api/validate/mouse3d/btn_reset", {"btn_reset": "0", "btn_next_marker": "0", "btn_prev_marker": "1"}
+    )
+    assert "Button 0 taken from Next marker" in body
+    assert [m["field"] for m in event["moved"]] == ["btn_next_marker"]
+
+
+def test_validate_fader_stick_on_the_move_stick_is_an_error(live_server) -> None:
+    _, base = live_server
+    body, event = _get_checked(
+        base, "/api/validate/gamepad/marker_fader_stick", {"marker_fader_stick": "left_y", "move_xy_stick": "left"}
+    )
+    assert 'class="field-error-msg"' in body
+    assert "Left Stick moves the marker (Move X/Y)." in body
+    assert event is None
+
+
+def test_validate_move_stick_takes_the_fader_stick(live_server) -> None:
+    _, base = live_server
+    body, event = _get_checked(
+        base, "/api/validate/gamepad/move_xy_stick", {"move_xy_stick": "right", "marker_fader_stick": "right_y"}
+    )
+    assert "Right Stick Y taken from Marker fader stick" in body
+    assert event["moved"][0]["field"] == "marker_fader_stick"
+    assert "Right Stick Y moved to Move X/Y" in event["moved"][0]["html"]
+
+
+def test_validate_move_stick_leaving_the_fader_stick_rechecks_it(live_server) -> None:
+    _, base = live_server
+    body, event = _get_checked(
+        base, "/api/validate/gamepad/move_xy_stick", {"move_xy_stick": "right", "marker_fader_stick": "left_y"}
+    )
+    assert body == ""
+    assert event == {"field": "move_xy_stick", "moved": [], "recheck": ["marker_fader_stick"]}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "caution"),
+    [
+        ("trigger.button", "B", "Also 'Toggle Zone Overlay' on gamepad input"),
+        ("trigger.button", "A", ""),
+        ("trigger.key", "x", "Also 'Reset Marker' on keyboard input"),
+        ("trigger.key", "p", ""),
+    ],
+)
+def test_validate_osc_trigger_on_an_action_input_is_a_caution(
+    live_server, field: str, value: str, caution: str
+) -> None:
+    _, base = live_server
+    status, body = _get(base, f"/api/validate/osc_binding/{field}?{urllib.parse.urlencode({field: value})}")
+    assert status == 200
+    if caution:
+        assert 'class="field-caution-msg"' in body
+        assert caution in html.unescape(body)
+    else:
+        assert body == ""
+
+
+def test_validate_osc_trigger_ignores_a_switched_off_gamepad(live_server, tmp_path) -> None:
+    config = AppConfig()
+    config.controller.enabled = False
+    save_config(config, str(tmp_path / "config.toml"))
+    _, base = live_server
+    _status, body = _get(base, "/api/validate/osc_binding/trigger.button?trigger.button=B")
+    assert body == ""
+
+
+def test_validate_endpoint_unknown_section_returns_404(live_server) -> None:
+    _, base = live_server
+    status, _body = _get(base, "/api/validate/nope/fov?fov=60")
+    assert status == 404
+
+
+def test_validate_endpoint_unknown_field_returns_404(live_server) -> None:
+    _, base = live_server
+    status, _body = _get(base, "/api/validate/camera/unknown?unknown=1")
+    assert status == 404
+
+
+def test_validate_endpoint_html_escapes_error_text(live_server) -> None:
+    """Error copy is HTML-escaped so injected markup can't break the swap."""
+    _, base = live_server
+    # ``detection/model`` has a max_len rule, so an over-long value trips an
+    # error whose text is HTML-escaped before it lands in the swap target.
+    status, body = _get(
+        base,
+        "/api/validate/detection/model?model=" + ("x" * 600),
+    )
+    assert status == 200
+    assert "<script>" not in body
+
+
+def test_validate_endpoint_requires_auth(pin_protected_server) -> None:
+    _, base, _pin = pin_protected_server
+    status, _body = _get(base, "/api/validate/camera/fov?fov=60")
+    assert status == 401
+
+
+def test_validate_reuses_request_scoped_config_cache(live_server) -> None:
+    _, base = live_server
+    status, body = _get(
+        base,
+        "/api/validate/general/update_service_name?update_service_name=openfollow",
+    )
+    assert status == 200
+    # A valid service name passes – the response body is empty (no error span).
+    assert body == ""
+
+
+def test_get_handler_parses_config_once_per_request(live_server, monkeypatch) -> None:
+    """GET handlers reuse request-scoped config cache to parse config exactly once per request."""
+    import openfollow.web.routes as routes_mod
+
+    calls: list[str] = []
+    real_load = routes_mod.load_config
+
+    def _counting(path, *a, **k):
+        calls.append(path)
+        return real_load(path, *a, **k)
+
+    monkeypatch.setattr(routes_mod, "load_config", _counting)
+    _, base = live_server
+    calls.clear()
+    status, _ = _get(base, "/")
+    assert status == 200
+    # ``_check_auth`` (before_request) parses once and caches on the request
+    # environ; ``index`` reuses that instead of a second parse.
+    assert len(calls) == 1
+
+
+def test_marker_catalog_parses_config_once_per_request(
+    live_server,
+    monkeypatch,
+) -> None:
+    import openfollow.web.routes as routes_mod
+
+    calls: list[str] = []
+    real_load = routes_mod.load_config
+
+    def _counting(path, *a, **k):
+        calls.append(path)
+        return real_load(path, *a, **k)
+
+    monkeypatch.setattr(routes_mod, "load_config", _counting)
+    _, base = live_server
+    calls.clear()
+    status, _ = _get(base, "/api/markers/catalog")
+    assert status == 200
+    # before_request parses + caches; the catalog handler reuses that cache.
+    assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# ``/api/validate/zone/<field>`` endpoints serve the four per-zone OSC address fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "osc_address_first_entry",
+        "osc_address_additional_entry",
+        "osc_address_partial_exit",
+        "osc_address_final_exit",
+    ],
+)
+def test_validate_zone_osc_field_valid_returns_empty(live_server, field) -> None:
+    _, base = live_server
+    status, body = _get(
+        base,
+        f"/api/validate/zone/{field}?{field}=/zone/enter",
+    )
+    assert status == 200
+    assert body == ""
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "osc_address_first_entry",
+        "osc_address_additional_entry",
+        "osc_address_partial_exit",
+        "osc_address_final_exit",
+    ],
+)
+def test_validate_zone_osc_field_quoted_args_valid(live_server, field) -> None:
+    """Quoted args (e.g. /cmd "Go Cue 1" 1.5) pass blur validation."""
+    _, base = live_server
+    raw = '/cmd "Go Cue 1" 1.5'
+    status, body = _get(
+        base,
+        f"/api/validate/zone/{field}?{field}=" + urllib.parse.quote(raw, safe=""),
+    )
+    assert status == 200
+    assert body == ""
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "osc_address_first_entry",
+        "osc_address_additional_entry",
+        "osc_address_partial_exit",
+        "osc_address_final_exit",
+    ],
+)
+def test_validate_zone_osc_field_unclosed_quote_returns_error(
+    live_server,
+    field,
+) -> None:
+    """Unclosed quote → ``field-error-msg`` so the JS handler can flip
+    aria-invalid and surface the message inline."""
+    _, base = live_server
+    raw = '/cmd "unclosed'
+    status, body = _get(
+        base,
+        f"/api/validate/zone/{field}?{field}=" + urllib.parse.quote(raw, safe=""),
+    )
+    assert status == 200
+    assert 'class="field-error-msg"' in body
+    assert "Unclosed quote" in body
+
+
+def test_validate_zone_unknown_field_returns_404(live_server) -> None:
+    """A field not in ``FIELD_RULES["zone"]`` (e.g. ``name``) returns
+    404. The JS hookup only attaches blur handlers to the four registered
+    OSC address fields, so this only catches a future drift where a new
+    field name lands in the JS without a matching FIELD_RULES entry."""
+    _, base = live_server
+    status, _body = _get(base, "/api/validate/zone/name?name=foo")
+    assert status == 404
+
+
+# ===========================================================================
+# Privilege broker web surface (modal, submit, cancel, install)
+# ===========================================================================
+
+
+def test_privilege_password_modal_renders_empty_when_idle(live_server) -> None:
+    """The polling GET returns an empty partial when no broker call is
+    parked – the global modal container in base.tpl then renders no
+    overlay."""
+    _server, base = live_server
+    status, body = _get(base, "/system/privilege/password/modal")
+    assert status == 200
+    # Empty partial = no input element, no submit button.
+    assert "privilege-password-input" not in body
+
+
+def test_privilege_password_modal_renders_when_pending(live_server) -> None:
+    server, base = live_server
+    server._command_queue.request_privilege_password(
+        reason="Apply network changes",
+        capability_name="network.nm.con_mod",
+    )
+    status, body = _get(base, "/system/privilege/password/modal")
+    assert status == 200
+    assert "privilege-password-input" in body
+    assert "Apply network changes" in body
+
+
+def test_privilege_password_submit_forwards_to_queue(live_server) -> None:
+    server, base = live_server
+    server._command_queue.request_privilege_password(
+        reason="x",
+        capability_name="y",
+    )
+    status, _body = _post_form(
+        base,
+        "/system/privilege/password",
+        {"password": "hunter2"},
+    )
+    assert status == 200
+    assert server._command_queue.consume_privilege_password(timeout=0.5) == "hunter2"
+
+
+def test_privilege_password_submit_empty_is_treated_as_cancel(live_server) -> None:
+    server, base = live_server
+    server._command_queue.request_privilege_password(
+        reason="x",
+        capability_name="y",
+    )
+    status, _body = _post_form(
+        base,
+        "/system/privilege/password",
+        {"password": ""},
+    )
+    assert status == 200
+    assert server._command_queue.consume_privilege_password(timeout=0.5) is None
+
+
+def test_privilege_password_submit_noop_when_no_prompt(live_server) -> None:
+    server, base = live_server
+    status, _body = _post_form(
+        base,
+        "/system/privilege/password",
+        {"password": "hunter2"},
+    )
+    assert status == 200
+    # Now request a prompt and verify the consume is empty (nothing
+    # was leaked from the prior submit).
+    server._command_queue.request_privilege_password(
+        reason="x",
+        capability_name="y",
+    )
+    assert server._command_queue.consume_privilege_password(timeout=0.05) is None
+
+
+def test_privilege_password_cancel_route_wakes_worker(live_server) -> None:
+    server, base = live_server
+    server._command_queue.request_privilege_password(
+        reason="x",
+        capability_name="y",
+    )
+    status, _body = _post_form(base, "/system/privilege/password/cancel", {})
+    assert status == 200
+    assert server._command_queue.consume_privilege_password(timeout=0.5) is None
+
+
+def test_privilege_password_cancel_noop_when_idle(live_server) -> None:
+    """Cancel with no pending prompt is a no-op – guards against a
+    stray browser click clobbering a future prompt's state."""
+    _server, base = live_server
+    status, body = _post_form(base, "/system/privilege/password/cancel", {})
+    assert status == 200
+    # Empty partial body since pending=None.
+    assert "privilege-password-input" not in body
+
+
+def test_general_network_state_route_returns_partial(live_server) -> None:
+    """Network sub-section polls /section/general/network_state every 5s, keeping PIN input intact."""
+    _server, base = live_server
+    status, body = _get(base, "/section/general/network_state")
+    assert status == 200
+    # The partial renders the unavailable banner when no state
+    # provider is wired (the live_server fixture doesn't pass one),
+    # so we assert on that – the contract is "always 200, always
+    # the partial shape" regardless of provider availability.
+    assert "Network state unavailable" in body or "network-state-card" in body
+
+
+# ---------------------------------------------------------------------------
+# CSRF / DNS-rebind: Origin/Host check on state-changing requests
+# ---------------------------------------------------------------------------
+
+
+def _post_status_with_headers(base, path, *, extra_headers, method="POST", data=b"{}"):
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=data,
+        headers={"Content-Type": "application/json", **extra_headers},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def test_csrf_foreign_origin_on_post_is_refused(pin_protected_server) -> None:
+    """A state-changing POST carrying a foreign Origin (cross-site / DNS-
+    rebind) is rejected 403 before the cookie check."""
+    _, base, _ = pin_protected_server
+    status = _post_status_with_headers(base, "/api/restart", extra_headers={"Origin": "http://evil.example.com"})
+    assert status == 403
+
+
+def test_csrf_foreign_referer_on_post_is_refused(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    status = _post_status_with_headers(base, "/api/restart", extra_headers={"Referer": "http://evil.example.com/x"})
+    assert status == 403
+
+
+def test_csrf_absent_origin_falls_through_to_auth(pin_protected_server) -> None:
+    """No Origin/Referer (non-browser client) → Host check skipped, request
+    reaches the cookie gate (401 without a cookie), NOT 403."""
+    _, base, _ = pin_protected_server
+    assert _post_status_with_headers(base, "/api/restart", extra_headers={}) == 401
+
+
+def test_csrf_device_origin_allowed_reaches_auth(pin_protected_server) -> None:
+    """An Origin naming the device itself (loopback) passes the Host check
+    and reaches the cookie gate (401), not 403."""
+    _, base, _ = pin_protected_server
+    assert _post_status_with_headers(base, "/api/restart", extra_headers={"Origin": base}) == 401
+
+
+def test_csrf_origin_null_treated_as_absent(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    assert _post_status_with_headers(base, "/api/restart", extra_headers={"Origin": "null"}) == 401
+
+
+def test_csrf_unparseable_origin_treated_as_absent(pin_protected_server) -> None:
+    """An invalid-IPv6 Origin makes ``urlsplit().hostname`` raise ValueError →
+    treated as no Origin (allowed through to the cookie gate)."""
+    _, base, _ = pin_protected_server
+    assert _post_status_with_headers(base, "/api/restart", extra_headers={"Origin": "http://[::1]bad:80"}) == 401
+
+
+def test_csrf_safe_method_ignores_foreign_origin(pin_protected_server) -> None:
+    """GET (safe method) is never Host-gated; a foreign Origin on a read must
+    not 403 – it falls through to normal auth (401)."""
+    _, base, _ = pin_protected_server
+    status = _post_status_with_headers(
+        base, "/api/config", extra_headers={"Origin": "http://evil.example.com"}, method="GET", data=None
+    )
+    assert status != 403
+
+
+# ---------------------------------------------------------------------------
+# A change made through a name the station does not accept
+# ---------------------------------------------------------------------------
+
+_REFUSED_ORIGIN = "http://station.example.com"
+_REFUSED_SENTENCE = "This station does not accept changes made through station.example.com."
+
+
+def _raw_request(base, path, *, headers, method="POST", data=b""):
+    req = urllib.request.Request(
+        f"{base}{path}", data=None if method == "GET" else data, headers=headers, method=method
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode(), dict(r.headers.items())
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(), dict(e.headers.items())
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"HX-Request": "true", "Sec-Fetch-Mode": "navigate", "Accept": "text/html"},
+        {"Sec-Fetch-Mode": "cors", "Accept": "text/html"},
+        {"Accept": "*/*"},
+    ],
+    ids=["htmx", "fetch", "no-fetch-metadata"],
+)
+def test_a_scripted_change_through_an_unaccepted_name_is_refused_with_the_reason(live_server, headers) -> None:
+    server, base = live_server
+    status, body, response_headers = _raw_request(base, "/api/restart", headers={"Origin": _REFUSED_ORIGIN, **headers})
+    assert status == 403
+    assert response_headers["Content-Type"].startswith("application/json")
+    # The test server is reached over loopback, which is no address to offer a browser.
+    assert json.loads(body) == {"error": _REFUSED_SENTENCE, "action": "Open it by its IP address.", "href": None}
+    assert server.check_restart_requested() is False
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{"Sec-Fetch-Mode": "navigate", "Accept": "text/html"}, {"Accept": "text/html,application/xhtml+xml"}],
+    ids=["fetch-metadata", "accept-only"],
+)
+def test_a_plain_form_post_through_an_unaccepted_name_gets_a_page_saying_why(live_server, headers) -> None:
+    _, base = live_server
+    status, body, response_headers = _raw_request(base, "/logout", headers={"Origin": _REFUSED_ORIGIN, **headers})
+    assert status == 403
+    assert response_headers["Content-Type"].startswith("text/html")
+    assert _REFUSED_SENTENCE in body
+    assert "Settings here can be viewed but not saved." in body
+    assert "<h2>Not saved</h2>" in body
+
+
+def test_saves_through_the_configured_fqdn_work_from_the_next_request(live_server) -> None:
+    """The name is read from the config on every request, so it takes effect without a
+    restart, and it opens exactly that one name, not every name."""
+    server, base = live_server
+    form = {"HX-Request": "true", "Content-Type": "application/x-www-form-urlencoded"}
+    rename = urllib.parse.urlencode({"psn_system_name": "Stage Left"}).encode()
+    via_fqdn = {**form, "Origin": "http://of-1.stage.example.com"}
+
+    assert _raw_request(base, "/section/general", headers=via_fqdn, data=rename)[0] == 403
+
+    name_it = urllib.parse.urlencode({"station_fqdn": "Of-1.Stage.Example.COM."}).encode()
+    assert _raw_request(base, "/section/general", headers={**form, "Origin": base}, data=name_it)[0] == 200
+    assert load_config(server.config_path).station_fqdn == "of-1.stage.example.com"
+
+    assert _raw_request(base, "/section/general", headers=via_fqdn, data=rename)[0] == 200
+    assert load_config(server.config_path).psn_system_name == "Stage Left"
+    elsewhere = {**form, "Origin": _REFUSED_ORIGIN}
+    assert _raw_request(base, "/section/general", headers=elsewhere, data=rename)[0] == 403
+
+
+def test_the_fqdn_field_is_saved_and_redrawn_with_the_station_settings_form(live_server) -> None:
+    """It sits in Advanced Settings, outside the name and PIN form: ``form=`` puts it in
+    that form's POST, and the form re-renders the field's group out of band."""
+    server, base = live_server
+    save_config(AppConfig(station_fqdn="of-1.stage.example.com"), server.config_path)
+    status, body = _get(base, "/")
+    assert status == 200
+    form = re.search(r'<form id="general-network-section"[^>]*>', body)
+    assert form is not None
+    assert 'hx-select-oob="#general-station-fqdn-row"' in form.group(0)
+    group = body[body.index('id="general-station-fqdn-row"') :]
+    field = re.search(r'<input id="general-station-fqdn"[^>]*>', group)
+    assert field is not None
+    assert 'form="general-network-section"' in field.group(0)
+    assert 'value="of-1.stage.example.com"' in field.group(0)
+    assert body.index('id="general-station-fqdn-row"') > body.index("<summary>Advanced Settings</summary>")
+    assert '<button type="submit" form="general-network-section" class="save-btn">Save</button>' in body
+
+
+@pytest.mark.parametrize(
+    ("posted", "reason"),
+    [
+        ("of-1", "Enter the full name with its domain, such as of-1.stage.example.com."),
+        ("of-1.local", "Names under .local are mDNS names, and the station already answers to its own."),
+        (".", "Enter the full name with its domain, such as of-1.stage.example.com."),
+    ],
+    ids=["one-label", "mdns", "root-only"],
+)
+def test_a_refused_fqdn_fails_the_whole_save_and_says_why(live_server, posted: str, reason: str) -> None:
+    """Quietly keeping the stored name re-rendered the field with it and wiped the error, so
+    a Save clicked before the blur check answered read as the station rewriting the name."""
+    server, base = live_server
+    save_config(AppConfig(station_fqdn="of-1.stage.example.com"), server.config_path)
+    form = {"HX-Request": "true", "Content-Type": "application/x-www-form-urlencoded", "Origin": base}
+    body = urllib.parse.urlencode({"psn_system_name": "Stage Left", "station_fqdn": posted}).encode()
+    status, text, headers = _raw_request(base, "/section/general", headers=form, data=body)
+    assert status == 422
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(text) == {"error": f"Custom domain name: {reason}", "action": ""}
+    stored = load_config(server.config_path)
+    assert (stored.station_fqdn, stored.psn_system_name) == ("of-1.stage.example.com", AppConfig().psn_system_name)
+
+
+def test_the_station_settings_box_rings_on_save_not_just_its_name_form(live_server) -> None:
+    """Save writes the FQDN from Advanced Settings too, so the green or red ring has to go
+    around the box that holds it: the name and PIN form must not be a ring box of its own."""
+    _, base = live_server
+    _, body = _get(base, "/")
+    form = re.search(r'<form id="general-network-section"[^>]*>', body)
+    assert form is not None
+    assert "save-flash" not in form.group(0)
+    box_start = body.rindex('<div class="section"', 0, form.start())
+    box_end = body.find('<div class="section"', form.end())
+    box = body[box_start : box_end if box_end != -1 else len(body)]
+    assert 'data-help="general-station"' in box[:300]
+    assert 'id="general-station-fqdn"' in box
+    assert '<button type="submit" form="general-network-section" class="save-btn">Save</button>' in box
+
+
+def test_station_settings_never_wait_on_interface_state(live_server, monkeypatch) -> None:
+    """Reading every interface's state cost each Save a few hundred milliseconds on a station,
+    and the General tab renders nothing from it: the Network block fetches its own."""
+    server, base = live_server
+    reads: list[str] = []
+    monkeypatch.setattr(server, "get_network_state", lambda: reads.append("read"))
+    form = {"HX-Request": "true", "Content-Type": "application/x-www-form-urlencoded", "Origin": base}
+    rename = urllib.parse.urlencode({"psn_system_name": "Stage Left"}).encode()
+    assert _raw_request(base, "/section/general", headers=form, data=rename)[0] == 200
+    assert _get(base, "/section/general")[0] == 200
+    assert _get(base, "/")[0] == 200
+    assert reads == []
+
+
+@pytest.mark.parametrize(
+    ("hostname", "shown"), [("openfollow-noble-bear", 'value="openfollow-noble-bear.local"'), ("localhost", 'value=""')]
+)
+def test_the_mdns_address_is_shown_beside_the_custom_domain_name(
+    live_server, monkeypatch, hostname: str, shown: str
+) -> None:
+    """Read-only, and the running hostname's: the name avahi answers on, not the slug the config asks for."""
+    monkeypatch.setattr("openfollow.privilege.device_repair.current_hostname", lambda: hostname)
+    _, base = live_server
+    _, body = _get(base, "/")
+    row = body[body.index('id="general-station-fqdn-row"') : body.index('id="general-station-fqdn"')]
+    field = re.search(r'<input id="general-mdns-address"[^>]*>', row)
+    assert field is not None
+    assert shown in field.group(0)
+    assert "disabled" in field.group(0) and "name=" not in field.group(0)
+
+
+def test_the_station_settings_box_draws_no_rules_inside(live_server) -> None:
+    """A ``.group`` draws a rule under itself unless it is the last in its container, so each
+    of the box's three containers (name and PIN, display units, Advanced Settings) holds one."""
+    _, base = live_server
+    _, body = _get(base, "/")
+    start = body.index('data-fold-key="general-station"')
+    box = body[start : body.find('<div class="section"', start)]
+    assert box.count('class="group"') == 3
+    assert "group--divider" not in box
+
+
+def test_the_save_ring_outlives_its_animation(live_server) -> None:
+    """Removing ``saved`` before ``flash-green`` ends makes the ring jump to its end state."""
+    _, base = live_server
+    _, body = _get(base, "/")
+    animation_s = float(re.search(r"\.save-flash\.saved \{ animation: flash-green ([0-9.]+)s; \}", body).group(1))
+    settle = body[body.index("htmx:afterSettle', (e) =>") :]
+    delay_ms = int(re.search(r"ring\.classList\.remove\('saved'\); \}, (\d+)\);", settle).group(1))
+    assert delay_ms > animation_s * 1000
+
+
+@pytest.mark.parametrize(("fqdn", "shown"), [("of-1.stage.example.com", True), ("", False)])
+def test_what_dhcp_could_not_do_is_shown_under_the_custom_domain_name(live_server, fqdn: str, shown: bool) -> None:
+    server, base = live_server
+    save_config(AppConfig(station_fqdn=fqdn), server.config_path)
+    server._station_fqdn_problems_provider = lambda: ("Profile 'Wired connection 1' was not updated.",)
+    _, body = _get(base, "/")
+    row = body[
+        body.index('id="general-station-fqdn-row"') : body.index(
+            '<div class="row">', body.index('id="general-station-fqdn-row"')
+        )
+    ]
+    assert ("Not every interface sends this name by DHCP." in row) is shown
+    assert ("Profile &#039;Wired connection 1&#039; was not updated." in row) is shown
+
+
+def test_a_failing_dhcp_problems_provider_costs_nothing(live_server) -> None:
+    server, base = live_server
+
+    def _boom() -> tuple[str, ...]:
+        raise RuntimeError("services gone")
+
+    server._station_fqdn_problems_provider = _boom
+    assert server.get_station_fqdn_problems() == ()
+    assert _get(base, "/")[0] == 200
+
+
+def test_a_refused_unlock_says_why_on_the_login_page(pin_protected_server) -> None:
+    _, base, pin = pin_protected_server
+    status, body, response_headers = _raw_request(
+        base,
+        "/login",
+        headers={
+            "Origin": _REFUSED_ORIGIN,
+            "Sec-Fetch-Mode": "navigate",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data=urllib.parse.urlencode({"pin": pin}).encode(),
+    )
+    assert status == 403
+    assert f"Not logged in. {_REFUSED_SENTENCE}" in body
+    assert "You can&#039;t log in or save here." in body
+    assert "Set-Cookie" not in response_headers
+
+
+def _refused_login_post(tmp_path, declared_length: int | str, body: bytes) -> tuple[str, io.BytesIO]:
+    """POST the login form through a refused name straight into the WSGI app."""
+    server = ConfigWebServer(config_path=str(tmp_path / "config.toml"))
+    stream = io.BytesIO(body)
+    environ: dict[str, object] = {}
+    wsgiref.util.setup_testing_defaults(environ)
+    environ.update(
+        {
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/login",
+            "CONTENT_TYPE": "application/x-www-form-urlencoded",
+            "CONTENT_LENGTH": str(declared_length),
+            "HTTP_ORIGIN": _REFUSED_ORIGIN,
+            "HTTP_SEC_FETCH_MODE": "navigate",
+            "SERVER_ADDR": "192.0.2.10",
+            "wsgi.input": stream,
+        }
+    )
+    status: list[str] = []
+    b"".join(server._app(environ, lambda s, _headers, _exc=None: status.append(s)))
+    return status[0], stream
+
+
+def test_a_refusal_reads_the_body_first_so_closing_does_not_reset_its_answer(tmp_path) -> None:
+    # Closing a connection with unread request data resets it, which can drop
+    # the refusal before the browser reads it.
+    body = b"pin=sekret"
+    status, stream = _refused_login_post(tmp_path, len(body), body)
+    assert status.startswith("403")
+    assert stream.tell() == len(body)
+
+
+def test_a_refusal_does_not_read_a_body_past_the_pre_auth_cap(tmp_path) -> None:
+    status, stream = _refused_login_post(tmp_path, peer_auth.MAX_SIGNED_BODY_SIZE + 1, b"pin=sekret")
+    assert status.startswith("403")
+    assert stream.tell() == 0
+
+
+@pytest.mark.parametrize("declared", ["abc", "", "-5"])
+def test_a_refusal_with_a_missing_or_malformed_length_still_refuses(tmp_path, declared: str) -> None:
+    status, stream = _refused_login_post(tmp_path, declared, b"pin=sekret")
+    assert status.startswith("403")
+    assert stream.tell() == 0
+
+
+def test_the_refused_name_is_escaped(live_server) -> None:
+    _, base = live_server
+    status, body, _ = _raw_request(
+        base, "/logout", headers={"Origin": "http://a<b>.example", "Sec-Fetch-Mode": "navigate"}
+    )
+    assert status == 403
+    assert "made through a&lt;b&gt;.example." in body
+    assert "a<b>.example" not in body
+
+
+@pytest.mark.parametrize("path", ["/", "/wizard", "/about"])
+def test_a_page_opened_through_an_unaccepted_name_warns_before_any_edit(live_server, path: str) -> None:
+    _, base = live_server
+    port = base.rsplit(":", 1)[1]
+    status, body, _ = _raw_request(base, path, method="GET", headers={"Host": f"station.example.com:{port}"})
+    assert status == 200
+    assert _REFUSED_SENTENCE in body
+    assert "Settings here can be viewed but not saved." in body
+
+
+@pytest.mark.parametrize("path", ["/", "/wizard", "/about"])
+def test_a_page_opened_by_its_address_carries_no_warning(live_server, path: str) -> None:
+    _, base = live_server
+    status, body = _get(base, path)
+    assert status == 200
+    assert "does not accept changes made through" not in body
+
+
+def test_the_login_page_warns_before_the_pin_is_typed(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    port = base.rsplit(":", 1)[1]
+    status, body, _ = _raw_request(base, "/login", method="GET", headers={"Host": f"station.example.com:{port}"})
+    assert status == 200
+    assert _REFUSED_SENTENCE in body
+    assert "You can&#039;t log in or save here." in body
+
+
+def test_an_incorrect_pin_still_says_so(pin_protected_server) -> None:
+    _, base, _ = pin_protected_server
+    status, body = _post_form(base, "/login", {"pin": "wrong"})
+    assert status == 200
+    assert "Incorrect PIN" in body
+
+
+def test_every_page_loads_the_failed_save_script(live_server) -> None:
+    _, base = live_server
+    _, page = _get(base, "/")
+    assert '<script src="/assets/js/save-feedback.js?v=' in page
+    req = urllib.request.Request(f"{base}/assets/js/save-feedback.js")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        assert "javascript" in r.headers["Content-Type"]
+        script = r.read().decode()
+    # Every non-GET HTMX request reports a refusal and a request that got no answer.
+    for hook in ("htmx:responseError", "htmx:sendError", "window.OpenFollow.saveError"):
+        assert hook in script
+
+
+# ---------------------------------------------------------------------------
+# Media Gallery management routes (/video-input/testpattern/*)
+# ---------------------------------------------------------------------------
+
+_GP = "/video-input/testpattern"
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+_GIF = b"GIF89a" + b"\x00" * 10
+_JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 12
+
+
+def _post_bytes(base: str, path: str, data: bytes) -> tuple[int, str]:
+    req = urllib.request.Request(
+        f"{base}{path}",
+        data=data,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+
+
+def _get_raw(base: str, path: str) -> tuple[int, bytes]:
+    try:
+        with urllib.request.urlopen(f"{base}{path}", timeout=5) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+@pytest.fixture()
+def gallery_server(live_server, tmp_path, monkeypatch):
+    """A live server with the media store pointed at a temp dir and the
+    GStreamer decode/probe seams mocked, so uploads need no real pipeline."""
+    from openfollow.video import media_store
+
+    server, base = live_server
+    media_dir = tmp_path / "gallery-media"
+    monkeypatch.setattr(media_store, "resolve_media_storage_path", lambda: media_dir)
+    monkeypatch.setattr(media_store, "_render_jpeg", lambda src, *, max_dim: b"\xff\xd8\xff" + str(max_dim).encode())
+    monkeypatch.setattr(
+        media_store,
+        "_probe_video",
+        lambda src: media_store.VideoProbe("vp8", 1280, 720, 30.0, 10.0),
+    )
+    return server, base, media_dir
+
+
+def _user_files(media_dir) -> list:
+    return sorted(p.name for p in media_dir.glob("*.jpg") if ".thumb." not in p.name) if media_dir.is_dir() else []
+
+
+def test_gallery_list_shows_defaults(gallery_server) -> None:
+    _, base, _ = gallery_server
+    status, body = _get(base, f"{_GP}/list")
+    assert status == 200
+    assert 'id="gallery-grid"' in body
+    assert "Stage" in body and "Grey" in body
+    assert "gallery-label" not in body  # no visible per-tile labels
+    assert 'title="Stage"' in body  # name kept as hover/aria name only
+
+
+def test_gallery_select_persists(gallery_server) -> None:
+    server, base, _ = gallery_server
+    status, body = _post_form(base, f"{_GP}/select", {"media_id": "default:grey"})
+    assert status == 200
+    assert load_config(server.config_path).testpattern_selected_media == "default:grey"
+
+
+def test_gallery_select_unknown_rejected(gallery_server) -> None:
+    server, base, _ = gallery_server
+    status, _body = _post_form(base, f"{_GP}/select", {"media_id": "ffffffffffffffff"})
+    assert status == 400
+    assert load_config(server.config_path).testpattern_selected_media == "default:stage"  # unchanged
+
+
+def test_gallery_grid_highlights_stage_when_selection_unresolvable(gallery_server) -> None:
+    # A stored selection that no longer resolves (deleted item / hand-edited
+    # config) plays Stage at runtime, so the grid must mark the Stage tile
+    # selected rather than leave nothing highlighted (UI vs active-source drift).
+    server, base, _ = gallery_server
+    cfg = load_config(server.config_path)
+    cfg.testpattern_selected_media = "ffffffffffffffff"  # valid form, no backing file
+    save_config(cfg, server.config_path)
+    status, body = _get(base, f"{_GP}/list")
+    assert status == 200
+    assert body.count("gallery-tile selected") == 1
+    assert '<div class="gallery-tile selected"><button class="gallery-select" type="button" title="Stage"' in body
+
+
+def test_gallery_upload_image_stores_file(gallery_server) -> None:
+    _, base, media_dir = gallery_server
+    status, body = _post_bytes(base, f"{_GP}/upload", _PNG)
+    assert status == 200
+    assert len(_user_files(media_dir)) == 1  # one normalised image landed
+
+
+def test_gallery_upload_rejects_unknown_format(gallery_server) -> None:
+    _, base, media_dir = gallery_server
+    status, body = _post_bytes(base, f"{_GP}/upload", _GIF)
+    assert status == 200  # HTMX swap with an inline error banner
+    assert "Unsupported file" in body
+    assert _user_files(media_dir) == []
+
+
+def test_gallery_upload_rejects_oversize(gallery_server, monkeypatch) -> None:
+    from openfollow.video import media_store
+
+    _, base, media_dir = gallery_server
+    monkeypatch.setattr(media_store, "MAX_VIDEO_UPLOAD_BYTES", 4)
+    status, body = _post_bytes(base, f"{_GP}/upload", _PNG + b"xxxxxxxx")
+    assert status == 200
+    assert "too large" in body.lower()
+    assert _user_files(media_dir) == []
+
+
+def test_gallery_capture_503_without_feed(gallery_server) -> None:
+    _, base, _ = gallery_server
+    status, body = _post_bytes(base, f"{_GP}/capture", b"")
+    assert status == 503
+    assert json.loads(body)["ok"] is False
+
+
+def test_gallery_capture_saves_frame(gallery_server, monkeypatch) -> None:
+    server, base, media_dir = gallery_server
+    monkeypatch.setattr(server, "get_full_snapshot", lambda: _JPEG + b"clean-frame")
+    status, body = _post_bytes(base, f"{_GP}/capture", b"")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["ok"] is True
+    assert len(_user_files(media_dir)) == 1
+
+
+def test_gallery_delete_default_refused(gallery_server) -> None:
+    _, base, _ = gallery_server
+    status, body = _post_bytes(base, f"{_GP}/delete/default:stage", b"")
+    assert status == 400
+    assert "cannot be deleted" in body
+
+
+def test_gallery_delete_user_media(gallery_server) -> None:
+    _, base, media_dir = gallery_server
+    _post_bytes(base, f"{_GP}/upload", _PNG)
+    media_id = _user_files(media_dir)[0].removesuffix(".jpg")
+    status, _body = _post_bytes(base, f"{_GP}/delete/{media_id}", b"")
+    assert status == 200
+    assert _user_files(media_dir) == []
+
+
+def test_gallery_download_default_404(gallery_server) -> None:
+    _, base, _ = gallery_server
+    status, _body = _get(base, f"{_GP}/download/default:stage")
+    assert status == 404
+
+
+def test_gallery_thumb_stage_serves_asset(gallery_server) -> None:
+    _, base, _ = gallery_server
+    status, body = _get_raw(base, f"{_GP}/thumb/default:stage")
+    assert status == 200  # the bundled Stage asset
+    assert body[:3] == b"\xff\xd8\xff"  # JPEG
+
+
+def test_video_source_section_hides_capture_for_gallery(live_server) -> None:
+    _, base = live_server  # default source is the gallery (testpattern)
+    status, body = _get(base, "/section/video_source")
+    assert status == 200
+    assert 'id="gallery-grid"' in body  # grid container loads via HTMX
+    # Capture, connection recovery, and preview don't apply to the gallery.
+    assert 'id="capture-frame-row" style="margin-top:0.5rem;display:none"' in body
+    assert 'id="recovery-row" style="display:none"' in body
+    assert 'id="preview-row" style="margin-top:0.5rem;display:none"' in body
+
+
+def test_video_source_section_shows_capture_for_live_source(live_server) -> None:
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.video_source_type = "rtsp"
+    cfg.rtsp_url = "rtsp://example/stream"
+    save_config(cfg, server.config_path)
+    status, body = _get(base, "/section/video_source")
+    assert status == 200
+    assert "Capture frame to gallery" in body  # live sources offer capture
+    assert 'id="capture-frame-row" style="margin-top:0.5rem;display:"' in body  # shown
+    assert 'id="recovery-row" style="display:"' in body  # network source -> recovery shown
+    assert 'id="preview-row" style="margin-top:0.5rem;display:"' in body  # preview shown
+
+
+def test_video_source_section_camera_hides_recovery_keeps_preview(live_server) -> None:
+    # A non-network, non-gallery source (NDI uses its own reconnect): recovery
+    # hidden, but capture + preview still apply.
+    server, base = live_server
+    cfg = load_config(server.config_path)
+    cfg.video_source_type = "ndi"
+    save_config(cfg, server.config_path)
+    status, body = _get(base, "/section/video_source")
+    assert status == 200
+    assert 'id="recovery-row" style="display:none"' in body
+    assert 'id="preview-row" style="margin-top:0.5rem;display:"' in body
+    assert 'id="capture-frame-row" style="margin-top:0.5rem;display:"' in body
+
+
+def test_gallery_thumb_user_media(gallery_server) -> None:
+    _, base, media_dir = gallery_server
+    _post_bytes(base, f"{_GP}/upload", _PNG)
+    media_id = _user_files(media_dir)[0].removesuffix(".jpg")
+    status, body = _get_raw(base, f"{_GP}/thumb/{media_id}")
+    assert status == 200 and body[:3] == b"\xff\xd8\xff"
+
+
+def test_gallery_thumb_invalid_id_404(gallery_server) -> None:
+    _, base, _ = gallery_server
+    status, _body = _get_raw(base, f"{_GP}/thumb/not-a-valid-id")
+    assert status == 404
+
+
+def test_gallery_upload_empty(gallery_server) -> None:
+    _, base, media_dir = gallery_server
+    status, body = _post_bytes(base, f"{_GP}/upload", b"")
+    assert status == 200
+    assert "Empty upload" in body
+    assert _user_files(media_dir) == []
+
+
+def test_gallery_upload_unexpected_error(gallery_server, monkeypatch) -> None:
+    from openfollow.video import media_store
+
+    _, base, _ = gallery_server
+
+    def boom(staged):
+        raise RuntimeError("disk exploded")
+
+    monkeypatch.setattr(media_store, "save_upload", boom)
+    status, body = _post_bytes(base, f"{_GP}/upload", _PNG)
+    assert status == 200
+    assert "Upload failed" in body
+
+
+def test_gallery_capture_store_error(gallery_server, monkeypatch) -> None:
+    from openfollow.video import media_store
+
+    server, base, _ = gallery_server
+    monkeypatch.setattr(server, "get_full_snapshot", lambda: _JPEG + b"frame")
+
+    def boom(jpeg):
+        raise media_store.MediaStoreError("gallery full")
+
+    monkeypatch.setattr(media_store, "save_captured_frame", boom)
+    status, body = _post_bytes(base, f"{_GP}/capture", b"")
+    assert status == 200
+    assert json.loads(body) == {"ok": False, "error": "gallery full"}
+
+
+def test_gallery_download_user_media(gallery_server) -> None:
+    _, base, media_dir = gallery_server
+    _post_bytes(base, f"{_GP}/upload", _PNG)
+    media_id = _user_files(media_dir)[0].removesuffix(".jpg")
+    status, body = _get_raw(base, f"{_GP}/download/{media_id}")
+    assert status == 200 and body[:3] == b"\xff\xd8\xff"
+
+
+# --------------------------------------------------------------------------- #
+# Per-marker move speeds: device-local, runtime-authoritative (Web-save reset fix)
+# --------------------------------------------------------------------------- #
+
+
+def _speeds_server(tmp_path, monkeypatch, *, live_speeds, controlled_ids, disk_speeds=None):
+    """Live server with a ``marker_move_speeds_provider`` wired and an on-disk
+    config seeded with ``controlled_ids`` (and optionally ``disk_speeds``).
+
+    Models production: the disk config never carries the live runtime speeds
+    (they're written only by the debounced flush), so the provider is the only
+    source of the operator's just-ramped values during a section save.
+    """
+    monkeypatch.setattr(discovery_module.BeaconSender, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconSender, "stop", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "start", lambda self: None)
+    monkeypatch.setattr(discovery_module.BeaconReceiver, "stop", lambda self: None)
+
+    config_path = tmp_path / "config.toml"
+    cfg = AppConfig(controlled_marker_ids=list(controlled_ids))
+    if disk_speeds:
+        cfg.marker_move_speeds = dict(disk_speeds)
+    save_config(cfg, str(config_path))
+
+    return start_on_free_port(
+        lambda port: ConfigWebServer(
+            config_path=str(config_path),
+            host="127.0.0.1",
+            port=port,
+            system_name="TestSystem",
+            marker_move_speeds_provider=lambda: dict(live_speeds),
+        )
+    )
+
+
+def test_section_save_preserves_live_marker_speeds_on_disk(tmp_path, monkeypatch) -> None:
+    """Canonical repro: the operator ramps marker 5's speed at runtime (live dict
+    holds {5: 2.7}), the disk config has none, then they save an UNRELATED web
+    section (Grid). The written file must carry {5: 2.7}, not the empty disk
+    value, so the follow-up hot-reload of that file is a no-op for the speeds.
+
+    (The complementary guarantee – the reload itself never clobbers the live
+    dict – is covered directly in ``test_configuration.py``.)"""
+    server, base = _speeds_server(
+        tmp_path,
+        monkeypatch,
+        live_speeds={5: 2.7},
+        controlled_ids=[5],
+    )
+    try:
+        # Sanity: the disk config genuinely has no speeds before the save, so a
+        # naive "load disk, apply section, save" would drop {5: 2.7}.
+        assert load_config(server.config_path).marker_move_speeds == {}
+
+        status, _ = _post_form(base, "/section/grid", {"width": "25"})
+        assert status == 200
+
+        reloaded = load_config(server.config_path)
+        assert reloaded.marker_move_speeds == {5: 2.7}
+        # The unrelated edit still landed.
+        assert reloaded.grid.width == 25.0
+    finally:
+        server.stop()
+
+
+def test_section_save_prunes_deselected_live_speed(tmp_path, monkeypatch) -> None:
+    """A live speed for a marker no longer in ``controlled_marker_ids`` is pruned
+    on save (``config_to_toml_dict`` prunes), even though it was overlaid from the
+    provider. Marker 5 stays; marker 9 (not controlled) is dropped."""
+    server, base = _speeds_server(
+        tmp_path,
+        monkeypatch,
+        live_speeds={5: 2.7, 9: 4.0},
+        controlled_ids=[5],
+    )
+    try:
+        status, _ = _post_form(base, "/section/grid", {"width": "25"})
+        assert status == 200
+        reloaded = load_config(server.config_path)
+        assert reloaded.marker_move_speeds == {5: 2.7}
+    finally:
+        server.stop()
+
+
+def test_import_preserves_station_speeds_ignoring_payload(tmp_path, monkeypatch) -> None:
+    """Import is device-local for speeds: this station's live {5: 2.7} survives,
+    and speeds carried in the imported payload ({7: 3.3}) are ignored."""
+    server, base = _speeds_server(
+        tmp_path,
+        monkeypatch,
+        live_speeds={5: 2.7},
+        controlled_ids=[5],
+    )
+    try:
+        payload = {
+            "controlled_marker_ids": [5, 7],
+            "marker_move_speeds": {"7": 3.3},
+            "grid": {"width": 30.0},
+        }
+        status, body = _post_json(base, "/api/config/import", payload)
+        assert status == 200
+        assert body.get("success") is True
+
+        reloaded = load_config(server.config_path)
+        # Station's live speed kept; the imported {7: 3.3} did not land.
+        assert reloaded.marker_move_speeds == {5: 2.7}
+    finally:
+        server.stop()
+
+
+def test_export_omits_marker_move_speeds(tmp_path, monkeypatch) -> None:
+    """Per-marker speeds are device-local and must never leave the box via the
+    config export."""
+    server, base = _speeds_server(
+        tmp_path,
+        monkeypatch,
+        live_speeds={5: 2.7},
+        controlled_ids=[5],
+        disk_speeds={5: 2.7},
+    )
+    try:
+        with urllib.request.urlopen(f"{base}/api/config/export", timeout=5) as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read().decode())
+        assert "marker_move_speeds" not in body
+    finally:
+        server.stop()
+
+
+def test_section_broadcast_receive_does_not_carry_or_clobber_speeds(tmp_path, monkeypatch) -> None:
+    """A ``marker`` section applied via ``POST /api/config/<section>`` (the peer
+    broadcast receive) neither injects the provider's live speeds nor writes any
+    ``marker_move_speeds`` – the section apply doesn't touch that top-level field.
+    On-disk speeds (whatever they were) are left as-is."""
+    server, base = _speeds_server(
+        tmp_path,
+        monkeypatch,
+        live_speeds={5: 2.7},
+        controlled_ids=[5],
+        disk_speeds={5: 1.0},
+    )
+    try:
+        status, body = _post_json(base, "/api/config/marker", {"ball_size": 0.3})
+        assert status == 200
+        reloaded = load_config(server.config_path)
+        # The receive path does NOT overlay the live provider value; the disk
+        # value is preserved untouched by the marker-section apply.
+        assert reloaded.marker_move_speeds == {5: 1.0}
+    finally:
+        server.stop()
+
+
+def test_vlan_subinterface_is_offered_as_a_plane_pin(live_server, monkeypatch) -> None:
+    """A VLAN needs no plumbing beyond creating the link and addressing it.
+
+    Once eth0.10 has an IPv4 it is an ordinary netdev and reaches the interface
+    pickers through the same psutil enumeration every other adapter uses - the
+    claim the VLAN work rests on. The unaddressed half is asserted too: the
+    pickers list interfaces that HAVE an address, so a freshly created VLAN is
+    deliberately not selectable until Configure gives it one. Hardware
+    validation found that ordering, which an addressed-only test hides.
+    """
+    import socket as _socket
+    from types import SimpleNamespace
+
+    from openfollow import net_utils as net_utils_mod
+
+    def _addrs(vlan_address: str | None):
+        rows = {"eth0": [SimpleNamespace(family=_socket.AF_INET, address="192.168.178.59")]}
+        # An unaddressed VLAN still exists as a netdev; psutil reports it with
+        # no AF_INET entry, which is exactly the state right after Create.
+        rows["eth0.10"] = [SimpleNamespace(family=_socket.AF_INET, address=vlan_address)] if vlan_address else []
+        return rows
+
+    _, base = live_server
+
+    monkeypatch.setattr(net_utils_mod.psutil, "net_if_addrs", lambda: _addrs(None))
+    status, body = _get(base, "/network/interfaces/by_name")
+    assert status == 200
+    assert 'value="eth0.10"' not in body
+
+    monkeypatch.setattr(net_utils_mod.psutil, "net_if_addrs", lambda: _addrs("10.20.0.5"))
+    status, body = _get(base, "/network/interfaces/by_name")
+    assert status == 200
+    assert 'value="eth0.10"' in body
+    assert "eth0.10 – 10.20.0.5" in body

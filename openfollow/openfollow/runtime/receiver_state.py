@@ -1,0 +1,189 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""State machine helpers for GstNativeSinkReceiver connection lifecycle."""
+
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+
+from openfollow.video.failure import ConnectionPhase
+from openfollow.video.inputs._base import ReconnectPolicy
+
+
+@dataclass(frozen=True)
+class ReconnectSchedule:
+    """Computed reconnect timer schedule."""
+
+    attempt: int
+    delay_ms: int
+
+
+class ReceiverStateMachine:
+    """Owns receiver connection/reconnect/state transitions."""
+
+    def __init__(self, reconnect_delay: float) -> None:
+        self._base_reconnect_delay = max(0.1, reconnect_delay)
+        self.current_reconnect_delay = self._base_reconnect_delay
+        self.reconnect_attempt = 0
+        self.reconnect_source_id: int | None = None
+        self.connection_timeout_id: int | None = None
+
+        self.connected = False
+        self.video_flow_detected = False
+        # The furthest this *feed* has ever reached, not this attempt. Survives
+        # reconnects so a feed that dropped is not re-diagnosed as one that was
+        # never there; only a source change clears it.
+        self.phase = ConnectionPhase.STARTING
+        # Guards the read-modify-write in ``note_phase`` against the streaming
+        # threads the probes run on. Uncontended in the steady state: once the
+        # feed reaches DECODING every later call compares equal and writes
+        # nothing.
+        self._phase_lock = threading.Lock()
+        self.resolution: tuple[int, int] = (0, 0)
+        self.source_framerate: float = 0.0
+        # What the source element itself delivered: a pixel format for raw
+        # video, else the media type.
+        self.source_format = ""
+        self.is_placeholder_pipeline = False
+        self.source_selection_active = False
+        self.was_connected_before_selection = False
+
+    def reset_video_flow(self) -> None:
+        """Start a fresh connection attempt.
+
+        ``phase`` deliberately survives: it describes the *feed*, not the
+        attempt, so a retry that fails is still reported by how far the feed
+        got rather than as a source that was never reachable.
+        """
+        self.connected = False
+        self.video_flow_detected = False
+        self.clear_source_caps()
+
+    def forget_video_history(self) -> None:
+        """Drop how far the old feed got, because the source changed.
+
+        Nothing about the old source's history describes the new one.
+        """
+        with self._phase_lock:
+            self.phase = ConnectionPhase.STARTING
+
+    def note_phase(self, phase: ConnectionPhase) -> None:
+        """Record that the feed reached *phase*, keeping the furthest.
+
+        Probes fire from separate streaming threads and arrive out of order; a
+        lesser late observation must not walk a live feed back to a
+        reachability failure. The compare-and-assign is locked because that is
+        precisely what it would do if two probes interleaved: a thread reading
+        the old value, pausing while a higher phase is stored, then overwriting
+        it.
+        """
+        with self._phase_lock:
+            if phase > self.phase:
+                self.phase = phase
+
+    def clear_source_caps(self) -> None:
+        """Forget the negotiated resolution / frame rate / format of the last source."""
+        self.resolution = (0, 0)
+        self.source_framerate = 0.0
+        self.source_format = ""
+
+    def set_resolution(self, width: int, height: int) -> bool:
+        """Record the source's negotiated resolution; ``True`` when it changed.
+
+        Placeholder caps are refused for the same reason placeholder buffers
+        can't connect (see ``mark_frame_received``): the "No Signal" pipeline
+        feeds the *shared* sink, whose caps probe is attached once for the
+        sink's lifetime, so its 1920x1080 would otherwise be published as the
+        source's own geometry and pin the window's aspect hint to 16:9 for a
+        source that has never delivered a frame.
+        """
+        if self.is_placeholder_pipeline:
+            return False
+        previous = self.resolution
+        self.resolution = (width, height)
+        return previous != self.resolution
+
+    def set_source_framerate(self, fps: float) -> None:
+        if self.is_placeholder_pipeline:
+            return
+        self.source_framerate = float(fps)
+
+    def set_source_format(self, source_format: str) -> bool:
+        """Record the format the source delivered; ``True`` when it changed."""
+        if self.is_placeholder_pipeline:
+            return False
+        previous = self.source_format
+        self.source_format = source_format
+        return previous != source_format
+
+    def mark_frame_received(self) -> bool:
+        """Record that a real decoded frame reached the sink.
+
+        Returns ``True`` only on the disconnected→connected transition (the
+        first real frame from a non-placeholder pipeline). Connection is
+        driven by actual frame flow, NOT by CAPS events: CAPS is a *sticky*
+        event that GStreamer re-delivers to the shared-sink probe whenever a
+        new pipeline starts on that sink, so keying "connected" off CAPS made
+        reconnect flash the HUD green before actual frames arrived.
+
+        Placeholder frames are ignored entirely: they must neither connect
+        nor set ``video_flow_detected`` – a stray placeholder buffer crossing
+        the shared sink after ``is_placeholder_pipeline`` flips False would
+        otherwise also suppress the real pipeline's connection timeout
+        (which gates on ``video_flow_detected``). Only real frames count.
+        """
+        if self.is_placeholder_pipeline:
+            return False
+        self.video_flow_detected = True
+        self.note_phase(ConnectionPhase.DECODING)
+        if not self.connected:
+            self.connected = True
+            return True
+        return False
+
+    def mark_disconnected(self) -> None:
+        self.connected = False
+
+    def set_placeholder_pipeline(self, is_placeholder: bool) -> None:
+        self.is_placeholder_pipeline = is_placeholder
+
+    def activate_source_selection(self) -> None:
+        self.source_selection_active = True
+
+    def deactivate_source_selection(self) -> None:
+        self.source_selection_active = False
+
+    def enter_source_selection(self) -> None:
+        self.was_connected_before_selection = self.connected
+        self.source_selection_active = True
+
+    def restore_connection_after_selection(self) -> bool:
+        if not self.was_connected_before_selection:
+            return False
+        self.connected = True
+        self.was_connected_before_selection = False
+        return True
+
+    def reset_reconnect_backoff(self) -> None:
+        self.reconnect_attempt = 0
+        self.current_reconnect_delay = self._base_reconnect_delay
+
+    def build_reconnect_schedule(self, policy: ReconnectPolicy) -> ReconnectSchedule:
+        self.reconnect_attempt += 1
+        delay_ms = int(self.current_reconnect_delay * 1000)
+        self.current_reconnect_delay = min(
+            self.current_reconnect_delay * policy.backoff_multiplier,
+            policy.max_delay,
+        )
+        return ReconnectSchedule(attempt=self.reconnect_attempt, delay_ms=delay_ms)
+
+    def should_fallback_to_placeholder(self, policy: ReconnectPolicy) -> bool:
+        max_attempts = policy.max_attempts
+        return max_attempts > 0 and self.reconnect_attempt >= max_attempts and policy.fallback_to_selection
+
+    def clear_reconnect_source(self) -> None:
+        self.reconnect_source_id = None
+
+    def clear_connection_timeout(self) -> None:
+        self.connection_timeout_id = None

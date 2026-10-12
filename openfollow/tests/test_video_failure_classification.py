@@ -1,0 +1,587 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""The failure taxonomy: what we observed maps to what the operator is told."""
+
+from __future__ import annotations
+
+import pytest
+
+from openfollow.video.failure import (
+    RESOURCE_BUSY,
+    RESOURCE_DOMAIN,
+    RESOURCE_NOT_AUTHORIZED,
+    RESOURCE_NOT_FOUND,
+    RESOURCE_OPEN_READ,
+    RESOURCE_SETTINGS,
+    STREAM_CODEC_NOT_FOUND,
+    STREAM_DECODE,
+    STREAM_DEMUX,
+    STREAM_DOMAIN,
+    STREAM_FAILED,
+    STREAM_TYPE_NOT_FOUND,
+    STREAM_WRONG_TYPE,
+    ConnectionPhase,
+    SourceKind,
+    VideoFailure,
+    classify_failure,
+    failure_action,
+    failure_chip,
+    failure_sentence,
+)
+
+pytestmark = pytest.mark.unit
+
+
+class TestPhaseOrdering:
+    def test_phases_run_from_nothing_to_pictures(self) -> None:
+        """Classification asks "did we get at least this far", so the order is
+        load-bearing, not decorative."""
+        assert (
+            ConnectionPhase.STARTING
+            < ConnectionPhase.TRANSPORT_UP
+            < ConnectionPhase.STREAM_DESCRIBED
+            < ConnectionPhase.DATA_ARRIVING
+            < ConnectionPhase.DECODING
+        )
+
+
+class TestClassification:
+    @pytest.mark.parametrize(
+        ("phase", "domain", "code", "message", "expected"),
+        [
+            # The three the operator most needs told apart, and the observation
+            # that separates them: how far the connection got.
+            (ConnectionPhase.STARTING, RESOURCE_DOMAIN, RESOURCE_OPEN_READ, "", VideoFailure.UNREACHABLE),
+            (ConnectionPhase.STREAM_DESCRIBED, "", 0, "", VideoFailure.NO_DATA),
+            (
+                ConnectionPhase.DATA_ARRIVING,
+                STREAM_DOMAIN,
+                STREAM_DECODE,
+                "",
+                VideoFailure.DECODE_ERROR,
+            ),
+            # Credentials and paths are answers, not silence - the far end
+            # replied, so neither is a reachability problem.
+            (
+                ConnectionPhase.TRANSPORT_UP,
+                RESOURCE_DOMAIN,
+                RESOURCE_NOT_AUTHORIZED,
+                "",
+                VideoFailure.UNAUTHORIZED,
+            ),
+            (
+                ConnectionPhase.TRANSPORT_UP,
+                RESOURCE_DOMAIN,
+                RESOURCE_NOT_FOUND,
+                "",
+                VideoFailure.STREAM_NOT_FOUND,
+            ),
+            # A refusal is an open failure whose text carries the OS wording.
+            (
+                ConnectionPhase.STARTING,
+                RESOURCE_DOMAIN,
+                RESOURCE_OPEN_READ,
+                "Could not open resource: Connection refused",
+                VideoFailure.REFUSED,
+            ),
+            # Same domain and code as the unreachable case above; only the
+            # phase differs, and it changes the verdict.
+            (ConnectionPhase.DECODING, RESOURCE_DOMAIN, RESOURCE_OPEN_READ, "", VideoFailure.STALLED),
+            (
+                ConnectionPhase.DATA_ARRIVING,
+                STREAM_DOMAIN,
+                STREAM_CODEC_NOT_FOUND,
+                "",
+                VideoFailure.UNSUPPORTED_FORMAT,
+            ),
+            (
+                ConnectionPhase.DATA_ARRIVING,
+                STREAM_DOMAIN,
+                STREAM_TYPE_NOT_FOUND,
+                "",
+                VideoFailure.UNSUPPORTED_FORMAT,
+            ),
+            (
+                ConnectionPhase.DATA_ARRIVING,
+                STREAM_DOMAIN,
+                STREAM_WRONG_TYPE,
+                "",
+                VideoFailure.UNSUPPORTED_FORMAT,
+            ),
+            (ConnectionPhase.DATA_ARRIVING, STREAM_DOMAIN, STREAM_DEMUX, "", VideoFailure.DECODE_ERROR),
+            # A local capture device held by another program.
+            (ConnectionPhase.STARTING, RESOURCE_DOMAIN, RESOURCE_BUSY, "", VideoFailure.DEVICE_UNAVAILABLE),
+            # Silence with no error at all: the phase is the whole story.
+            (ConnectionPhase.STARTING, "", 0, "", VideoFailure.UNREACHABLE),
+            (ConnectionPhase.TRANSPORT_UP, "", 0, "", VideoFailure.NO_DATA),
+            (ConnectionPhase.DECODING, "", 0, "", VideoFailure.STALLED),
+            # An error we have no rule for stays honest rather than guessing.
+            (ConnectionPhase.STARTING, "some-other-quark", 42, "", VideoFailure.UNKNOWN),
+            # A known domain can still carry a code we have no rule for (the
+            # generic ``FAILED = 1`` both enums start with). With no evidence of
+            # progress that says nothing, so the verdict stays UNKNOWN rather
+            # than guessing a neighbouring bucket.
+            (ConnectionPhase.STARTING, RESOURCE_DOMAIN, 1, "", VideoFailure.UNKNOWN),
+            # Source bytes are not proof video flowed, so an unreadable code
+            # alongside them still says nothing.
+            (ConnectionPhase.DATA_ARRIVING, STREAM_DOMAIN, 1, "", VideoFailure.UNKNOWN),
+            # But once video was demonstrably decoding, the unknown code cannot
+            # undo that: ``GST_STREAM_ERROR_FAILED`` / "Internal data stream
+            # error" is the commonest dropout there is, and reporting it as
+            # "Failed" hides the one fact we are sure of.
+            (ConnectionPhase.DECODING, STREAM_DOMAIN, 1, "", VideoFailure.STALLED),
+            (ConnectionPhase.DECODING, STREAM_DOMAIN, 1, "", VideoFailure.STALLED),
+        ],
+    )
+    def test_observation_maps_to_failure(
+        self,
+        phase: ConnectionPhase,
+        domain: str,
+        code: int,
+        message: str,
+        expected: VideoFailure,
+    ) -> None:
+        assert classify_failure(phase=phase, domain=domain, code=code, message=message) == expected
+
+    def test_open_failure_before_and_after_data_differ(self) -> None:
+        """The distinction the whole taxonomy exists for. Identical GStreamer
+        error; the phase is what makes one a routing fault the operator should
+        chase and the other a dropout on a link that was working."""
+        args = {"domain": RESOURCE_DOMAIN, "code": RESOURCE_OPEN_READ, "message": ""}
+        before = classify_failure(phase=ConnectionPhase.STARTING, **args)  # type: ignore[arg-type]
+        after = classify_failure(phase=ConnectionPhase.DECODING, **args)  # type: ignore[arg-type]
+
+        assert before == VideoFailure.UNREACHABLE
+        assert after == VideoFailure.STALLED
+
+    def test_a_connection_that_carried_video_never_reads_as_unreachable(self) -> None:
+        """Telling an operator the camera cannot be reached, about a camera
+        that was on screen a second ago, sends them to the wrong equipment."""
+        for domain, code in (("", 0), (RESOURCE_DOMAIN, RESOURCE_OPEN_READ), ("some-quark", 1)):
+            failure = classify_failure(phase=ConnectionPhase.DECODING, domain=domain, code=code)
+            assert failure != VideoFailure.UNREACHABLE
+
+    def test_refusal_is_detected_case_insensitively(self) -> None:
+        """GStreamer's wording of the same errno is not stable in case."""
+        for text in ("Connection refused", "connection refused", "ECONNREFUSED"):
+            assert (
+                classify_failure(
+                    phase=ConnectionPhase.STARTING, domain=RESOURCE_DOMAIN, code=RESOURCE_OPEN_READ, message=text
+                )
+                == VideoFailure.REFUSED
+            )
+
+
+class TestOperatorText:
+    def test_every_failure_has_a_chip_and_a_sentence(self) -> None:
+        """Five surfaces render these. A member added without text would reach
+        an operator as a blank chip or a bare format placeholder."""
+        for failure in VideoFailure:
+            chip = failure_chip(failure)
+            sentence = failure_sentence(failure, where="192.0.2.10:554")
+
+            assert chip and chip == chip.strip()
+            assert sentence.endswith(".")
+            assert "{" not in sentence
+
+    def test_the_endpoint_is_named_where_one_is_known(self) -> None:
+        sentence = failure_sentence(VideoFailure.UNREACHABLE, where="192.0.2.10:554")
+        assert "192.0.2.10:554" in sentence
+
+    @pytest.mark.parametrize("where", ["", "   "])
+    def test_a_missing_endpoint_still_reads_as_a_sentence(self, where: str) -> None:
+        """The HUD renders this with no endpoint when the source dials nothing."""
+        sentence = failure_sentence(VideoFailure.UNREACHABLE, where=where)
+
+        assert "the video source" in sentence
+        assert "  " not in sentence
+
+    def test_sentences_carry_no_remedy(self) -> None:
+        """Copy constraint: the sentence describes what was seen. Procedures
+        live in the website docs, which an operator mid-show cannot open."""
+        for failure in VideoFailure:
+            sentence = failure_sentence(failure, where="192.0.2.10:554").lower()
+            for instruction in ("please ", "try ", "check the", "make sure", "you should"):
+                assert instruction not in sentence
+
+    def test_chips_stay_short_enough_for_a_chip(self) -> None:
+        """They sit in a fixed-width status chip on the Statistics panel."""
+        for failure in VideoFailure:
+            assert len(failure_chip(failure)) <= 16
+
+    def test_enum_values_are_stable_wire_names(self) -> None:
+        """``/api/stats`` publishes these for support tooling, so they are an
+        interface: renaming a member silently breaks a consumer's matching."""
+        assert {f.value for f in VideoFailure} == {
+            "none",
+            "not_configured",
+            "unreachable",
+            "refused",
+            "unauthorized",
+            "stream_not_found",
+            "no_data",
+            "unsupported_format",
+            "decode_error",
+            "stalled",
+            "device_unavailable",
+            "unsupported_mode",
+            "interface_down",
+            "wrong_interface",
+            "unknown",
+        }
+
+    def test_an_interface_pin_refusal_reads_as_what_was_observed(self) -> None:
+        down = VideoFailure.INTERFACE_DOWN
+        wrong = VideoFailure.WRONG_INTERFACE
+        assert failure_chip(down) == "Interface down"
+        assert failure_chip(wrong) == "Wrong interface"
+        assert failure_sentence(down) == "The interface pinned for video input has no address."
+        assert (
+            failure_sentence(wrong, where="rtsp://192.0.2.20/stream")
+            == "rtsp://192.0.2.20/stream is not reached through the interface pinned for video input."
+        )
+        assert "Network Interface Assignment" in failure_action(down)
+        assert failure_action(wrong) == "Check the camera's address, or pin the interface that reaches it."
+
+    def test_a_listener_off_the_pin_is_told_about_its_own_address(self) -> None:
+        """RTP dials nothing: the address at fault is the one it listens at."""
+        wrong = VideoFailure.WRONG_INTERFACE
+        where = "RTP 192.0.2.10:5004 H264 (unicast)"
+        assert failure_sentence(wrong, where=where, kind=SourceKind.LISTENER) == (
+            f"{where} listens at an address the interface pinned for video input does not have."
+        )
+        assert failure_action(wrong, kind=SourceKind.LISTENER) == (
+            "Set the RTP URL's address to 0.0.0.0, or pin the interface that has it."
+        )
+
+
+class TestRefusalArrivesInTheDebugString:
+    """``rtspsrc`` and ``srtsrc`` put the OS wording in GStreamer's debug
+    string, not the message, so searching only the message left REFUSED
+    unreachable for every shipped plugin."""
+
+    def test_a_refusal_in_the_debug_string_is_found(self) -> None:
+        assert (
+            classify_failure(
+                phase=ConnectionPhase.STARTING,
+                domain=RESOURCE_DOMAIN,
+                code=RESOURCE_OPEN_READ,
+                message="Could not open resource for reading and writing.",
+                debug="gstrtspsrc.c(7469): gst_rtspsrc_send (): Connection refused",
+            )
+            == VideoFailure.REFUSED
+        )
+
+    def test_a_plain_timeout_in_the_debug_string_is_not_a_refusal(self) -> None:
+        assert (
+            classify_failure(
+                phase=ConnectionPhase.STARTING,
+                domain=RESOURCE_DOMAIN,
+                code=RESOURCE_OPEN_READ,
+                message="Could not open resource for reading and writing.",
+                debug="gstrtspsrc.c(7469): gst_rtspsrc_send (): Connect timed out",
+            )
+            == VideoFailure.UNREACHABLE
+        )
+
+
+class TestDemonstratedFlowOutranksAnUnreadableError:
+    """Evidence beats absence of a rule. A feed that was on screen a second ago
+    must not be reported as a failure of unknown kind."""
+
+    @pytest.mark.parametrize("domain", [RESOURCE_DOMAIN, STREAM_DOMAIN, "some-other-quark"])
+    def test_an_unknown_code_after_video_flowed_is_a_stall(self, domain: str) -> None:
+        assert classify_failure(phase=ConnectionPhase.DECODING, domain=domain, code=999) == VideoFailure.STALLED
+
+    @pytest.mark.parametrize("domain", [RESOURCE_DOMAIN, STREAM_DOMAIN, "some-other-quark"])
+    def test_an_unknown_code_with_no_progress_stays_unknown(self, domain: str) -> None:
+        assert classify_failure(phase=ConnectionPhase.STARTING, domain=domain, code=999) == VideoFailure.UNKNOWN
+
+
+class TestAnEmptySdpIsNotAGenericSettingsFailure:
+    """Verified against a real camera: asking an RTSP server for a path it does
+    not serve gets a session description listing no media, not a 404. It
+    reaches us as ``RESOURCE_SETTINGS``, which on its own says nothing.
+    """
+
+    _MESSAGE = "Could not get/set settings from/on resource."
+    _SDP_DEBUG = "gstrtspsrc.c(8357): gst_rtspsrc_setup_streams_start (): SDP contains no streams"
+
+    def test_an_empty_sdp_names_the_path(self) -> None:
+        assert (
+            classify_failure(
+                phase=ConnectionPhase.STARTING,
+                domain=RESOURCE_DOMAIN,
+                code=RESOURCE_SETTINGS,
+                message=self._MESSAGE,
+                debug=self._SDP_DEBUG,
+            )
+            == VideoFailure.STREAM_NOT_FOUND
+        )
+
+    def test_an_unrelated_settings_failure_is_not_claimed(self) -> None:
+        """The code is generic; only the wording makes it a missing stream."""
+        assert (
+            classify_failure(
+                phase=ConnectionPhase.STARTING,
+                domain=RESOURCE_DOMAIN,
+                code=RESOURCE_SETTINGS,
+                message=self._MESSAGE,
+                debug="could not set property on element",
+            )
+            == VideoFailure.UNKNOWN
+        )
+
+    def test_it_reads_the_path_not_a_dropped_feed(self) -> None:
+        """A named cause outranks how far the feed once got."""
+        assert (
+            classify_failure(
+                phase=ConnectionPhase.DECODING,
+                domain=RESOURCE_DOMAIN,
+                code=RESOURCE_SETTINGS,
+                message=self._MESSAGE,
+                debug=self._SDP_DEBUG,
+            )
+            == VideoFailure.STREAM_NOT_FOUND
+        )
+
+
+class TestSourceBytesAreNotDecodedVideo:
+    """``DATA_ARRIVING`` is bytes out of the source element. A feed carrying a
+    payload this station cannot decode produces them just as readily as a
+    working one, so it is not evidence that video ever arrived.
+    """
+
+    def test_bytes_without_a_frame_never_reads_as_a_stall(self) -> None:
+        """Otherwise a feed that never showed a picture is reported as one that
+        "stopped arriving"."""
+        assert classify_failure(phase=ConnectionPhase.DATA_ARRIVING) == VideoFailure.NO_DATA
+
+    def test_a_decoded_frame_does(self) -> None:
+        assert classify_failure(phase=ConnectionPhase.DECODING) == VideoFailure.STALLED
+
+    def test_the_phase_is_the_feeds_history_not_the_attempts(self) -> None:
+        """A retry knows nothing, so the caller passes how far the *feed* ever
+        got; ``STARTING`` therefore means this feed never produced a byte."""
+        assert classify_failure(phase=ConnectionPhase.STARTING) == VideoFailure.UNREACHABLE
+
+    @pytest.mark.parametrize(
+        ("phase", "expected"),
+        [
+            (ConnectionPhase.STARTING, VideoFailure.UNREACHABLE),
+            (ConnectionPhase.TRANSPORT_UP, VideoFailure.NO_DATA),
+            (ConnectionPhase.STREAM_DESCRIBED, VideoFailure.NO_DATA),
+            (ConnectionPhase.DATA_ARRIVING, VideoFailure.NO_DATA),
+            (ConnectionPhase.DECODING, VideoFailure.STALLED),
+        ],
+    )
+    def test_the_open_failure_ladder_matches_the_silent_one(
+        self, phase: ConnectionPhase, expected: VideoFailure
+    ) -> None:
+        """A read/open failure and plain silence describe the same progress, so
+        they must not disagree about what that progress means."""
+        assert classify_failure(phase=phase, domain=RESOURCE_DOMAIN, code=RESOURCE_OPEN_READ) == expected
+        assert classify_failure(phase=phase) == expected
+
+    def test_no_data_is_reachable_without_the_rtsp_sdp_hook(self) -> None:
+        """Only RTSP reports TRANSPORT_UP / STREAM_DESCRIBED. Every other input
+        jumps STARTING to DATA_ARRIVING, so NO_DATA has to be reachable from
+        there or it is unreachable for SRT, RTP, NDI and every local device."""
+        assert classify_failure(phase=ConnectionPhase.DATA_ARRIVING) == VideoFailure.NO_DATA
+
+
+class TestNotFoundDoesNotClaimSomethingAnswered:
+    """``RESOURCE_NOT_FOUND`` comes from an absent v4l2 / libcamera /
+    AVFoundation device and a deleted Media Gallery file as readily as from an
+    RTSP path, and neither of those answered anything.
+    """
+
+    @pytest.mark.parametrize("where", ["rtsp://192.0.2.10:554/no/such/stream", "/dev/video0", "Stage.webm"])
+    def test_the_sentence_holds_for_every_producer(self, where: str) -> None:
+        sentence = failure_sentence(VideoFailure.STREAM_NOT_FOUND, where=where)
+        assert where in sentence
+        assert "answered" not in sentence
+
+
+class TestAnInputThatDialsNothingIsNotDescribedAsUnanswered:
+    """Seen on hardware: an RTP listener with no sender reported "Nothing
+    answered at RTP 0.0.0.0:5004", naming this station's own listening port as
+    a host that failed to reply. A listener, a local capture device and a
+    discovery-by-name source all connect nowhere.
+    """
+
+    @pytest.mark.parametrize("failure", [VideoFailure.UNREACHABLE, VideoFailure.NO_DATA])
+    def test_the_wording_presumes_no_request(self, failure: VideoFailure) -> None:
+        sentence = failure_sentence(failure, where="RTP 0.0.0.0:5004", kind=SourceKind.LISTENER)
+        assert "answered" not in sentence
+        assert "RTP 0.0.0.0:5004" in sentence
+
+    @pytest.mark.parametrize("failure", [VideoFailure.UNREACHABLE, VideoFailure.NO_DATA])
+    def test_a_dialling_input_keeps_the_stronger_wording(self, failure: VideoFailure) -> None:
+        """ "Nothing answered" is the useful fact when we did dial somewhere."""
+        assert "answered" in failure_sentence(failure, where="rtsp://192.0.2.10:554/s")
+
+    def test_only_the_request_shaped_sentences_change(self) -> None:
+        """A stall and a decode error describe what was observed either way."""
+        for failure in (VideoFailure.STALLED, VideoFailure.DECODE_ERROR, VideoFailure.STREAM_NOT_FOUND):
+            assert failure_sentence(failure, where="X") == failure_sentence(
+                failure, where="X", kind=SourceKind.LISTENER
+            )
+
+    def test_every_failure_still_reads_as_a_sentence_without_a_dial(self) -> None:
+        for failure in VideoFailure:
+            sentence = failure_sentence(failure, where="X", kind=SourceKind.LISTENER)
+            assert sentence.endswith(".")
+            assert "{" not in sentence
+
+
+class TestEveryFailureOffersSomethingToDo:
+    """An operator reading a projected screen mid-show needs the next step, not
+    the pipeline's own wording. The action is a separate field from the
+    sentence so the two never blur: one is what the station saw, the other is
+    what the operator is being asked to do.
+    """
+
+    def test_every_failure_that_is_one_has_an_action(self) -> None:
+        for failure in VideoFailure:
+            if failure is VideoFailure.NONE:
+                continue
+            assert failure_action(failure).endswith(".")
+
+    def test_a_healthy_feed_asks_for_nothing(self) -> None:
+        assert failure_action(VideoFailure.NONE) == ""
+
+    def test_the_action_is_one_line_not_a_procedure(self) -> None:
+        """Anything longer belongs in the website docs, which cannot be opened
+        from the stage."""
+        for failure in VideoFailure:
+            action = failure_action(failure)
+            assert action.count(".") <= 2
+            assert len(action) <= 110
+
+    def test_it_names_the_setting_not_a_click_path(self) -> None:
+        """Wording has to hold on the projected screen too, where there is no
+        tab to click."""
+        for failure in VideoFailure:
+            assert "click" not in failure_action(failure).lower()
+
+    @pytest.mark.parametrize("failure", [VideoFailure.UNREACHABLE, VideoFailure.NO_DATA])
+    def test_each_kind_is_told_to_check_something_it_actually_has(self, failure: VideoFailure) -> None:
+        """An NDI source has no address or port, a USB camera has no sender,
+        and a listener has no camera to power on. One shared line would name a
+        setting that three of the four cannot find."""
+        actions = {kind: failure_action(failure, kind=kind) for kind in SourceKind}
+        assert len(set(actions.values())) == len(SourceKind)
+        # None of the three non-dialling kinds is sent looking for an address
+        # or port: only a listener has one the operator configured.
+        for kind in (SourceKind.NAMED, SourceKind.LOCAL):
+            assert "address" not in actions[kind]
+            assert "port" not in actions[kind]
+        # A local device has no sender to check.
+        assert "sender" not in actions[SourceKind.LOCAL]
+        assert "sender" in actions[SourceKind.LISTENER]
+
+    def test_the_sentence_still_carries_no_remedy(self) -> None:
+        """The separation is the point: a reader quoting the observation into a
+        support thread should not carry our advice with it."""
+        for failure in VideoFailure:
+            sentence = failure_sentence(failure, where="192.0.2.10:554").lower()
+            for instruction in ("check the", "please ", "make sure", "you should"):
+                assert instruction not in sentence
+
+
+class TestNoSentenceClaimsWhatTheFarEndDid:
+    """What a camera did is not observable from here.
+
+    "answered, but sent no video" asserted the camera sent nothing, when it may
+    have been sending into a blocked media path - half of what the action asks
+    the operator to check. Only what reached this station is ours to state.
+    """
+
+    @pytest.mark.parametrize("kind", list(SourceKind))
+    def test_no_sentence_asserts_the_far_end_transmitted_or_did_not(self, kind: SourceKind) -> None:
+        for failure in VideoFailure:
+            sentence = failure_sentence(failure, where="X", kind=kind).lower()
+            for claim in ("sent no", "is not sending", "stopped sending", "sends no"):
+                assert claim not in sentence, f"{failure.name} claims what the far end did"
+
+    def test_a_stall_is_phrased_as_arrival_not_as_sending(self) -> None:
+        """We observe our own receive side; the camera may still be running."""
+        assert failure_sentence(VideoFailure.STALLED, where="X") == "Video from X stopped arriving."
+
+    def test_the_no_data_sentence_names_this_station_as_the_observer(self) -> None:
+        assert "this station did not receive" in failure_sentence(VideoFailure.NO_DATA, where="X")
+
+
+class TestANegotiationFailureNamesTheMode:
+    """``libcamerasrc`` asked for a mode the camera cannot deliver reports the
+    generic stream failure, with the reason only in the debug string. As
+    captured from a Pi Camera left to choose its own format."""
+
+    _MESSAGE = "Internal data stream error."
+    _DEBUG = (
+        "../src/gstreamer/gstlibcamerasrc.cpp(902): gst_libcamera_src_task_enter (): "
+        "/GstPipeline:picam-sink/GstLibcameraSrc:libcamerasrc:\nstreaming stopped, reason not-negotiated (-4)"
+    )
+
+    @pytest.mark.parametrize("phase", [ConnectionPhase.STARTING, ConnectionPhase.DATA_ARRIVING])
+    def test_before_any_video_it_is_the_mode(self, phase: ConnectionPhase) -> None:
+        verdict = classify_failure(
+            phase=phase, domain=STREAM_DOMAIN, code=STREAM_FAILED, message=self._MESSAGE, debug=self._DEBUG
+        )
+        assert verdict == VideoFailure.UNSUPPORTED_MODE
+
+    def test_the_marker_counts_in_the_message_too(self) -> None:
+        verdict = classify_failure(
+            phase=ConnectionPhase.STARTING,
+            domain=STREAM_DOMAIN,
+            code=STREAM_FAILED,
+            message="streaming stopped, reason not-negotiated (-4)",
+        )
+        assert verdict == VideoFailure.UNSUPPORTED_MODE
+
+    def test_after_video_it_is_still_a_stall(self) -> None:
+        """A feed that was on screen and stopped is reported as having stopped."""
+        verdict = classify_failure(
+            phase=ConnectionPhase.DECODING,
+            domain=STREAM_DOMAIN,
+            code=STREAM_FAILED,
+            message=self._MESSAGE,
+            debug=self._DEBUG,
+        )
+        assert verdict == VideoFailure.STALLED
+
+    def test_the_generic_failure_without_the_marker_stays_unknown(self) -> None:
+        verdict = classify_failure(
+            phase=ConnectionPhase.STARTING,
+            domain=STREAM_DOMAIN,
+            code=STREAM_FAILED,
+            message=self._MESSAGE,
+            debug="streaming stopped, reason error (-5)",
+        )
+        assert verdict == VideoFailure.UNKNOWN
+
+    @pytest.mark.parametrize("domain", [RESOURCE_DOMAIN, "some-other-quark"])
+    def test_the_marker_in_another_domain_is_not_claimed(self, domain: str) -> None:
+        verdict = classify_failure(phase=ConnectionPhase.STARTING, domain=domain, code=1, debug=self._DEBUG)
+        assert verdict == VideoFailure.UNKNOWN
+
+    def test_it_reads_as_what_the_device_does_not_offer(self) -> None:
+        assert failure_chip(VideoFailure.UNSUPPORTED_MODE) == "Unsupported mode"
+        assert (
+            failure_sentence(VideoFailure.UNSUPPORTED_MODE, where="Pi Camera (1920x1080@30)", kind=SourceKind.LOCAL)
+            == "Pi Camera (1920x1080@30) does not offer the format, size or frame rate this station asked for."
+        )
+
+    def test_a_local_device_is_sent_to_its_resolution_and_frame_rate(self) -> None:
+        assert (
+            failure_action(VideoFailure.UNSUPPORTED_MODE, kind=SourceKind.LOCAL)
+            == "Choose a resolution and frame rate the device supports under Video Source."
+        )
+
+    @pytest.mark.parametrize("kind", [SourceKind.REMOTE, SourceKind.NAMED, SourceKind.LISTENER])
+    def test_a_network_source_gets_the_general_step(self, kind: SourceKind) -> None:
+        assert (
+            failure_action(VideoFailure.UNSUPPORTED_MODE, kind=kind)
+            == "Check the settings under Video Source, or download a diagnostics bundle."
+        )

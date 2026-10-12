@@ -1,0 +1,278 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""Shared style constants and helpers for Cairo overlay draw passes."""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import cairo
+
+# ==================================================================
+# Color Palette (adapted from web UI)
+# ==================================================================
+# Background colors
+COLOR_BG_BASE = (0.027, 0.075, 0.051)  # #07130d (RGB)
+COLOR_BG_SOFT = (0.059, 0.133, 0.067)  # #0f2118 (RGB)
+
+# Text colors
+COLOR_TEXT = (0.969, 0.961, 0.914)  # #f7f5e9 (RGB, main text)
+COLOR_TEXT_MUTED = (0.969, 0.961, 0.914, 0.68)  # muted text (RGBA)
+
+# Accent (golden)
+COLOR_ACCENT = (1.0, 0.737, 0.0)  # #ffbc00 (RGB)
+COLOR_ACCENT_SOFT = (1.0, 0.737, 0.0, 0.12)  # soft accent background (RGBA)
+
+# Borders and UI
+COLOR_BORDER_SOFT = (1.0, 1.0, 1.0, 0.08)  # soft border (RGBA)
+COLOR_BORDER = (1.0, 1.0, 1.0, 0.12)  # standard border (RGBA)
+# Dashed edge of the Support OpenFollow request, the website's own: #ffbc00 at 60%.
+COLOR_SUPPORT_BORDER = (*COLOR_ACCENT, 0.6)  # (RGBA)
+SUPPORT_DASH = (5.0, 4.0)
+
+# Translucent fill for the shared overlay-card chrome (operator-message cards
+# + every HUD panel). Marker cards paint their own opaque colour-coded chrome.
+CARD_BG_ALPHA = 0.9
+
+# Status indicators
+COLOR_OK = (0.361, 0.788, 0.549)  # #5cc98c (RGB, green, online)
+# The HUD's warning red. Status rows, failure panels and a missing controller's
+# card fill with it (the card keeps its marker-coloured border); dark enough
+# that the HUD's normal text stays readable on it.
+COLOR_DANGER_BG = (0.42, 0.08, 0.08)  # #6b1414 (RGB)
+COLOR_WARNING_FILL = (*COLOR_DANGER_BG, 0.8)  # #6b1414 at 80% (RGBA)
+COLOR_WARNING_BORDER = (0.69, 0.149, 0.149)  # #b02626 (RGB)
+COLOR_INFO_BG = (0.09, 0.239, 0.42)  # #173d6b (RGB)
+COLOR_INFO_FILL = (*COLOR_INFO_BG, 0.8)  # #173d6b at 80% (RGBA)
+COLOR_INFO_BORDER = (0.149, 0.392, 0.69)  # #2664b0 (RGB)
+COLOR_CAUTION_BG = (0.608, 0.447, 0.0)  # #9b7200 (RGB)
+COLOR_CAUTION_FILL = (*COLOR_CAUTION_BG, 0.8)  # #9b7200 at 80% (RGBA)
+COLOR_CAUTION_BORDER = (1.0, 0.737, 0.0)  # #ffbc00 (RGB)
+COLOR_SUCCESS_BG = (0.145, 0.369, 0.227)  # #255e3a (RGB)
+COLOR_SUCCESS_FILL = (*COLOR_SUCCESS_BG, 0.8)  # #255e3a at 80% (RGBA)
+COLOR_SUCCESS_BORDER = (0.239, 0.604, 0.376)  # #3d9a60 (RGB)
+
+# Typography
+FONT_UI_FAMILY = "Inter"
+
+
+# One corner radius per nesting level, so an inner corner is never rounder than its container.
+MODAL_RADIUS = 14.0
+PANEL_RADIUS = 6.0
+ROW_RADIUS = 4.0
+
+
+def draw_rounded_rect(cr: Any, x: float, y: float, w: float, h: float, radius: float) -> None:
+    """Draw a rounded rectangle path on the given Cairo context."""
+    if radius <= 0:
+        cr.rectangle(x, y, w, h)
+        return
+
+    radius = min(radius, w / 2, h / 2)
+
+    cr.move_to(x + radius, y)
+    cr.line_to(x + w - radius, y)
+    cr.arc(x + w - radius, y + radius, radius, -math.pi / 2, 0)
+    cr.line_to(x + w, y + h - radius)
+    cr.arc(x + w - radius, y + h - radius, radius, 0, math.pi / 2)
+    cr.line_to(x + radius, y + h)
+    cr.arc(x + radius, y + h - radius, radius, math.pi / 2, math.pi)
+    cr.line_to(x, y + radius)
+    cr.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def draw_warning_sign(cr: Any, cx: float, cy: float, size: float = 13.0) -> None:
+    """Off-white warning triangle with its "!" in the warning red, centred on (cx, cy)."""
+    half = size * 0.58
+    cr.save()
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.set_line_width(size * 0.154)
+    cr.move_to(cx, cy - size * 0.55)
+    cr.line_to(cx - half, cy + size * 0.45)
+    cr.line_to(cx + half, cy + size * 0.45)
+    cr.close_path()
+    cr.set_source_rgb(*COLOR_TEXT)
+    cr.fill_preserve()
+    cr.stroke()
+    mark_h = size * 0.62
+    bar_w = mark_h * 0.2
+    bar_h = mark_h * 0.52
+    bar_top = cy + size * 0.092 - mark_h * 0.42
+    cr.set_source_rgb(*COLOR_DANGER_BG)
+    cr.rectangle(cx - bar_w / 2, bar_top, bar_w, bar_h)
+    cr.fill()
+    cr.arc(cx, bar_top + bar_h + bar_w * 1.25, bar_w * 0.62, 0, 2 * math.pi)
+    cr.fill()
+    cr.restore()
+
+
+def draw_info_sign(cr: Any, cx: float, cy: float, size: float = 13.0, cut: tuple[float, ...] = COLOR_BG_BASE) -> None:
+    """Off-white disc with its "i" cut out in ``cut``, centred on (cx, cy)."""
+    cr.save()
+    cr.set_source_rgb(*COLOR_TEXT)
+    cr.arc(cx, cy, size * 0.45, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_source_rgb(*cut)
+    stem_w = size * 0.1125
+    cr.rectangle(cx - stem_w / 2, cy - size * 0.0875, stem_w, size * 0.325)
+    cr.fill()
+    cr.arc(cx, cy - size * 0.206, size * 0.069, 0, 2 * math.pi)
+    cr.fill()
+    cr.restore()
+
+
+def draw_success_sign(
+    cr: Any,
+    cx: float,
+    cy: float,
+    size: float = 13.0,
+    cut: tuple[float, ...] = COLOR_BG_BASE,
+    disc: tuple[float, ...] = COLOR_OK,
+) -> None:
+    """Disc (green unless ``disc`` says otherwise) with its check cut out in ``cut``, centred on (cx, cy)."""
+    cr.save()
+    cr.set_source_rgb(*disc)
+    cr.arc(cx, cy, size * 0.45, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_source_rgb(*cut)
+    cr.set_line_width(size * 0.1125)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.move_to(cx - size * 0.2125, cy + size * 0.01875)
+    cr.line_to(cx - size * 0.0625, cy + size * 0.1625)
+    cr.line_to(cx + size * 0.2125, cy - size * 0.1375)
+    cr.stroke()
+    cr.restore()
+
+
+# Fill, border and the sign's cut-out colour of a status level, as the web chips.
+STATUS_LEVEL_COLORS: dict[str, tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]] = {
+    "error": (COLOR_WARNING_FILL, COLOR_WARNING_BORDER, COLOR_DANGER_BG),
+    "caution": (COLOR_CAUTION_FILL, COLOR_CAUTION_BORDER, COLOR_CAUTION_BG),
+    "info": (COLOR_INFO_FILL, COLOR_INFO_BORDER, COLOR_INFO_BG),
+    "success": (COLOR_SUCCESS_FILL, COLOR_SUCCESS_BORDER, COLOR_SUCCESS_BG),
+}
+# Gravest first.
+STATUS_LEVELS = ("error", "caution", "info", "success")
+
+
+def status_level(value: object) -> str:
+    """*value* when it names a status level, else "error": a malformed writer shows as a fault."""
+    return value if isinstance(value, str) and value in STATUS_LEVEL_COLORS else "error"
+
+
+def draw_level_box(
+    cr: Any, level: str, x: float, y: float, w: float, h: float, *, radius: float, line_width: float
+) -> None:
+    """A rounded box in *level*'s chip fill and border."""
+    fill, border, _cut = STATUS_LEVEL_COLORS[status_level(level)]
+    draw_rounded_rect(cr, x, y, w, h, radius)
+    cr.set_source_rgba(*fill)
+    cr.fill_preserve()
+    cr.set_source_rgb(*border)
+    cr.set_line_width(line_width)
+    cr.stroke()
+
+
+def draw_level_sign(cr: Any, level: str, cx: float, cy: float, size: float = 13.0) -> None:
+    """Off-white: the warning sign for an error, the check for a success, the "i" otherwise."""
+    level = status_level(level)
+    cut = STATUS_LEVEL_COLORS[level][2]
+    if level == "error":
+        draw_warning_sign(cr, cx, cy, size)
+    elif level == "success":
+        draw_success_sign(cr, cx, cy, size, cut=cut, disc=COLOR_TEXT)
+    else:
+        draw_info_sign(cr, cx, cy, size, cut=cut)
+
+
+# The level signs' size, so a chevron reads as an icon beside them.
+CHEVRON_SIZE = 13.0
+
+# Corner points of each direction's angle, as fractions of its size around the centre.
+_CHEVRON_POINTS = {
+    "right": ((-0.22, -0.42), (0.22, 0.0), (-0.22, 0.42)),
+    "down": ((-0.42, -0.22), (0.0, 0.22), (0.42, -0.22)),
+    "up": ((-0.42, 0.22), (0.0, -0.22), (0.42, 0.22)),
+}
+
+
+def draw_chevron(
+    cr: Any, cx: float, cy: float, direction: str = "right", size: float = CHEVRON_SIZE, alpha: float = 1.0
+) -> None:
+    """An open off-white angle pointing *direction*, centred on (cx, cy), with round ends."""
+    points = [(cx + dx * size, cy + dy * size) for dx, dy in _CHEVRON_POINTS[direction]]
+    cr.save()
+    cr.set_source_rgba(*COLOR_TEXT, alpha)
+    cr.set_line_width(size * 0.18)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.move_to(*points[0])
+    for point in points[1:]:
+        cr.line_to(*point)
+    cr.stroke()
+    cr.restore()
+
+
+def draw_heart(cr: Any, cx: float, cy: float, size: float, color: tuple[float, ...] = COLOR_ACCENT) -> None:
+    """Filled heart ``size`` wide, centred on (cx, cy): the Support OpenFollow mark."""
+    k = size / 24.0
+    ox, oy = cx - 12.0 * k, cy - 12.5 * k
+
+    def pt(x: float, y: float) -> tuple[float, float]:
+        return ox + x * k, oy + y * k
+
+    cr.save()
+    cr.move_to(*pt(12.0, 21.0))
+    cr.curve_to(*pt(12.0, 21.0), *pt(4.4, 16.3), *pt(2.3, 11.5))
+    cr.curve_to(*pt(0.8, 8.1), *pt(3.0, 4.0), *pt(6.9, 4.0))
+    cr.curve_to(*pt(9.0, 4.0), *pt(10.5, 5.1), *pt(12.0, 7.0))
+    cr.curve_to(*pt(13.5, 5.1), *pt(15.0, 4.0), *pt(17.1, 4.0))
+    cr.curve_to(*pt(21.0, 4.0), *pt(23.2, 8.1), *pt(21.7, 11.5))
+    cr.curve_to(*pt(19.6, 16.3), *pt(12.0, 21.0), *pt(12.0, 21.0))
+    cr.close_path()
+    cr.set_source_rgb(*color[:3])
+    cr.fill()
+    cr.restore()
+
+
+def draw_card_background(cr: Any, x: float, y: float, w: float, h: float, radius: float = PANEL_RADIUS) -> None:
+    """Translucent card fill + soft 1px border – the shared overlay-card chrome.
+
+    Used by the operator-message cards and every HUD panel (help, bottom-left
+    info, system stats, modals, selection lists, faders) so their chrome reads
+    as one visual language. Marker cards paint their own colour-coded chrome
+    and deliberately don't route through here.
+    """
+    draw_rounded_rect(cr, x, y, w, h, radius)
+    cr.set_source_rgba(COLOR_BG_BASE[0], COLOR_BG_BASE[1], COLOR_BG_BASE[2], CARD_BG_ALPHA)
+    cr.fill()
+    draw_rounded_rect(cr, x, y, w, h, radius)
+    cr.set_source_rgba(*COLOR_BORDER)
+    cr.set_line_width(1.0)
+    cr.stroke()
+
+
+def parse_hex(color: str) -> tuple[float, float, float]:
+    """Parse '#rrggbb' to (r, g, b) floats in [0,1]."""
+    c = color.lstrip("#")
+    if len(c) < 6:
+        return (1.0, 1.0, 1.0)
+    try:
+        return int(c[0:2], 16) / 255, int(c[2:4], 16) / 255, int(c[4:6], 16) / 255
+    except ValueError:
+        return (1.0, 1.0, 1.0)
+
+
+def speed_color(speed: float, max_speed: float = 20.0) -> tuple[float, float, float]:
+    """Map speed → (r, g, b) gradient: green → yellow → red."""
+    if speed <= 0:
+        return (0.133, 0.773, 0.369)
+    t = min(speed / max_speed, 1.0)
+    if t <= 0.5:
+        s = t * 2.0
+        return ((34 + 221 * s) / 255, (197 + 58 * s) / 255, 94 * (1 - s) / 255)
+    s = (t - 0.5) * 2.0
+    return (1.0, 1.0 - s, 0.0)

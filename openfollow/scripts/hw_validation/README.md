@@ -1,0 +1,304 @@
+# Hardware validation tooling (two-Pi)
+
+End-to-end validation of network-driven features across two devices: a
+**device under test (DUT)** running the deployed code, and a **companion**
+device that drives traffic at it. The seed here validates the OSC
+**operator-message** feature (#330) over unicast **and** multicast; it's meant
+to grow into a fuller two-Pi validation suite (see the tracking issue).
+
+## Layout
+
+| Script | Runs on | Purpose |
+| --- | --- | --- |
+| `operator_message_receiver.py` | DUT | Drives the deployed `OscService` + ingest adapter + store on a real listener; records every accept/clear to JSON. Writes a readiness marker once bound. |
+| `operator_message_sender.py` | companion | Fires the operator-message battery (unicast + multicast). |
+| `analyze_results.py` | anywhere | Asserts every functionality from the receiver JSON; exits non-zero on failure. |
+| `raw_udp_probe.py` | both | Dependency-free UDP reachability preflight – tells a network drop apart from an app bug. |
+| `psn_packet_size_probe.py` | DUT | Builds real multi-tracker PSN datagrams with the deployed encoder, round-trips them through a loopback socket at 1500 vs 65535, and guards the receiver's `recvfrom` buffer (#463). |
+| `output_protocol_driver.py` | DUT | Drives N moving markers out of the deployed PSN / OTP / RTTrPM servers so real consumer software (PSNView, OTPAnalyzer, OTPView) can be pointed at the live output. `--markers 40` splits every stream; `--markers 13` is the control where nothing splits. Classifies datagrams by their own header bytes and reports per-stream counts and largest size. |
+| `output_datagram_size_probe.py` | DUT | Drives the deployed PSN / OTP / RTTrPM send paths at 4-100 markers and asserts no stream emits a datagram past the 1472 B MTU budget - the size at which IP fragments and a loaded show network starts dropping frames. Exits `0` (PASS) / `1` (FAIL). |
+| `osc_socket_options_probe.py` | DUT | Builds clients via the deployed `OscService._make_client` and asserts the broadcast/multicast socket options (#482). |
+| `eos_console_probe.py` | workstation | Drives the deployed `OscTransmitterManager` at an Eos console / ETCnomad. `verify` reads Eos's own parameter values back and asserts the bundled ETC Eos templates' X/Y/Z mapping, exiting `0` (mapping correct) / `1` (mismatch or setup fault). `test` / `sweep` / `stream` drive the console for an operator to watch; their exit code reports only whether the sends reached the socket. |
+| `marker_catalog_two_station.py` | workstation | Reproduces the clock-skew marker-rename revert across two stations: steps station B's clock ahead, renames on A, asserts the rename holds on both. Exits `0` (PASS) / `1` (FAIL). |
+| `osc_marker_paths.py` | companion / workstation | Drives any number of markers along predefined paths (circle, figure8, line, square, spiral, random, static) over OSC, so a receiver can be checked against motion rather than a single static write. Stdlib only. `--dry-run` prints the samples instead of sending. |
+| `multi_interface_two_station.py` | workstation | Drives the multi-interface feature end-to-end: creates a tagged VLAN from the web UI, asserts it becomes a pinnable netdev, exercises the delete guards, then proves PSN leaves tagged on the pinned NIC and **stops** when its interface is unavailable. Exits `0` (PASS) / `1` (FAIL). |
+| `discovery_containment_probe.py` | DUT | Tallies discovery-beacon and marker-catalog-sync datagrams **per interface, by source IP**, over one window, and asserts either silence everywhere or traffic on one interface and nowhere else. Watches every interface at once, because a leak that moved to a second adapter reads as containment on the one interface you thought to watch. Exits `0` (PASS) / `1` (FAIL). |
+| `vlan_tag_probe.py` | DUT | Dependency-free raw-socket capture reporting the 802.1Q tag on each frame. A station ships no `tcpdump` and no uplink to install one. |
+| `dhcp_fqdn_probe.py` | companion | Watches the station's DHCP requests by MAC and asserts the Station FQDN went out as option 81 (S and E flags set, no option 12), or after Remove FQDN, the hostname as option 12 and no option 81. Exits `0` (PASS) / `1` (FAIL) / `2` (no request seen). |
+
+## DUT-local probes (no companion)
+
+`psn_packet_size_probe.py` and `osc_socket_options_probe.py` validate OS-level
+socket behaviour that fake-socket unit tests can't reach, entirely on the DUT –
+no second device, no service stop. Each exits `0` (PASS) / `1` (FAIL):
+
+```sh
+# On the DUT, from the repo root
+poetry run python scripts/hw_validation/psn_packet_size_probe.py
+poetry run python scripts/hw_validation/output_datagram_size_probe.py
+poetry run python scripts/hw_validation/osc_socket_options_probe.py
+```
+
+- **PSN receive** – a PSN data packet crosses 1500 B at ~15 trackers; a
+  `recvfrom(1500)` receiver then silently drops the tail markers every frame.
+  The probe confirms the deployed receiver's buffer covers a realistic packet
+  (40 trackers ≈ 2.1 kB).
+- **Live consumers** – `output_protocol_driver.py` is the one that needs a
+  second machine, but only as a *viewer*: it transmits and you watch. Point the
+  consumer at a **wired** interface. PSN and OTP are multicast at 60 Hz, and
+  60 Hz multicast is routinely dropped over Wi-Fi while low-rate advertisement
+  traffic survives - which looks exactly like a broken split. RTTrPM is unicast,
+  so it needs `--rttrpm-host <consumer IP>`.
+
+  OTPView and OTPAnalyzer both bind UDP `*:5568` without `SO_REUSEPORT`, so only
+  one of them can run at a time; the second silently shows nothing. A packet
+  capture has to bind the group address rather than the wildcard to coexist.
+
+  The paging boundary is where to look: at 40 markers the OTP transform splits
+  31 + 9, so **points 32-40 are the ones that only appear if paging works**, and
+  the name advertisement splits 35 + 5, so **names 36-40 are the second paged
+  stream's proof**. Everything below those numbers rides on page 0 and looks
+  identical either way.
+
+  `--reverse-ids` registers markers highest id first. The OTP name
+  advertisement has to carry one ascending list per *folio* (Section 13.5) and
+  a page can only sort what it is handed, so an ascending marker list cannot
+  tell a correct split from one that sorts each page separately - this is the
+  flag that makes the difference visible on the wire.
+- **Output sizes** – every marker-carrying output splits a large set across
+  datagrams rather than emitting one oversize datagram. The probe walks the
+  marker counts that straddle each stream's boundary (PSN data 14, OTP transform
+  32, RTTrPM 35, OTP name advertisement 36, PSN info 85 with short labels) and
+  reports the largest datagram per stream.
+- **OSC** – a plain `SimpleUDPClient` to `255.255.255.255` raises `EACCES`; the
+  probe confirms the deployed `_make_client` sets `SO_BROADCAST` (and reports the
+  multicast TTL/loop) so broadcast/multicast rows actually transmit.
+- **OSC input interface** – `osc_listen_iface_probe.py` writes a marker over OSC
+  and reads the position back through the web API, so it proves *delivery* on a
+  station with several adapters, not just what `/proc/net/igmp` claims. It needs
+  a marker id and the web PIN:
+
+  ```sh
+  sudo /opt/openfollow/venv/bin/python \
+      scripts/hw_validation/osc_listen_iface_probe.py --marker 301 --pin 0303
+  ```
+
+  Both halves have to hold at once, and either alone passes while the feature is
+  broken: the group arrives **only** via the pinned interface, and unicast still
+  arrives via **every** one. A listener bound to a single address satisfies the
+  first and fails the second in silence – the join keeps reporting success while
+  no multicast is ever delivered. Where the group belongs is read from
+  `config.toml` (`osc.listen_iface`, else `psn_source_iface`), never from
+  `/proc/net/igmp`: judged against the kernel alone, a join on the wrong adapter
+  matches itself and passes.
+
+  Worth running **after an interface flap**, not only from a clean boot. A
+  membership that cannot be released strands the group on the adapter the pin
+  moved off, which a probe run on a freshly-started station cannot see.
+
+- **Sender egress pin** – `egress_pin_probe.py` checks that RTTrPM and OSC
+  output pinned to an interface leave on it or not at all, against the
+  deployed `pin_socket_egress`. Run it as root (it captures with AF_PACKET),
+  pinned to one interface, with `--other-dest` an address the routing table
+  sends out of another interface and that answers ARP there:
+
+  ```sh
+  sudo /opt/openfollow/venv/bin/python \
+      scripts/hw_validation/egress_pin_probe.py --iface eth0.13 --other-dest 192.0.2.50
+  ```
+
+  It applies the pin as the service user, then sends unicast, limited
+  broadcast, multicast and a TCP connect pinned, each after the same traffic
+  unpinned as a control, and fails any leak onto another interface. A control
+  that never reaches another interface fails too: the capture could not have
+  seen a leak. It also reports what a pinned socket does with 127.0.0.1, which
+  is why loopback destinations are never pinned.
+
+## Station FQDN on the wire (companion)
+
+`dhcp_fqdn_probe.py` runs as root on the companion, on an interface that shares a
+network with the station, and checks what the station sends its DHCP server.
+Start it, then save the Station FQDN on the station (or press Remove FQDN): the
+save reconnects every interface, and a reconnecting client broadcasts its
+request, so it reaches the companion.
+
+```sh
+sudo python3 scripts/hw_validation/dhcp_fqdn_probe.py --iface eth0 \
+    --mac 02:00:5e:00:53:01 --expect-fqdn of-1.stage.example.com
+sudo python3 scripts/hw_validation/dhcp_fqdn_probe.py --iface eth0 \
+    --mac 02:00:5e:00:53:01 --expect-hostname openfollow-noble-bear
+```
+
+Capture at the companion, not on the station: a capture on the sender shows
+what left it, not what arrived. A renewal is unicast to the server and never
+reaches the companion, so a quiet window is inconclusive (`2`), never a pass.
+
+## Eos console / ETCnomad axis convention
+
+`eos_console_probe.py` verifies the bundled **ETC Eos** templates against a real
+console. Unit tests pin the wire bytes; only hardware can say which axis each
+argument lands on. The probe drives the deployed `OscTransmitterManager` and
+`OscService`, so the bytes on the wire are the app's, not a re-render.
+
+```sh
+# assert the axis mapping - reads Eos's own values back, no human needed
+python3 scripts/hw_validation/eos_console_probe.py --host <EOS_IP> --channel 401 verify
+
+# look at it yourself: one packet / one axis at a time / 30 Hz soak
+python3 scripts/hw_validation/eos_console_probe.py --host <EOS_IP> --channel 401 test
+python3 scripts/hw_validation/eos_console_probe.py --host <EOS_IP> --channel 401 sweep
+python3 scripts/hw_validation/eos_console_probe.py --host <EOS_IP> --channel 401 stream
+```
+
+`verify` exits `0` / `1` and needs **OSC TX enabled on the console** pointed back
+at `--rx-port` (default 8001). The other three report only that the sends left
+the transmitter; their verdict is the operator's, from Augment3d.
+
+**Console setup, the failure modes, and the Eos behaviours that mislead a manual
+run are in [`docs/EOS_NOMAD_VERIFICATION.md`](../../docs/EOS_NOMAD_VERIFICATION.md).**
+Read it before a first run - notably that Eos silently discards OSC arriving on a
+duplicate-subnet interface, which looks exactly like a broken template.
+
+## Two-station marker-catalog conflict (clock skew)
+
+`marker_catalog_two_station.py` runs from a **workstation** (not the Pis) and
+drives both stations over HTTP + SSH. It reproduces the field bug where a
+clock-ahead peer's stale catalog entry reverted a fresh marker rename: it pauses
+NTP and steps station B's clock ~1 h ahead so B's write carries a far-future
+`updated_at`, renames the marker on A (normal clock), then asserts both stations
+converge on A's name and hold it. B's clock + NTP are restored in a `finally`.
+
+The catalog resolves conflicts by a Lamport logical clock, so the rename wins
+despite the skew (on the old wall-clock code the test FAILS – B keeps the stale
+name). Needs HTTP reachability to both web UIs and passwordless SSH (key auth) to
+both as a sudo-capable user. The marker id must already exist in the catalog.
+
+```sh
+# From a workstation on the same LAN
+python3 scripts/hw_validation/marker_catalog_two_station.py \
+    --a <STATION_A_IP> --b <STATION_B_IP> \
+    --ssh-user openfollow --ssh-key ~/.ssh/openfollow_pi
+```
+
+## Running
+
+The receiver imports the installed package, so run it from the repo root on the
+DUT. If you bind the device's configured OSC port (8765), stop the app first so
+the port is free:
+
+```sh
+# On the DUT
+sudo systemctl stop openfollow.service
+cd /home/openfollow/openfollow
+python3 scripts/hw_validation/operator_message_receiver.py \
+    --port 8765 --group 239.20.20.20 --controlled 3,4 --window 15 &
+# wait for the readiness marker (/tmp/of_validate_ready) before sending
+
+# On the companion Pi (after readiness)
+cd /home/openfollow/openfollow
+python3 scripts/hw_validation/operator_message_sender.py --host <DUT_IP> --port 8765
+
+# Back on the DUT once the window closes
+python3 scripts/hw_validation/analyze_results.py /tmp/of_validate_out.json
+sudo systemctl start openfollow.service
+```
+
+The receiver/sender/analyzer need `pythonosc`, which the project venv provides
+(`poetry run python ...`). `raw_udp_probe.py` is pure stdlib.
+
+## What it checks
+
+Unicast + multicast receive; broadcast routing (markerId 0); marker routing
+accept (controlled ids) vs drop (uncontrolled); negative-id and empty-message
+drops; the `info`/`seconds` fields; clear-by-marker and clear-all.
+
+Overlay-only concerns (title bar, compact layout, `+N more` overflow, top/bottom
+placement) are render-layer, not OSC-driven, and are covered by the unit suite
+plus on-screen checks – not by this network harness.
+
+## Known caveat: port reachability
+
+On the test bench, UDP to an **arbitrary** port (8790) never reached the DUT
+from either the companion Pi or a laptop, while the configured OSC port **8765**
+worked – with **no firewall** on the DUT (nft/ufw/firewalld inactive, iptables
+absent). Likely switch/AP isolation of non-service ports. Until that's
+understood, **bind the harness to 8765** (stop the app first), and run
+`raw_udp_probe.py` as a preflight if a run records zero packets:
+
+```sh
+# DUT
+python3 scripts/hw_validation/raw_udp_probe.py listen --port 8765
+# companion
+python3 scripts/hw_validation/raw_udp_probe.py send --host <DUT_IP> --port 8765
+```
+
+## Multi-interface networking (two stations)
+
+`multi_interface_two_station.py` runs from a **workstation** and drives the DUT
+over HTTP + SSH. It is the hardware half of issue #50 - the parts a fake-socket
+test cannot reach, because they depend on real frames on a real wire.
+
+```sh
+python3 scripts/hw_validation/multi_interface_two_station.py \
+    --dut <DUT_IP> --parent eth0 --vlan-id 10 \
+    --ssh-user openfollow --ssh-key ~/.ssh/openfollow_pi --pin <WEB_PIN>
+```
+
+The two load-bearing checks:
+
+- **Traffic separation** - with PSN pinned to `eth0.10`, every PSN frame on the
+  parent carries `vlan 10` and none from this station is untagged. If PSN
+  appears untagged on the office LAN the feature has failed at its purpose.
+- **Fail closed** - pinning to an interface that has no address must make PSN
+  **stop**, closing its sockets rather than rebinding. On a show a dead output
+  is diagnosable and a misrouted one is not.
+
+### Four things that make this harder than it looks
+
+**A trunk port is not needed for the tagging check.** Tagging is done by the
+host: sending via `eth0.10` makes the kernel add the VLAN header before the
+frame reaches `eth0`, so capturing on the parent proves the pin is honoured
+even on an access port. Only end-to-end delivery to a second station needs a
+trunk. Capture on the **parent** - the VLAN interface sees its own frames
+untagged.
+
+**There is no `tcpdump` on a station**, and the offline contract means a
+validation step cannot install one. `vlan_tag_probe.py` is a raw `AF_PACKET`
+socket in the bundled venv's Python. A tcpdump-based check reports "no traffic"
+on every station, which reads as a pass.
+
+**A tag is in the frame on the way out and in socket metadata on the way in.**
+The kernel lifts an 802.1Q header off on ingress, so reading the ethernet header
+alone finds the tag at the sender and nothing at the receiver - a delivered
+frame reports as untagged, which reads as a leak. The probe asks for
+`PACKET_AUXDATA` and recovers the tag from there, the same source tcpdump uses
+to print `vlan 10`. Note also that a capture sees a multicast group only if
+something on that host has joined it: without a joiner the switch prunes the
+group and the capture reports zero frames, which reads as "never arrived".
+
+**A VLAN is not pinnable until it has an address.** The interface pickers list
+interfaces that *have* an IPv4, so a freshly created VLAN is absent from them
+until `Configure` gives it one. The Create banner says so; the script skips the
+traffic phases rather than reporting a false failure.
+
+**Do not set the pin through `/api/config/interface_assignment`.**
+`psn_source_iface` is device-local, so the JSON section API strips it and
+answers `{"success": true}` having written nothing - every later assertion then
+measures the old pin. The panel's form POST to `/section/interface_assignment`
+is the working path, and the script re-reads the pin to confirm it landed.
+
+### Why the fail-closed check has no cross-station control
+
+Suspending PSN stops the *receiver* as well, which drops the DUT's IGMP
+membership for the group. The switch then prunes it from that port, so **every**
+station's PSN vanishes from the capture, not just the DUT's. A second station is
+therefore not a usable control here; the DUT's own closed send socket plus the
+journal line naming the interface are the direct evidence, and that is what the
+script asserts.
+
+The script restores what it changed in a `finally`: the PSN pin returns to its
+original value and the VLAN it created is deleted. It refuses to start if the
+VLAN name already exists, so cleanup can never remove one you rely on.
+
+`--other-nic` and `--companion` are optional; both skip loudly when absent
+rather than passing vacuously.

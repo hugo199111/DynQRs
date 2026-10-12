@@ -1,0 +1,1172 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""Tests for person detection: NMS, ByteTrack track-ID stickiness, and box post-processing."""
+
+from __future__ import annotations
+
+import dataclasses
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from openfollow.configuration import DetectionConfig
+
+pytestmark = pytest.mark.unit
+
+
+def _load_detection_module():
+    pytest.importorskip("cv2")
+    import openfollow.video.detection as detection_module
+
+    return detection_module
+
+
+def test_track_keeps_track_id_stable() -> None:
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False))
+
+    first = detector._track([detection_module.DetectionBox(0.10, 0.10, 0.40, 0.60, 0.9)])
+    second = detector._track([detection_module.DetectionBox(0.11, 0.11, 0.41, 0.61, 0.8)])
+
+    assert len(first) == 1
+    assert len(second) == 1
+    assert second[0].track_id == first[0].track_id
+
+
+def test_check_detection_dependencies_reports_cv2_when_import_failed(monkeypatch) -> None:
+    import openfollow.video.detection as detection_module
+
+    monkeypatch.setattr(detection_module, "_CV2_IMPORT_ERROR", "simulated cv2 gone")
+
+    missing = detection_module.check_detection_dependencies(
+        DetectionConfig(model="yolov8n.onnx"),
+    )
+    assert "opencv-python" in missing
+
+
+def test_check_detection_dependencies_reports_missing_onnxruntime(monkeypatch) -> None:
+    import openfollow.video.detection as detection_module
+
+    # cv2 present, onnxruntime absent – its absence is reported.
+    monkeypatch.setattr(detection_module, "_CV2_IMPORT_ERROR", None)
+
+    def _fake_find_spec(name: str):
+        return None if name == "onnxruntime" else object()
+
+    monkeypatch.setattr(detection_module.importlib.util, "find_spec", _fake_find_spec)
+
+    assert detection_module.check_detection_dependencies(
+        DetectionConfig(model="yolov8n.onnx"),
+    ) == ["onnxruntime"]
+
+
+def test_check_detection_dependencies_empty_when_all_present(monkeypatch) -> None:
+    import openfollow.video.detection as detection_module
+
+    monkeypatch.setattr(detection_module, "_CV2_IMPORT_ERROR", None)
+    monkeypatch.setattr(detection_module.importlib.util, "find_spec", lambda name: object())
+
+    # Works with or without a config; the config does not change the result.
+    assert detection_module.check_detection_dependencies() == []
+    assert detection_module.check_detection_dependencies(DetectionConfig(model="x.onnx")) == []
+
+
+def test_tracked_detection_obeys_grace_period_then_reacquires(monkeypatch) -> None:
+    detection_module = _load_detection_module()
+    cfg = DetectionConfig(enabled=False, grace_period_ms=500)
+    detector = detection_module.PersonDetector(cfg)
+
+    pinned_box = detection_module.DetectionBox(0.2, 0.2, 0.5, 0.8, 0.95, track_id=7)
+    detector._tracked = [detection_module._TrackedPerson(track_id=7, box=pinned_box, last_seen=10.0)]
+    detector._pinned_id = 7
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 10.2)
+
+    # Within grace: sticky return of the pinned person's box, aged live past
+    # the one-interval gap a fresh match would show.
+    sticky = detector.tracked_detection
+    assert dataclasses.replace(sticky, age_s=0.0) == pinned_box
+    assert sticky.age_s == pytest.approx(0.2 - cfg.interval_ms / 1000.0)
+
+    # Grace expired: the pin releases and re-acquires the visible detection at the
+    # same place (same centre as the pinned box), now under a new track_id.
+    reacquired_box = detection_module.DetectionBox(0.25, 0.2, 0.45, 0.8, 0.7, track_id=42)
+    detector._results = [reacquired_box]
+    detector._tracked = [detection_module._TrackedPerson(track_id=7, box=pinned_box, last_seen=9.0)]
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 10.0)
+
+    chosen = detector.tracked_detection
+    assert chosen is reacquired_box
+    assert detector._pinned_id == 42
+
+
+def test_nms_suppresses_strong_overlap_and_keeps_non_overlapping() -> None:
+    import openfollow.video.detection as detection_module
+
+    boxes = np.array(
+        [
+            [0.0, 0.0, 1.0, 1.0],  # high score, kept
+            [0.05, 0.05, 1.05, 1.05],  # ~88% IoU with #0, suppressed
+            [5.0, 5.0, 6.0, 6.0],  # disjoint, kept
+        ],
+        dtype=np.float32,
+    )
+    scores = np.array([0.9, 0.8, 0.7], dtype=np.float32)
+
+    keep = detection_module._nms(boxes, scores, iou_threshold=0.45)
+    assert keep == [0, 2]
+
+
+def test_nms_returns_empty_for_empty_inputs() -> None:
+    import openfollow.video.detection as detection_module
+
+    empty_boxes = np.empty((0, 4), dtype=np.float32)
+    empty_scores = np.empty((0,), dtype=np.float32)
+    assert detection_module._nms(empty_boxes, empty_scores) == []
+
+
+def test_nms_orders_kept_indices_by_descending_score() -> None:
+    import openfollow.video.detection as detection_module
+
+    # Three disjoint boxes with deliberately-unsorted scores.
+    boxes = np.array(
+        [
+            [0.0, 0.0, 1.0, 1.0],
+            [2.0, 2.0, 3.0, 3.0],
+            [4.0, 4.0, 5.0, 5.0],
+        ],
+        dtype=np.float32,
+    )
+    scores = np.array([0.3, 0.9, 0.6], dtype=np.float32)
+
+    keep = detection_module._nms(boxes, scores, iou_threshold=0.45)
+    assert keep == [1, 2, 0]
+
+
+def test_prepare_predictions_converts_batch_channel_first_layout() -> None:
+    import openfollow.video.detection as detection_module
+
+    # Real YOLOv8 ONNX output is [1, 84, 8400]. _prepare_predictions should
+    # drop the batch and transpose to [N, 84] so per-row access is sane.
+    raw = np.zeros((1, 84, 1000), dtype=np.float32)
+    out = detection_module._OnnxBackend._prepare_predictions(raw)
+    assert out.shape == (1000, 84)
+
+
+def test_prepare_predictions_transposes_channel_first_2d() -> None:
+    import openfollow.video.detection as detection_module
+
+    raw = np.zeros((84, 500), dtype=np.float32)
+    out = detection_module._OnnxBackend._prepare_predictions(raw)
+    assert out.shape == (500, 84)
+
+
+def test_prepare_predictions_leaves_row_major_untouched() -> None:
+    import openfollow.video.detection as detection_module
+
+    raw = np.zeros((1000, 84), dtype=np.float32)
+    out = detection_module._OnnxBackend._prepare_predictions(raw)
+    assert out.shape == (1000, 84)
+
+
+def test_prepare_predictions_returns_empty_for_unusable_shapes() -> None:
+    import openfollow.video.detection as detection_module
+
+    # 1D and 4D both miss the ``ndim == 2`` (after optional batch strip)
+    # expectation and should collapse to an empty float32 array so the
+    # caller's ``pred.size == 0`` guard trips safely.
+    assert detection_module._OnnxBackend._prepare_predictions(np.zeros((84,))).size == 0
+    assert detection_module._OnnxBackend._prepare_predictions(np.zeros((1, 1, 84, 100))).size == 0
+
+
+def test_to_positive_int_accepts_only_positive_ints() -> None:
+    import openfollow.video.detection as detection_module
+
+    assert detection_module._OnnxBackend._to_positive_int(320) == 320
+    # Dynamic ONNX dims are strings like "height"; treat as unknown.
+    assert detection_module._OnnxBackend._to_positive_int("height") is None
+    assert detection_module._OnnxBackend._to_positive_int(0) is None
+    assert detection_module._OnnxBackend._to_positive_int(-5) is None
+
+
+def test_extract_input_size_picks_max_of_h_w() -> None:
+    import openfollow.video.detection as detection_module
+
+    # NCHW shape with static dims returns max(h, w).
+    assert detection_module._OnnxBackend._extract_input_size((1, 3, 480, 640)) == 640
+
+
+def test_extract_input_size_returns_none_for_dynamic_or_short_shape() -> None:
+    import openfollow.video.detection as detection_module
+
+    assert detection_module._OnnxBackend._extract_input_size((1, 3)) is None
+    assert detection_module._OnnxBackend._extract_input_size((1, 3, "height", "width")) is None
+
+
+def test_letterbox_preserves_aspect_and_centers_padding() -> None:
+    detection_module = _load_detection_module()
+
+    # 200x100 image (landscape) at target 320 – scale is 320/200=1.6, so
+    # final inner size is 320x160 with 80px of padding on top and bottom.
+    src = np.full((100, 200, 3), 255, dtype=np.uint8)
+    padded, scale, (pad_x, pad_y) = detection_module._letterbox(src, 320)
+
+    assert padded.shape == (320, 320, 3)
+    assert scale == pytest.approx(1.6)
+    assert (pad_x, pad_y) == (0, 80)
+    # Padding band must be the neutral 114 used by YOLO preprocessing.
+    assert padded[0, 0, 0] == 114
+    # Interior must be the resized content (white), not padding.
+    assert padded[160, 160, 0] == 255
+
+
+def test_letterbox_handles_zero_sized_input() -> None:
+    detection_module = _load_detection_module()
+
+    src = np.zeros((0, 0, 3), dtype=np.uint8)
+    padded, scale, offsets = detection_module._letterbox(src, 320)
+    assert padded.shape == (320, 320, 3)
+    assert scale == 1.0
+    assert offsets == (0, 0)
+
+
+def test_percentile_returns_zero_for_empty() -> None:
+    import openfollow.video.detection as detection_module
+
+    assert detection_module.PersonDetector._percentile([], 95.0) == 0.0
+
+
+def test_percentile_returns_expected_sample() -> None:
+    import openfollow.video.detection as detection_module
+
+    # nearest-rank at p95 over 0..99 is idx=round(0.95*99)=94 → value 94.
+    values = [float(v) for v in range(100)]
+    assert detection_module.PersonDetector._percentile(values, 95.0) == 94.0
+
+
+def test_normalize_inference_size_snaps_to_multiple_of_32() -> None:
+    import openfollow.video.detection as detection_module
+
+    assert detection_module.PersonDetector._normalize_inference_size(500) == 480
+    assert detection_module.PersonDetector._normalize_inference_size(320) == 320
+
+
+def test_normalize_inference_size_clamps_to_bounds() -> None:
+    import openfollow.video.detection as detection_module
+
+    # Below 160 is clamped up; above 1280 is clamped down to a multiple of 32.
+    assert detection_module.PersonDetector._normalize_inference_size(10) == 160
+    assert detection_module.PersonDetector._normalize_inference_size(5000) == 1280
+
+
+def test_performance_stats_shape_matches_services_template() -> None:
+    """The detector's dict shape is the contract consumed by services.py's
+    runtime-stats fallback; if a key is renamed here without updating the
+    fallback, the web UI silently renders 0/None instead of live values."""
+    import openfollow.video.detection as detection_module
+
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False))
+    stats = detector.performance_stats
+
+    expected_keys = {
+        "enabled",
+        "available",
+        "running",
+        "model",
+        "interval_ms",
+        "inference_count",
+        "inference_hz",
+        "inference_avg_ms",
+        "inference_p95_ms",
+        "inference_max_ms",
+        "inference_last_ms",
+        "inference_errors",
+        "sample_timeouts",
+        "sample_failures",
+        "detections_last",
+        "detections_avg",
+        "tracked_people",
+        "pinned_track_id",
+        "last_inference_age_ms",
+    }
+    assert expected_keys.issubset(stats.keys())
+    assert stats["enabled"] is False
+    assert stats["available"] is False
+    assert stats["running"] is False
+    assert stats["pinned_track_id"] is None
+    assert stats["last_inference_age_ms"] is None
+
+
+def test_track_assigns_fresh_ids_to_new_detections() -> None:
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False))
+
+    boxes = [
+        detection_module.DetectionBox(0.1, 0.1, 0.2, 0.3, 0.9),
+        detection_module.DetectionBox(0.6, 0.6, 0.7, 0.8, 0.8),
+    ]
+    tracked = detector._track(boxes)
+
+    assert len(tracked) == 2
+    ids = {t.track_id for t in tracked}
+    assert len(ids) == 2  # two distinct ids
+    assert -1 not in ids  # sentinel replaced by real id
+
+
+def test_track_caps_results_to_highest_confidence() -> None:
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, max_persons=2))
+
+    boxes = [
+        detection_module.DetectionBox(0.00, 0.0, 0.10, 0.30, 0.30),  # lowest conf
+        detection_module.DetectionBox(0.30, 0.0, 0.45, 0.40, 0.90),  # highest conf
+        detection_module.DetectionBox(0.70, 0.0, 0.85, 0.50, 0.50),  # mid conf
+    ]
+    tracked = detector._track(boxes)
+
+    # Capped to max_persons, keeping the highest-confidence detections (the
+    # documented "Max Persons ... (highest-confidence first)" contract).
+    assert len(tracked) == 2
+    assert sorted(round(b.confidence, 2) for b in tracked) == [0.50, 0.90]
+
+
+def test_track_carries_lost_track_for_the_span_it_is_handed_out(monkeypatch) -> None:
+    """A lost track is retained for the step period plus the coast window, the
+    span ``tracked_detection`` hands its predicted box out for, so the status
+    fade completes before the track drops."""
+    detection_module = _load_detection_module()
+    cfg = DetectionConfig(enabled=False, grace_period_ms=500, interval_ms=100)
+    detector = detection_module.PersonDetector(cfg)
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.0)
+    first = detector._track([detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)])
+    assert len(first) == 1
+    first_id = first[0].track_id
+
+    # Missed on every 100 ms step: carried, though never returned as a fresh match.
+    for t in (100.1, 100.2, 100.3, 100.4, 100.5, 100.59):
+        monkeypatch.setattr(detection_module.time, "monotonic", lambda t=t: t)
+        assert detector._track([]) == []
+        assert any(t.track_id == first_id for t in detector._tracked)
+
+    # One step past the window – the carry-over drops.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.7)
+    assert detector._track([]) == []
+    assert all(t.track_id != first_id for t in detector._tracked)
+
+
+def test_the_fade_completes_before_the_tracker_drops_the_track(monkeypatch) -> None:
+    """A step landing just past the grace period must not remove a track whose
+    status still reads well above zero; the last box handed out has coasted the
+    whole window."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=500, interval_ms=100))
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.0)
+    (first,) = detector._track([detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)])
+    detector._pinned_id = first.track_id
+    for t in (100.1, 100.2, 100.3, 100.4):
+        monkeypatch.setattr(detection_module.time, "monotonic", lambda t=t: t)
+        detector._track([])
+
+    # A 120 ms step lands past the grace period: still carried, status at 20 %.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.52)
+    detector._track([])
+    assert detector.tracked_detection.age_s == pytest.approx(0.4)
+
+    # The last step inside the window still hands the box out, all but faded.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.61)
+    detector._track([])
+    assert detector.tracked_detection.age_s == pytest.approx(0.49)
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.72)
+    detector._track([])
+    assert detector.tracked_detection is None
+
+
+def test_with_no_grace_a_missed_step_coasts_for_one_step_then_drops(monkeypatch) -> None:
+    """A zero grace keeps the one step of headroom: the step that misses the
+    person carries the track so the fade can run, and the next step drops it."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=0, interval_ms=100))
+    person = detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)
+
+    for t in (100.0, 100.1):
+        monkeypatch.setattr(detection_module.time, "monotonic", lambda t=t: t)
+        (box,) = detector._track([person])
+    detector._results = [box]
+    assert detector.tracked_detection is box
+
+    # Missed: carried on prediction, fresh at the step and fading across the headroom.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.2)
+    assert detector._track([]) == []
+    detector._results = []
+    assert detector.tracked_detection.age_s == 0.0
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.25)
+    assert detector.tracked_detection.age_s == pytest.approx(0.05)
+
+    # Missed again, just inside the window: the box goes out all but faded.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.29)
+    assert detector._track([]) == []
+    assert detector.tracked_detection.age_s == pytest.approx(0.09)
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.4)
+    assert detector._track([]) == []
+    assert detector.tracked_detection is None
+
+
+def test_track_reports_how_long_a_lost_track_has_coasted(monkeypatch) -> None:
+    """A coasting box says how long it has coasted past the step due to re-match
+    it, and keeps its last matched score, which is what the PSN tracker status
+    decays from. One missed step is the same age a live read would give the
+    box, so the two definitions cannot sawtooth against each other."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=500))
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.0)
+    (first,) = detector._track([detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)])
+    assert first.age_s == 0.0
+
+    # One missed step on a 200 ms cadence: due now, not yet coasting.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.2)
+    assert detector._track([]) == []
+    (coasting,) = detector._tracked
+    assert coasting.box.age_s == 0.0
+    assert coasting.box.confidence == pytest.approx(0.9)
+
+    # Two missed steps: one step past due.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.4)
+    assert detector._track([]) == []
+    (coasting,) = detector._tracked
+    assert coasting.box.age_s == pytest.approx(0.2)
+
+    # The pinned person's box hands that age out while the grace period runs.
+    detector._pinned_id = first.track_id
+    assert detector.tracked_detection.age_s == pytest.approx(0.2)
+
+    # Matched again: the age resets.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.5)
+    (again,) = detector._track([detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.8)])
+    assert again.track_id == first.track_id
+    assert again.age_s == 0.0
+
+
+def test_a_missed_step_reads_the_same_age_stamped_or_live(monkeypatch) -> None:
+    """At the moment a step misses, the age the step stamps on the lost track
+    equals the age a live read gave the box the instant before."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=500, interval_ms=100))
+    person = detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)
+
+    for t in (100.0, 100.3):
+        monkeypatch.setattr(detection_module.time, "monotonic", lambda t=t: t)
+        (box,) = detector._track([person])
+    detector._pinned_id = box.track_id
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.6)
+    live = detector.tracked_detection.age_s
+    assert detector._track([]) == []
+    assert detector.tracked_detection.age_s == pytest.approx(live)
+    assert live == 0.0
+
+
+def test_tracked_detection_ages_the_pinned_box_while_the_detector_stalls(monkeypatch) -> None:
+    """A matched box is stamped with age 0, but a detector that stops stepping
+    must not keep handing it out as a fresh sighting: the age is measured live,
+    and results older than the grace period re-acquire nothing."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=500, interval_ms=100))
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.0)
+    (first,) = detector._track([detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)])
+    detector._results = [first]
+    detector._pinned_id = first.track_id
+    assert detector.tracked_detection.age_s == 0.0
+
+    # One interval is the normal gap between matches; beyond it the box is coasting.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.05)
+    assert detector.tracked_detection.age_s == 0.0
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.4)
+    assert detector.tracked_detection.age_s == pytest.approx(0.3)
+
+    # The fade runs to the end of the grace period: the last box handed out has
+    # coasted exactly that long, so the status it feeds reaches 0.0 before the drop.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.6)
+    assert detector.tracked_detection.age_s == pytest.approx(0.5)
+
+    # Past grace: the pin releases and the frozen results must not re-acquire it.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.61)
+    assert detector.tracked_detection is None
+
+
+def test_tracked_detection_with_no_grace_keeps_a_match_for_one_interval(monkeypatch) -> None:
+    """A zero grace period means no coasting, not no tracking: the frame loop
+    runs between detector steps, so a match must stay valid for the normal gap
+    between steps and lapse only once the detector misses one by a whole step."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=0, interval_ms=100))
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.0)
+    (first,) = detector._track([detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)])
+    detector._results = [first]
+
+    # Between steps: cold-start acquire, then sticky, both unaged.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.05)
+    assert detector.tracked_detection is first
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.09)
+    assert detector.tracked_detection is first
+
+    # The detector stepped on time: still a fresh match.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.1)
+    (again,) = detector._track([detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)])
+    detector._results = [again]
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.15)
+    assert detector.tracked_detection.age_s == 0.0
+
+    # One step overdue: still handed out, aged, across one step of headroom.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.21)
+    assert detector.tracked_detection.age_s == pytest.approx(0.01)
+
+    # A whole step overdue: the pin lapses and the stale results re-acquire nothing.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.31)
+    assert detector.tracked_detection is None
+
+
+def test_tracked_detection_allows_for_the_detectors_own_step_period(monkeypatch) -> None:
+    """``interval_ms`` only bounds the pull; inference time sets the real gap
+    between steps. A person matched on every step must not read as coasting
+    between them, or the status would sawtooth at the step rate."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=0, interval_ms=100))
+    person = detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.0)
+    detector._track([person])
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.3)
+    (again,) = detector._track([person])
+    detector._results = [again]
+
+    # 250 ms after a step on a 300 ms cadence: fresh, acquired and sticky.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.55)
+    assert detector.tracked_detection is again
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.59)
+    assert detector.tracked_detection.age_s == 0.0
+
+    # Overdue by more than a whole step: lapsed.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.91)
+    assert detector.tracked_detection is None
+
+
+def test_tracked_detection_with_no_grace_survives_a_step_longer_than_the_recent_ones(monkeypatch) -> None:
+    """The allowance is the longest recent step, so a new longest step always
+    overruns it. Without headroom every such step would release the pin, reset
+    the smoothing and put 0.0 on the wire under a zero grace."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=0, interval_ms=100))
+    person = detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)
+
+    for t in (100.0, 100.1, 100.2):
+        monkeypatch.setattr(detection_module.time, "monotonic", lambda t=t: t)
+        (box,) = detector._track([person])
+    detector._results = [box]
+    assert detector.tracked_detection is box
+    pinned = detector._pinned_id
+
+    # This step takes 160 ms, 60 % over the recent 100 ms: overdue, but not lost.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.35)
+    overdue = detector.tracked_detection
+    assert overdue is not None
+    assert overdue.age_s == pytest.approx(0.05)
+    assert detector._pinned_id == pinned
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.36)
+    (box,) = detector._track([person])
+    detector._results = [box]
+    assert detector.tracked_detection is box
+    assert detector._pinned_id == pinned
+
+
+def test_an_outage_between_steps_does_not_become_the_allowance(monkeypatch) -> None:
+    """Pull timeouts, inference errors and backend rebuilds never step the
+    tracker, so the first step after one spans the whole outage. Recorded as a
+    step gap it would hand a frozen box out as fresh for as long as the outage
+    lasted; it is clamped like the Kalman dt instead."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=500, interval_ms=100))
+    person = detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)
+
+    for t in (100.0, 100.1, 160.0):  # a one-minute outage, then the feed is back
+        monkeypatch.setattr(detection_module.time, "monotonic", lambda t=t: t)
+        (box,) = detector._track([person])
+    detector._results = [box]
+    detector._pinned_id = box.track_id
+
+    # The detector stalls again right away. Eight nominal steps is the most the
+    # outage may count for, plus the grace: well under two seconds, not a minute.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 160.5)
+    assert detector.tracked_detection.age_s == 0.0
+    monkeypatch.setattr(
+        detection_module.time, "monotonic", lambda: 160.0 + 2 * detection_module._MAX_DT_REL * 0.1 + 0.01
+    )
+    assert detector.tracked_detection is None
+
+
+def test_a_reacquired_box_is_aged_like_a_sticky_one(monkeypatch) -> None:
+    """Results carry the age stamped at their step, 0 for a match. A re-acquire
+    from a stalled detector must hand the box out at its live age, not as a
+    fresh sighting the sticky path would age the very next frame."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=500, interval_ms=100))
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.0)
+    (first,) = detector._track([detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)])
+    detector._results = [first]
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.4)
+    reacquired = detector.tracked_detection
+    assert reacquired.track_id == first.track_id
+    assert reacquired.age_s == pytest.approx(0.3)
+    # The sticky path agrees on the next read.
+    assert detector.tracked_detection.age_s == pytest.approx(0.3)
+
+
+def test_tracked_detection_allowance_is_the_longest_recent_step(monkeypatch) -> None:
+    """A single quick step must not shrink the allowance to its own gap, or the
+    next normal-length gap reads as coasting."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=500, interval_ms=100))
+    person = detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)
+
+    for t in (100.0, 100.3, 100.4):
+        monkeypatch.setattr(detection_module.time, "monotonic", lambda t=t: t)
+        (box,) = detector._track([person])
+    detector._results = [box]
+    detector._pinned_id = box.track_id
+
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.65)
+    assert detector.tracked_detection.age_s == 0.0
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.8)
+    assert detector.tracked_detection.age_s == pytest.approx(0.1)
+
+
+def test_grace_s_mirrors_the_configured_grace_period() -> None:
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=750))
+    assert detector.grace_s == pytest.approx(0.75)
+
+
+def test_coast_s_is_the_grace_period_but_never_under_one_step(monkeypatch) -> None:
+    """The window the status fades across is the window a box is handed out
+    for, so the two cannot disagree on where 0.0 lands."""
+    detection_module = _load_detection_module()
+    person = detection_module.DetectionBox(0.1, 0.1, 0.4, 0.6, 0.9)
+
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=750, interval_ms=100))
+    assert detector.coast_s == pytest.approx(0.75)
+
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, grace_period_ms=0, interval_ms=100))
+    assert detector.coast_s == pytest.approx(0.1)  # no steps yet: the pull timeout
+    for t in (100.0, 100.3):
+        monkeypatch.setattr(detection_module.time, "monotonic", lambda t=t: t)
+        detector._track([person])
+    assert detector.coast_s == pytest.approx(0.3)  # the detector's own 300 ms cadence
+
+
+def test_confidence_threshold_mirrors_the_configured_confidence() -> None:
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False, confidence=0.35))
+    assert detector.confidence_threshold == pytest.approx(0.35)
+
+
+def test_pin_survives_confidence_dip_without_renumber(monkeypatch) -> None:
+    """End-to-end (re-acquisition + low-band recovery): a performer who goes
+    briefly undetected and then reappears dim (low band only) keeps their
+    track_id and stays pinned – the follow never re-numbers or jumps away."""
+    detection_module = _load_detection_module()
+    cfg = DetectionConfig(enabled=False, confidence=0.5, grace_period_ms=500)
+    detector = detection_module.PersonDetector(cfg)
+
+    # Frame 1: a high detection -> track created, auto-pin locks on.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.0)
+    detector._results = detector._track([detection_module.DetectionBox(0.30, 0.30, 0.50, 0.80, 0.9)])
+    pinned = detector.tracked_detection
+    assert pinned is not None
+    pinned_id = detector._pinned_id
+    assert pinned_id == pinned.track_id
+
+    # Frame 2: no detection at all -> the track goes lost (still within grace).
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.1)
+    detector._results = detector._track([])
+
+    # Frame 3: the performer reappears DIM (low band only) at the same place.
+    # The lost track is recovered from the low band and keeps its id.
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: 100.2)
+    detector._results = detector._track([detection_module.DetectionBox(0.31, 0.31, 0.49, 0.79, 0.3)])
+
+    assert pinned_id in {b.track_id for b in detector._results}  # recovered, same id
+    still = detector.tracked_detection
+    assert still is not None
+    assert detector._pinned_id == pinned_id  # never re-numbered, follow held
+
+
+def test_track_passes_elapsed_dt_to_tracker(monkeypatch) -> None:
+    """``_track`` converts real elapsed time into a nominal-interval-relative dt
+    for the Kalman: 1.0 on the first call, the true ratio after, clamped on a
+    back-to-back call so a zero gap can't stall the extrapolation."""
+    detection_module = _load_detection_module()
+    cfg = DetectionConfig(enabled=False, interval_ms=100)  # nominal step = 0.1s
+    detector = detection_module.PersonDetector(cfg)
+
+    captured: list[float] = []
+    real_update = detector._tracker.update
+
+    def spy(high, low, now, max_lost_time, dt=1.0):
+        captured.append(dt)
+        return real_update(high, low, now, max_lost_time, dt=dt)
+
+    monkeypatch.setattr(detector._tracker, "update", spy)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(detection_module.time, "monotonic", lambda: clock["t"])
+
+    detector._track([])  # first step: no prior timestamp -> dt 1.0
+    clock["t"] = 1000.2  # 200ms later, nominal 100ms -> dt 2.0
+    detector._track([])
+    detector._track([])  # same timestamp -> clamps to the floor
+
+    assert captured[0] == 1.0
+    assert captured[1] == pytest.approx(2.0)
+    assert captured[2] == pytest.approx(detection_module._MIN_DT_REL)
+
+
+# ---------------------------------------------------------------------------
+# Live config-apply
+# ---------------------------------------------------------------------------
+
+
+def test_reload_config_stages_pending_for_worker_drain() -> None:
+    """``reload_config`` runs on the GTK thread; it stages the new
+    config under ``_config_lock`` for the worker to pick up between
+    frames. The single-slot semantics mean two consecutive updates
+    collapse to the latest one."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False))
+
+    new_a = DetectionConfig(enabled=False, confidence=0.42)
+    detector.reload_config(new_a)
+    assert detector._pending_config is new_a
+
+    new_b = DetectionConfig(enabled=False, confidence=0.66)
+    detector.reload_config(new_b)
+    assert detector._pending_config is new_b
+
+
+def test_drain_swaps_hot_path_fields_without_rebuild() -> None:
+    """Hot-path fields (confidence, max_persons, interval_ms,
+    grace_period_ms) are read inside the worker loop on every frame;
+    the drain swaps them in place with no backend rebuild."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False))
+    new_cfg = DetectionConfig(
+        enabled=False,
+        confidence=0.85,
+        max_persons=3,
+        interval_ms=50,
+        grace_period_ms=1000,
+    )
+    detector._pending_config = new_cfg
+
+    rebuild_calls: list[str | None] = []
+
+    def _spy_load(base_model_path: str | None = None) -> None:
+        rebuild_calls.append(base_model_path)
+
+    detector._load_backend = _spy_load  # type: ignore[method-assign]
+
+    detector._drain_pending_config()
+
+    assert detector._config is new_cfg
+    assert detector._pending_config is None
+    assert rebuild_calls == []
+
+
+def test_drain_does_not_live_swap_inference_size() -> None:
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(
+        DetectionConfig(enabled=False, inference_size=320),
+    )
+    assert detector._inference_size == 320
+
+    # Pending config has a different inference_size but no other
+    # cold-path field changed (so the rebuild branch doesn't fire).
+    detector._pending_config = DetectionConfig(enabled=False, inference_size=640)
+    detector._drain_pending_config()
+
+    # Worker kept the prior derived value – the pipeline caps haven't
+    # changed, so neither does the backend's effective input size.
+    assert detector._inference_size == 320
+
+
+def test_clahe_always_present_and_survives_drain() -> None:
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False))
+    # CLAHE is unconditional – the equaliser exists straight after construction.
+    assert detector._clahe is not None
+    clahe_before = detector._clahe
+
+    # A live reload doesn't touch CLAHE – there is no toggle to drain.
+    detector._pending_config = DetectionConfig(enabled=False, confidence=0.42)
+    detector._drain_pending_config()
+    assert detector._clahe is clahe_before
+
+
+def test_drain_rebuilds_backend_when_model_changes() -> None:
+    """Cold-path fields (model, storage_path) require a fresh inference
+    session. The rebuild happens on the worker thread so the GTK thread
+    isn't blocked by an ONNX session load. The drain detects that
+    ``_load_backend`` actually loaded a new backend by identity-comparing
+    against the captured prior one."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(
+        DetectionConfig(enabled=False, model="yolov8n.onnx"),
+    )
+
+    rebuild_calls: list[str | None] = []
+    new_backend = object()
+
+    def _spy_load(base_model_path: str | None = None) -> None:
+        rebuild_calls.append(base_model_path)
+        # Mirror the real ``_load_backend`` contract: assign
+        # ``self._backend`` on a successful load. The drain checks
+        # this identity to detect silent-no-load failures.
+        detector._backend = new_backend  # type: ignore[assignment]
+
+    detector._load_backend = _spy_load  # type: ignore[method-assign]
+    detector._prepare_model_path = lambda cfg: cfg.model  # type: ignore[method-assign]
+
+    new_cfg = DetectionConfig(enabled=False, model="yolov8s.onnx")
+    detector._pending_config = new_cfg
+    detector._drain_pending_config()
+
+    assert rebuild_calls == ["yolov8s.onnx"]
+    assert detector._config is new_cfg
+    assert detector._backend is new_backend
+
+
+def test_drain_keeps_prior_config_when_backend_rebuild_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    detection_module = _load_detection_module()
+    old_cfg = DetectionConfig(enabled=False, model="yolov8n.onnx")
+    detector = detection_module.PersonDetector(old_cfg)
+    sentinel_backend = object()
+    detector._backend = sentinel_backend  # type: ignore[assignment]
+    detector._backend_name = "onnx-old"
+    detector._model_path = "/old/path/yolov8n.onnx"
+
+    def _raising_load(_base_model_path: str | None = None) -> None:
+        raise OSError("simulated session load failure")
+
+    detector._load_backend = _raising_load  # type: ignore[method-assign]
+    detector._prepare_model_path = lambda cfg: f"/new/{cfg.model}"  # type: ignore[method-assign]
+
+    detector._pending_config = DetectionConfig(enabled=False, model="yolov8s.onnx")
+    with caplog.at_level("ERROR", logger="openfollow.video.detection"):
+        detector._drain_pending_config()
+
+    assert detector._config is old_cfg
+    assert detector._backend is sentinel_backend
+    # ``_backend_name`` and ``_model_path`` must roll back too – they
+    # may have been mutated mid-rebuild before the raise.
+    assert detector._backend_name == "onnx-old"
+    assert detector._model_path == "/old/path/yolov8n.onnx"
+    assert any("backend rebuild failed" in r.message for r in caplog.records)
+
+
+def test_drain_keeps_prior_config_when_load_backend_silently_loads_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_load_backend`` doesn't raise when every attempt fails – it
+    logs a warning and returns with ``self._backend`` unchanged. The
+    drain must detect that case (by identity-comparing the post-call
+    ``_backend`` against the captured prior one) and roll back, or
+    we end up with a config saying "new model" while the backend still
+    serves the old one."""
+    detection_module = _load_detection_module()
+    old_cfg = DetectionConfig(enabled=False, model="yolov8n.onnx")
+    detector = detection_module.PersonDetector(old_cfg)
+    sentinel_backend = object()
+    detector._backend = sentinel_backend  # type: ignore[assignment]
+    detector._backend_name = "onnx-old"
+    detector._model_path = "/old/path/yolov8n.onnx"
+
+    def _silent_no_load(_base_model_path: str | None = None) -> None:
+        # Mirrors real ``_load_backend`` when every attempt's import /
+        # session-load fails: log + return without raising and without
+        # assigning ``self._backend``.
+        return None
+
+    detector._load_backend = _silent_no_load  # type: ignore[method-assign]
+    detector._prepare_model_path = lambda cfg: f"/new/{cfg.model}"  # type: ignore[method-assign]
+
+    detector._pending_config = DetectionConfig(enabled=False, model="yolov8s.onnx")
+    with caplog.at_level("ERROR", logger="openfollow.video.detection"):
+        detector._drain_pending_config()
+
+    assert detector._config is old_cfg
+    assert detector._backend is sentinel_backend
+    assert detector._backend_name == "onnx-old"
+    assert detector._model_path == "/old/path/yolov8n.onnx"
+    assert any("loaded no new backend" in r.message for r in caplog.records)
+
+
+def test_drain_keeps_prior_config_when_model_path_resolution_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_prepare_model_path`` runs before the backend rebuild; if it
+    raises (storage permission denied, missing file, etc.) the swap
+    is aborted before any side effect."""
+    detection_module = _load_detection_module()
+    old_cfg = DetectionConfig(enabled=False, model="yolov8n.onnx")
+    detector = detection_module.PersonDetector(old_cfg)
+
+    def _raising_prepare(_cfg: DetectionConfig) -> str:
+        raise OSError("simulated storage failure")
+
+    detector._prepare_model_path = _raising_prepare  # type: ignore[method-assign]
+
+    detector._pending_config = DetectionConfig(enabled=False, model="yolov8s.onnx")
+    with caplog.at_level("ERROR", logger="openfollow.video.detection"):
+        detector._drain_pending_config()
+
+    assert detector._config is old_cfg
+    assert any("model-path resolution failed" in r.message for r in caplog.records)
+
+
+def test_drain_with_no_pending_is_noop() -> None:
+    """No pending config → drain returns without touching any state."""
+    detection_module = _load_detection_module()
+    detector = detection_module.PersonDetector(DetectionConfig(enabled=False))
+    sentinel = detector._config
+
+    detector._drain_pending_config()
+
+    assert detector._config is sentinel
+    assert detector._pending_config is None
+
+
+def test_drain_restores_env_vars_when_backend_rebuild_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``_prepare_model_path`` mutates ``XDG_CACHE_HOME`` when
+    ``storage_path`` is set so the ONNX runtime cache lands in the
+    operator's chosen directory. If ``_load_backend`` then raises, the
+    rollback restores ``_backend`` / ``_backend_name`` / ``_model_path`` –
+    but the env var persists process-wide. Without restoring it too, the
+    process ends up pointing at the new cache dir while inference still
+    runs on the old session."""
+    import os as _os
+
+    detection_module = _load_detection_module()
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+    old_cfg = DetectionConfig(enabled=False, model="yolov8n.onnx")
+    detector = detection_module.PersonDetector(old_cfg)
+    sentinel_backend = object()
+    detector._backend = sentinel_backend  # type: ignore[assignment]
+
+    def _raising_load(_base_model_path: str | None = None) -> None:
+        raise OSError("simulated session load failure")
+
+    detector._load_backend = _raising_load  # type: ignore[method-assign]
+
+    detector._pending_config = DetectionConfig(
+        enabled=False,
+        model="yolov8s.onnx",
+        storage_path=str(tmp_path),
+    )
+    detector._drain_pending_config()
+
+    # Env vars rolled back to the unset state from before the swap.
+    assert "XDG_CACHE_HOME" not in _os.environ
+    assert detector._config is old_cfg
+
+
+def test_drain_restores_env_vars_when_load_backend_silently_loads_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import os as _os
+
+    detection_module = _load_detection_module()
+    monkeypatch.setenv("XDG_CACHE_HOME", "/old/cache")
+
+    old_cfg = DetectionConfig(enabled=False, model="yolov8n.onnx")
+    detector = detection_module.PersonDetector(old_cfg)
+    sentinel_backend = object()
+    detector._backend = sentinel_backend  # type: ignore[assignment]
+
+    def _silent_no_load(_base_model_path: str | None = None) -> None:
+        return None
+
+    detector._load_backend = _silent_no_load  # type: ignore[method-assign]
+
+    detector._pending_config = DetectionConfig(
+        enabled=False,
+        model="yolov8s.onnx",
+        storage_path=str(tmp_path),
+    )
+    detector._drain_pending_config()
+
+    # Pre-existing env value restored, NOT left at the new cache dir.
+    assert _os.environ["XDG_CACHE_HOME"] == "/old/cache"
+    assert detector._config is old_cfg
+
+
+def test_drain_restores_env_vars_when_pre_existing_values_present(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import os as _os
+
+    detection_module = _load_detection_module()
+    monkeypatch.setenv("XDG_CACHE_HOME", "/operator/cache")
+
+    old_cfg = DetectionConfig(enabled=False, model="yolov8n.onnx")
+    detector = detection_module.PersonDetector(old_cfg)
+    sentinel_backend = object()
+    detector._backend = sentinel_backend  # type: ignore[assignment]
+
+    def _raising_load(_base_model_path: str | None = None) -> None:
+        raise OSError("simulated")
+
+    detector._load_backend = _raising_load  # type: ignore[method-assign]
+
+    detector._pending_config = DetectionConfig(
+        enabled=False,
+        model="yolov8s.onnx",
+        storage_path=str(tmp_path),
+    )
+    detector._drain_pending_config()
+
+    assert _os.environ["XDG_CACHE_HOME"] == "/operator/cache"
+
+
+def test_drain_restores_env_baseline_on_storage_path_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Transition ``storage_path: "/foo" → ""``: the worker rebuilds
+    the backend (model path computed without redirection) and the
+    operator's intent is "no cache redirection any more". But
+    ``_prepare_model_path`` returns early without mutating env vars
+    when ``storage_path`` is empty. Drain must restore init-time baseline
+    on success path of empty-transition swap.
+    """
+    import os as _os
+
+    detection_module = _load_detection_module()
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+    # Init with storage_path=/foo so init-time mutates env to redirect.
+    initial_storage = tmp_path / "initial"
+    initial_storage.mkdir()
+    old_cfg = DetectionConfig(
+        enabled=False,
+        model="yolov8n.onnx",
+        storage_path=str(initial_storage),
+    )
+    detector = detection_module.PersonDetector(old_cfg)
+    # Sanity: detector __init__ captured the (empty) baseline BEFORE
+    # any redirect mutation.
+    assert detector._initial_storage_env["XDG_CACHE_HOME"] is None
+
+    # Stub out backend wiring so the rebuild "succeeds" without needing
+    # a real ONNX session.
+    new_backend = object()
+
+    def _spy_load(_base_model_path: str | None = None) -> None:
+        detector._backend = new_backend  # type: ignore[assignment]
+
+    detector._load_backend = _spy_load  # type: ignore[method-assign]
+
+    # Pretend init-time redirection actually mutated env (which the
+    # real ``_prepare_model_path`` would have done before this test
+    # if it had a writeable storage dir).
+    monkeypatch.setenv("XDG_CACHE_HOME", str(initial_storage / "cache"))
+
+    # Now transition to ``storage_path=""`` – operator clears the
+    # redirection. Drain should detect old.storage_path was non-empty
+    # AND new is empty, and restore the baseline.
+    detector._pending_config = DetectionConfig(
+        enabled=False,
+        model="yolov8n.onnx",
+        storage_path="",
+    )
+    detector._drain_pending_config()
+
+    # Env restored to the operator's pre-app baseline (unset).
+    assert "XDG_CACHE_HOME" not in _os.environ
+    assert detector._config.storage_path == ""
+
+
+def test_pick_available_model_prefers_fastest_tier(tmp_path: Path) -> None:
+    detection_module = _load_detection_module()
+    models = tmp_path / "models"
+    models.mkdir()
+    # A higher tier and a non-tier model present, but the Fastest tier wins.
+    for name in ("yolo26m.onnx", "yolo11l.onnx", "yolo26n.onnx"):
+        (models / name).write_bytes(b"x")
+
+    picked = detection_module.PersonDetector._pick_available_model(models)
+
+    assert picked is not None
+    assert picked.name == "yolo26n.onnx"
+
+
+def test_pick_available_model_falls_back_to_any_onnx(tmp_path: Path) -> None:
+    detection_module = _load_detection_module()
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "custom_model.onnx").write_bytes(b"x")
+
+    picked = detection_module.PersonDetector._pick_available_model(models)
+
+    assert picked is not None
+    assert picked.name == "custom_model.onnx"
+
+
+def test_pick_available_model_none_when_empty(tmp_path: Path) -> None:
+    detection_module = _load_detection_module()
+    models = tmp_path / "models"
+    models.mkdir()
+
+    assert detection_module.PersonDetector._pick_available_model(models) is None
+
+
+def test_prepare_model_path_falls_back_when_configured_model_missing(tmp_path: Path) -> None:
+    detection_module = _load_detection_module()
+    models = tmp_path / "models"
+    models.mkdir(parents=True)
+    (models / "yolo26n.onnx").write_bytes(b"x")
+
+    # Configured model isn't on disk; resolution should fall back to the tier
+    # that is, so enabling detection still starts.
+    cfg = DetectionConfig(enabled=True, model="yolov8n.onnx", storage_path=str(tmp_path))
+    resolved = detection_module.PersonDetector._prepare_model_path(cfg)
+
+    assert Path(resolved) == models / "yolo26n.onnx"
+
+
+def test_prepare_model_path_keeps_configured_model_when_present(tmp_path: Path) -> None:
+    detection_module = _load_detection_module()
+    models = tmp_path / "models"
+    models.mkdir(parents=True)
+    (models / "yolo26n.onnx").write_bytes(b"x")
+    (models / "yolo26m.onnx").write_bytes(b"x")
+
+    cfg = DetectionConfig(enabled=True, model="yolo26m.onnx", storage_path=str(tmp_path))
+    resolved = detection_module.PersonDetector._prepare_model_path(cfg)
+
+    assert Path(resolved) == models / "yolo26m.onnx"

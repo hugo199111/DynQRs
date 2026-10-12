@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+name: Build Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Build native Windows package
+        shell: pwsh
+        run: |
+          C:\msys64\usr\bin\bash.exe -lc 'pacman -S --needed --noconfirm patch'
+          if ($LASTEXITCODE -ne 0) { throw 'MSYS2 dependency installation failed' }
+          & .\packaging\windows\Build-Windows.ps1 -BuildRoot C:\of-build -PythonExecutable (Get-Command python).Source
+      - name: Upload build and verification results
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenFollow-Windows-x64
+          path: |
+            C:\of-build\dist\OpenFollow-Windows-x64.zip
+            C:\of-build\dist\OpenFollow-running.png
+            C:\of-build\self-check.json
+          if-no-files-found: error
+      - name: Upload corresponding application source
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenFollow-Windows-source
+          path: |
+            openfollow
+            packaging
+            scripts
+            pyproject.toml
+            poetry.lock
+            README.md
+            LICENSE
+            THIRD_PARTY_NOTICES.md
+            WRITTEN_OFFER.md

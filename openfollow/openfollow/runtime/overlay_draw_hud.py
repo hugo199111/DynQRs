@@ -1,0 +1,2074 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""HUD and modal draw passes for the Cairo overlay renderer.
+
+Draws the marker cards, info panels, system stats, virtual faders, and every
+modal overlay (Settings, source/iface/method pickers, URL editor, About,
+button-detection wizard, Pi network screens)."""
+
+from __future__ import annotations
+
+import math
+import time
+from collections.abc import Sequence
+from typing import Any, cast
+
+import cairo
+
+from openfollow.runtime.overlay_draw_style import (
+    CHEVRON_SIZE,
+    COLOR_ACCENT,
+    COLOR_ACCENT_SOFT,
+    COLOR_BG_BASE,
+    COLOR_BORDER_SOFT,
+    COLOR_OK,
+    COLOR_SUPPORT_BORDER,
+    COLOR_TEXT,
+    COLOR_TEXT_MUTED,
+    COLOR_WARNING_FILL,
+    MODAL_RADIUS,
+    PANEL_RADIUS,
+    ROW_RADIUS,
+    STATUS_LEVEL_COLORS,
+    SUPPORT_DASH,
+    draw_card_background,
+    draw_chevron,
+    draw_heart,
+    draw_level_box,
+    draw_level_sign,
+    draw_rounded_rect,
+    draw_success_sign,
+    draw_warning_sign,
+    parse_hex,
+    speed_color,
+    status_level,
+)
+from openfollow.runtime.overlay_layout import (
+    INFO_PANEL_ROW_H,
+    HelpSections,
+    bottom_left_info_panel_layout,
+    build_help_sections,
+    build_system_stats_text,
+    centered_panel_layout,
+    fader_stack_bottom_padding,
+    format_source_text,
+    friendly_button_label,
+    help_sections_height,
+    info_panel_height,
+    key_label,
+    marker_card_y,
+    selectable_list_layout,
+    virtual_fader_card_y,
+)
+from openfollow.runtime.overlay_links import LINKS, LinkCode, draw_link_qr
+from openfollow.runtime.overlay_state import (
+    MarkerOverlayData,
+    OverlayState,
+    VirtualFaderDisplayData,
+)
+from openfollow.runtime.overlay_status_badge import draw_status_badge
+from openfollow.units import UnitSystem, format_length_compact, format_speed
+
+
+def _help_sections_for(
+    renderer: Any,
+    mode: str,
+    state: OverlayState,
+) -> HelpSections:
+    """Memoised build_help_sections result; cheap recompute on rebind."""
+    key = (
+        mode,
+        state.keyboard_connected,
+        state.controller_connected,
+        state.mouse_enabled,
+        state.mouse_double_click_reset,
+        state.mouse_wheel_z_enabled,
+        tuple(sorted((state.button_labels or {}).items())),
+        tuple(sorted((state.keyboard_labels or {}).items())),
+        state.mouse3d_connected,
+        tuple(sorted((state.mouse3d_axis_map or {}).items())),
+        tuple(sorted((state.mouse3d_buttons or {}).items())),
+        state.marker_cycle_enabled,
+    )
+    cached = renderer._help_sections_cache
+    if cached is not None and cached[0] == key:
+        return cast(HelpSections, cached[1])
+    result = build_help_sections(
+        mode=mode,
+        keyboard_connected=state.keyboard_connected,
+        controller_connected=state.controller_connected,
+        mouse_enabled=state.mouse_enabled,
+        double_click_reset=state.mouse_double_click_reset,
+        scroll_z=state.mouse_wheel_z_enabled,
+        button_labels=state.button_labels,
+        keyboard_labels=state.keyboard_labels,
+        mouse3d_connected=state.mouse3d_connected,
+        mouse3d_axis_map=state.mouse3d_axis_map,
+        mouse3d_buttons=state.mouse3d_buttons,
+        marker_cycle_enabled=state.marker_cycle_enabled,
+    )
+    renderer._help_sections_cache = (key, result)
+    return result
+
+
+_HELP_FONT = 10.0
+_HELP_BULLET = "• "
+
+
+def _wrapped_help(renderer: Any, cr: Any, width: float, sections: HelpSections) -> list[tuple[str, list[list[str]]]]:
+    """Each line wrapped after its bullet to *width*: a help line is never cut."""
+    renderer._set_ui_font(cr, _HELP_FONT)
+    text_w = width - cr.text_extents(_HELP_BULLET).x_advance
+    return [
+        (title, [_wrap_error_message(renderer, cr, line, text_w, _HELP_FONT, bold=False) for line in lines])
+        for title, lines in sections
+    ]
+
+
+def help_block_height(renderer: Any, cr: Any, width: float, sections: HelpSections) -> float:
+    """The height :func:`draw_help_block` takes for *sections* at *width*."""
+    wrapped = _wrapped_help(renderer, cr, width, sections)
+    return help_sections_height([(title, [part for parts in lines for part in parts]) for title, lines in wrapped])
+
+
+def draw_help_block(
+    renderer: Any,
+    cr: Any,
+    x: float,
+    y: float,
+    width: float,
+    sections: HelpSections,
+) -> None:
+    wrapped = _wrapped_help(renderer, cr, width, sections)
+    indent = cr.text_extents(_HELP_BULLET).x_advance
+    y_cursor = y
+    for idx, (title, lines) in enumerate(wrapped):
+        renderer._set_ui_font(cr, 10.5, bold=True)
+        cr.set_source_rgb(*COLOR_ACCENT)
+        cr.move_to(x, y_cursor)
+        cr.show_text(title.upper())
+        y_cursor += 13.0
+
+        renderer._set_ui_font(cr, _HELP_FONT)
+        cr.set_source_rgb(*COLOR_TEXT)
+        for parts in lines:
+            # A wrapped line continues under its own text, not under the bullet.
+            for i, part in enumerate(parts):
+                cr.move_to(x + indent if i else x, y_cursor)
+                cr.show_text(part if i else f"{_HELP_BULLET}{part}")
+                y_cursor += 14.0
+
+        if idx < len(wrapped) - 1:
+            y_cursor += 8.0
+
+
+def draw_modal_scrim(cr: Any, w: int, h: int, alpha: float = 0.62) -> None:
+    cr.set_source_rgba(0.0, 0.0, 0.0, alpha)
+    cr.rectangle(0, 0, w, h)
+    cr.fill()
+
+
+def draw_modal_shell(
+    renderer: Any,
+    cr: Any,
+    w: int,
+    h: int,
+    *,
+    title: str,
+    subtitle: str,
+    panel_w: float,
+    panel_h: float,
+    title_color: tuple[float, float, float] = COLOR_ACCENT,
+) -> tuple[float, float, float, float]:
+    panel_layout = centered_panel_layout(w, h, panel_w, panel_h)
+    panel_x, panel_y = panel_layout.x, panel_layout.y
+    panel_w, panel_h = panel_layout.width, panel_layout.height
+
+    draw_panel_background(renderer, cr, panel_x, panel_y, panel_w, panel_h, radius=MODAL_RADIUS)
+    cr.set_source_rgba(*COLOR_BORDER_SOFT)
+    draw_rounded_rect(cr, panel_x, panel_y, panel_w, panel_h, MODAL_RADIUS)
+    cr.set_line_width(1.0)
+    cr.stroke()
+
+    renderer._set_ui_font(cr, 23 if h >= 720 else 20, bold=True)
+    cr.set_source_rgb(*title_color)
+    # A title can carry an operator's label, so it is cut to the panel like the subtitle.
+    title = renderer._truncate_text_to_width(cr, title, panel_w - 48.0)
+    title_ext = cr.text_extents(title)
+    title_x = panel_x + (panel_w - title_ext.width) / 2.0 - title_ext.x_bearing
+    title_y = panel_y + 34.0
+    cr.move_to(title_x, title_y)
+    cr.show_text(title)
+
+    renderer._set_ui_font(cr, 11)
+    cr.set_source_rgba(*COLOR_TEXT_MUTED)
+    subtitle_text = renderer._truncate_text_to_width(cr, subtitle, panel_w - 48.0)
+    subtitle_ext = cr.text_extents(subtitle_text)
+    subtitle_x = panel_x + (panel_w - subtitle_ext.width) / 2.0 - subtitle_ext.x_bearing
+    subtitle_y = panel_y + 56.0
+    cr.move_to(subtitle_x, subtitle_y)
+    cr.show_text(subtitle_text)
+    return panel_x, panel_y, panel_w, panel_h
+
+
+# Settings list rows are 30px on a 14px pad (see ``draw_selectable_list``); the
+# documentation pointer takes what the rows leave.
+_LIST_ITEM_H = 30.0
+# The crossed disc leading a list row that can't be picked.
+_ROW_MARK_R = 6.0
+# One turn of the progress spinner, as the web UI's.
+_SPIN_PERIOD_S = 0.7
+_LIST_PADDING = 14.0
+_LIST_MIN_H = 80.0
+_DOCS_GAP = 10.0
+# The pointer sits just under the rows, and what the rows do not use falls
+# below it rather than above.
+_DOCS_TOP_GAP = 24.0
+_DOCS_BOTTOM_MARGIN = 34.0
+_DOCS_LINE_H = 14.0
+_DOCS_FONT = 11.5
+_DOCS_COL_GAP = 20.0
+_DOCS_QR_MAX = 190.0
+# Below this the code is too small to read off a screen, so draw nothing.
+_DOCS_QR_MIN = 70.0
+# Every on-screen panel is the same width. An operator moving between
+# Settings, Network and the pickers should see the frame stay put rather than
+# resize under them, and a dialog that matches the screen it covers reads as
+# part of the same surface. Heights still follow content: a one-field editor
+# has no business being as tall as a list of interfaces.
+PANEL_W_FRACTION = 0.62
+PANEL_W_MAX = 880.0
+SCREEN_H_FRACTION = 0.90
+SCREEN_H_MAX = 760.0
+
+
+def panel_width(w: int) -> float:
+    """Shared width for every on-screen panel."""
+    return min(w * PANEL_W_FRACTION, PANEL_W_MAX)
+
+
+def screen_height(h: int) -> float:
+    """Shared height for the navigable screens (not the entry dialogs)."""
+    return min(h * SCREEN_H_FRACTION, SCREEN_H_MAX)
+
+
+# Room a chevron needs, so a label is truncated before it runs underneath.
+CHEVRON_GUTTER = CHEVRON_SIZE + 8.0
+
+
+def draw_submenu_chevron(cr: Any, x: float, cy: float) -> None:
+    """Mark a row that opens another screen. Right-aligned at ``x``, centred on ``cy``."""
+    draw_chevron(cr, x - CHEVRON_SIZE * 0.31, cy)
+
+
+_HEART_GAP = 5.0
+# The same on all four sides of the support column's content; never past the column gap's midline.
+_FRAME_PAD = 14.0
+
+
+def draw_selectable_list(
+    renderer: Any,
+    cr: Any,
+    *,
+    items: list[str],
+    selected_idx: int,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    empty_message: str,
+    disabled: Sequence[bool] = (),
+    submenu: list[bool] | None = None,
+) -> None:
+    """A scrolling list of selectable rows.
+
+    A row flagged in *disabled* is led by the crossed disc (it can't be picked).
+    ``submenu`` marks the rows that open another screen rather than doing
+    something. Those get a chevron, so an operator can tell before pressing
+    which rows take them somewhere - the distinction a d-pad menu otherwise
+    hides until it is too late.
+    """
+    draw_rounded_rect(cr, x, y, w, h, PANEL_RADIUS)
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.26)
+    cr.fill()
+    cr.set_source_rgba(*COLOR_BORDER_SOFT)
+    draw_rounded_rect(cr, x, y, w, h, PANEL_RADIUS)
+    cr.set_line_width(1.0)
+    cr.stroke()
+
+    if not items:
+        renderer._set_ui_font(cr, 12)
+        cr.set_source_rgba(*COLOR_TEXT_MUTED)
+        msg = renderer._truncate_text_to_width(cr, empty_message, w - 20.0)
+        ext = cr.text_extents(msg)
+        cr.move_to(x + (w - ext.width) / 2.0, y + h / 2.0)
+        cr.show_text(msg)
+        return
+
+    item_h = 30.0
+    list_layout = selectable_list_layout(len(items), selected_idx, h, item_h=item_h, vertical_padding=14.0)
+    max_visible = list_layout.max_visible
+    scroll_offset = list_layout.scroll_offset
+
+    text_max_w = w - 32.0
+    for i in range(max_visible):
+        item_idx = i + scroll_offset
+        if item_idx >= len(items):
+            break
+
+        row_x = x + 7.0
+        row_y = y + 7.0 + i * item_h
+        row_w = w - 14.0
+        row_h = item_h - 3.0
+        is_selected = item_idx == selected_idx
+        if is_selected:
+            cr.set_source_rgba(*COLOR_ACCENT_SOFT)
+            draw_rounded_rect(cr, row_x, row_y, row_w, row_h, ROW_RADIUS)
+            cr.fill()
+            cr.set_source_rgba(COLOR_ACCENT[0], COLOR_ACCENT[1], COLOR_ACCENT[2], 0.42)
+            draw_rounded_rect(cr, row_x, row_y, row_w, row_h, ROW_RADIUS)
+            cr.set_line_width(1.1)
+            cr.stroke()
+            renderer._set_ui_font(cr, 12, bold=True)
+            cr.set_source_rgb(*COLOR_TEXT)
+        else:
+            renderer._set_ui_font(cr, 11.5)
+            cr.set_source_rgba(*COLOR_TEXT_MUTED)
+
+        text_x = row_x + 10.0
+        if item_idx < len(disabled) and disabled[item_idx]:
+            _draw_offline_mark(cr, text_x + _ROW_MARK_R, row_y + row_h / 2.0, _ROW_MARK_R)
+            text_x += 2 * _ROW_MARK_R + 8.0
+        leads_somewhere = bool(submenu[item_idx]) if submenu and item_idx < len(submenu) else False
+        text = renderer._truncate_text_to_width(
+            cr,
+            items[item_idx],
+            text_max_w - (text_x - row_x - 10.0) - (CHEVRON_GUTTER if leads_somewhere else 0.0),
+        )
+        cr.move_to(text_x, row_y + row_h / 2.0 + 4.0)
+        cr.show_text(text)
+        if leads_somewhere:
+            draw_submenu_chevron(cr, row_x + row_w - 10.0, row_y + row_h / 2.0)
+
+    # Turned and centred, so a scroll hint is never read as a row's chevron.
+    if scroll_offset > 0:
+        draw_chevron(cr, x + w / 2.0, y + 3.5, "up", size=10.0, alpha=0.6)
+    if scroll_offset + max_visible < len(items):
+        draw_chevron(cr, x + w / 2.0, y + h - 3.5, "down", size=10.0, alpha=0.6)
+
+
+def draw_selection_menu(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+    *,
+    title: str,
+    subtitle: str,
+    items: list[str],
+    selected_idx: int,
+    empty_message: str,
+    disabled: Sequence[bool] = (),
+) -> None:
+    panel_w = panel_width(w)
+    panel_h = screen_height(h)
+    panel_x, panel_y, panel_w, panel_h = draw_modal_shell(
+        renderer,
+        cr,
+        w,
+        h,
+        title=title,
+        subtitle=subtitle,
+        panel_w=panel_w,
+        panel_h=panel_h,
+    )
+
+    content_x = panel_x + 16.0
+    content_w = panel_w - 32.0
+    cursor_y = panel_y + 74.0
+
+    list_h = max(80.0, panel_y + panel_h - cursor_y - 14.0)
+    draw_selectable_list(
+        renderer,
+        cr,
+        items=items,
+        selected_idx=selected_idx,
+        x=content_x,
+        y=cursor_y,
+        w=content_w,
+        h=list_h,
+        empty_message=empty_message,
+        disabled=disabled,
+    )
+
+
+def draw_media_picker_overlay(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    """The drive picker: one row per partition, a drive that can't be written listed with why."""
+    from openfollow.runtime.app_modes_media import PICKER_SUBTITLE
+
+    draw_modal_scrim(cr, w, h)
+    draw_selection_menu(
+        renderer,
+        cr,
+        state,
+        w,
+        h,
+        title=state.media_picker_title,
+        subtitle=PICKER_SUBTITLE,
+        items=state.media_picker_items,
+        selected_idx=state.media_picker_index,
+        empty_message=state.media_picker_empty,
+        disabled=[not enabled for enabled in state.media_picker_enabled],
+    )
+
+
+def draw_spinner(cr: Any, cx: float, cy: float, r: float, now: float) -> None:
+    """An accent arc turning on a faint ring, like the web UI's; the display tick redraws it."""
+    start = (now % _SPIN_PERIOD_S) / _SPIN_PERIOD_S * 2 * math.pi
+    cr.save()
+    cr.set_line_width(2.0)
+    cr.set_source_rgba(*COLOR_ACCENT, 0.25)
+    cr.new_sub_path()
+    cr.arc(cx, cy, r, 0, 2 * math.pi)
+    cr.stroke()
+    cr.set_source_rgb(*COLOR_ACCENT)
+    cr.new_sub_path()
+    cr.arc(cx, cy, r, start, start + math.pi / 2)
+    cr.stroke()
+    cr.restore()
+
+
+_EXPORT_PAD = 12.0
+_EXPORT_SIGN = 16.0
+_EXPORT_HEAD_FONT = 16.0
+_EXPORT_HEAD_LINE_H = 22.0
+_EXPORT_NEXT_FONT = 13.0
+_EXPORT_NEXT_LINE_H = 18.0
+_EXPORT_MAX_LINES = 2
+# The progress lines under the spinner take as much room as a result of one line each.
+_EXPORT_PROGRESS_H = 70.0
+
+
+def draw_media_export_overlay(
+    renderer: Any, cr: Any, state: OverlayState, w: int, h: int, now: float | None = None
+) -> None:
+    """The export's progress under a spinner, then a box in its result's level:
+    what happened and the one next step, as the web's result box."""
+    from openfollow.runtime.app_modes_media import EXPORT_SUBTITLE, EXPORT_TITLE
+
+    headline, next_step, ok = state.media_export_lines
+    panel_w = min(w * 0.52, 760.0)
+    box_w = panel_w - 32.0
+    text_w = box_w - 2 * _EXPORT_PAD - _EXPORT_SIGN - 10.0
+    head: list[str] = []
+    rest: list[str] = []
+    content_h = _EXPORT_PROGRESS_H
+    if ok is not None:
+        head = _wrap_lines(renderer, cr, headline, text_w, _EXPORT_HEAD_FONT, bold=True, max_lines=_EXPORT_MAX_LINES)
+        rest = _wrap_lines(renderer, cr, next_step, text_w, _EXPORT_NEXT_FONT, bold=False, max_lines=_EXPORT_MAX_LINES)
+        content_h = 2 * _EXPORT_PAD + len(head) * _EXPORT_HEAD_LINE_H + 6.0 + len(rest) * _EXPORT_NEXT_LINE_H
+    draw_modal_scrim(cr, w, h)
+    panel_x, panel_y, panel_w, _ = draw_modal_shell(
+        renderer,
+        cr,
+        w,
+        h,
+        title=EXPORT_TITLE,
+        subtitle=EXPORT_SUBTITLE,
+        panel_w=panel_w,
+        panel_h=102.0 + content_h,
+    )
+    top = panel_y + 80.0
+    if ok is None:
+        text_x = panel_x + 28.0
+        line_y = panel_y + 108.0
+        draw_spinner(cr, text_x + 8.0, line_y - 6.0, 8.0, time.monotonic() if now is None else now)
+        text_x += 28.0
+        width = panel_x + panel_w - 28.0 - text_x
+        renderer._set_ui_font(cr, 16, bold=True)
+        cr.set_source_rgb(*COLOR_TEXT)
+        cr.move_to(text_x, line_y)
+        cr.show_text(renderer._truncate_text_to_width(cr, headline, width))
+        renderer._set_ui_font(cr, 13)
+        cr.set_source_rgba(*COLOR_TEXT_MUTED)
+        cr.move_to(text_x, line_y + 28.0)
+        cr.show_text(renderer._truncate_text_to_width(cr, next_step, width))
+        return
+    level = "success" if ok else "error"
+    box_x = panel_x + 16.0
+    draw_level_box(cr, level, box_x, top, box_w, content_h, radius=ROW_RADIUS, line_width=1.2)
+    draw_level_sign(
+        cr, level, box_x + _EXPORT_PAD + _EXPORT_SIGN / 2.0, top + _EXPORT_PAD + _EXPORT_HEAD_LINE_H / 2.0, _EXPORT_SIGN
+    )
+    text_x = box_x + _EXPORT_PAD + _EXPORT_SIGN + 10.0
+    y = top + _EXPORT_PAD
+    renderer._set_ui_font(cr, _EXPORT_HEAD_FONT, bold=True)
+    cr.set_source_rgb(*COLOR_TEXT)
+    for line in head:
+        cr.move_to(text_x, y + 16.0)
+        cr.show_text(line)
+        y += _EXPORT_HEAD_LINE_H
+    renderer._set_ui_font(cr, _EXPORT_NEXT_FONT)
+    cr.set_source_rgba(*COLOR_TEXT_MUTED)
+    y += 6.0
+    for line in rest:
+        cr.move_to(text_x, y + 13.0)
+        cr.show_text(line)
+        y += _EXPORT_NEXT_LINE_H
+
+
+def draw_source_selection(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    draw_selection_menu(
+        renderer,
+        cr,
+        state,
+        w,
+        h,
+        title=state.source_selection_title,
+        subtitle="Choose a source and confirm to reconnect video.",
+        items=list(state.discovered_sources),
+        selected_idx=state.selected_source_index,
+        empty_message="Scanning for available sources...",
+    )
+
+
+def draw_source_selection_overlay(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    draw_modal_scrim(cr, w, h, alpha=0.56)
+    draw_source_selection(renderer, cr, state, w, h)
+
+
+def draw_source_type_selection(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+) -> None:
+    items = [display for _iid, display in state.available_source_types]
+    draw_selection_menu(
+        renderer,
+        cr,
+        state,
+        w,
+        h,
+        title="VIDEO SOURCE TYPE",
+        subtitle="Switch the active video plugin (RTSP, NDI, Test Pattern, …).",
+        items=items,
+        selected_idx=state.selected_source_type_index,
+        empty_message="No video source plugins available on this device.",
+    )
+
+
+def draw_source_type_selection_overlay(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+) -> None:
+    draw_modal_scrim(cr, w, h, alpha=0.56)
+    draw_source_type_selection(renderer, cr, state, w, h)
+
+
+def draw_field_choice_picker(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+) -> None:
+    """Render the on-device list picker for an enum-style plugin field
+    (e.g. testpattern's grey vs stage)."""
+    title = (state.field_choice_title or "SELECT VALUE").upper()
+    draw_selection_menu(
+        renderer,
+        cr,
+        state,
+        w,
+        h,
+        title=title,
+        subtitle="Choose a value.",
+        items=list(state.field_choice_items),
+        selected_idx=state.field_choice_selected_index,
+        empty_message="No options available.",
+    )
+
+
+def draw_field_choice_picker_overlay(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+) -> None:
+    draw_modal_scrim(cr, w, h, alpha=0.56)
+    draw_field_choice_picker(renderer, cr, state, w, h)
+
+
+def draw_url_editor(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+) -> None:
+    """Render on-device single-line text editor with caret."""
+    title = (state.url_editor_field_label or "URL").upper()
+    subtitle = state.url_editor_banner or "Edit the value."
+    panel_w = panel_width(w)
+    panel_h = min(h * 0.32, 280.0)
+    panel_x, panel_y, panel_w, panel_h = draw_modal_shell(
+        renderer,
+        cr,
+        w,
+        h,
+        title=title,
+        subtitle=subtitle,
+        panel_w=panel_w,
+        panel_h=panel_h,
+    )
+
+    # Text-field box with steady caret (no blink animation).
+    box_x = panel_x + 24.0
+    box_y = panel_y + 84.0
+    box_w = panel_w - 48.0
+    box_h = 56.0
+    draw_panel_background(renderer, cr, box_x, box_y, box_w, box_h, radius=PANEL_RADIUS)
+
+    renderer._set_ui_font(cr, 18.0)
+    cr.set_source_rgba(*COLOR_TEXT)
+    text_x = box_x + 16.0
+    text_y = box_y + box_h / 2.0 + 6.0
+    value = state.url_editor_value
+    rendered = renderer._truncate_text_to_width(cr, value, box_w - 40.0)
+    cr.move_to(text_x, text_y)
+    cr.show_text(rendered)
+
+    rendered_ext = cr.text_extents(rendered)
+    cursor_x = text_x + rendered_ext.x_advance + 1.0
+    cursor_y_top = box_y + 14.0
+    cursor_y_bot = box_y + box_h - 14.0
+    cr.set_source_rgba(*COLOR_ACCENT)
+    cr.set_line_width(1.6)
+    cr.move_to(cursor_x, cursor_y_top)
+    cr.line_to(cursor_x, cursor_y_bot)
+    cr.stroke()
+
+
+def draw_url_editor_overlay(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+) -> None:
+    draw_modal_scrim(cr, w, h, alpha=0.56)
+    draw_url_editor(renderer, cr, state, w, h)
+
+
+def draw_settings_menu(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    """Render Settings menu modal with info card and error box."""
+    labels = list(state.settings_items)
+    enabled = list(state.settings_items_enabled)
+    reasons = list(state.settings_items_disabled_reasons)
+    if len(reasons) < len(labels):
+        reasons.extend([""] * (len(labels) - len(reasons)))
+    items: list[str] = []
+    for label, is_enabled, reason in zip(labels, enabled, reasons, strict=False):
+        if is_enabled:
+            items.append(label)
+        else:
+            items.append(f"{label} ({reason or 'unavailable'})")
+
+    # Modal shell; recovery context (banner/error_message) in red-bordered box below for prominence.
+    panel_w = panel_width(w)
+    panel_h = screen_height(h)
+    panel_x, panel_y, panel_w, panel_h = draw_modal_shell(
+        renderer,
+        cr,
+        w,
+        h,
+        title="SETTINGS",
+        subtitle="Open a sub-screen.",
+        panel_w=panel_w,
+        panel_h=panel_h,
+    )
+
+    content_x = panel_x + 16.0
+    content_w = panel_w - 32.0
+    cursor_y = panel_y + 74.0
+
+    cursor_y = _draw_settings_info_card(
+        renderer,
+        cr,
+        state,
+        content_x,
+        cursor_y,
+        content_w,
+    )
+    # Single error surface: banner takes priority (auto-open path passes a
+    # structured message including source + GStreamer error). Opening Settings
+    # manually falls back to the same pair the web UI shows - the sentence
+    # naming what failed, then the element's own wording - because the raw
+    # message alone was half of what the browser was reporting.
+    error_text = state.settings_menu_banner or state.video_failure_text or state.error_message
+    if error_text:
+        cursor_y = _draw_settings_error_box(
+            renderer,
+            cr,
+            error_text,
+            state.video_failure_action,
+            content_x,
+            cursor_y,
+            content_w,
+        )
+
+    # The list takes the height its rows need, not everything left over, so the
+    # documentation pointer below it is on screen rather than under the panel.
+    available_h = panel_y + panel_h - cursor_y - _DOCS_BOTTOM_MARGIN
+    col_w = (content_w - _DOCS_COL_GAP * (len(LINKS) - 1)) / len(LINKS)
+    # One text height for every column, so the codes sit on one line whatever
+    # each caption breaks to.
+    text_h = max(len(code.lines) for code in LINKS) * _DOCS_LINE_H
+    block_max = text_h + _DOCS_GAP + min(_DOCS_QR_MAX, col_w)
+    docs_h = min(block_max, max(0.0, available_h - _LIST_MIN_H - _DOCS_TOP_GAP))
+    natural_list_h = len(items) * _LIST_ITEM_H + _LIST_PADDING if items else _LIST_MIN_H
+    list_h = max(_LIST_MIN_H, min(natural_list_h, available_h - docs_h - _DOCS_TOP_GAP))
+    draw_selectable_list(
+        renderer,
+        cr,
+        items=items,
+        submenu=list(state.settings_items_submenu),
+        selected_idx=state.settings_selected_index,
+        x=content_x,
+        y=cursor_y,
+        w=content_w,
+        h=list_h,
+        empty_message="No settings available.",
+    )
+    qr_size = min(docs_h - text_h - _DOCS_GAP, _DOCS_QR_MAX, col_w)
+    if qr_size >= _DOCS_QR_MIN:
+        docs_y = min(cursor_y + list_h + _DOCS_TOP_GAP, panel_y + panel_h - _DOCS_BOTTOM_MARGIN - docs_h)
+        for idx, code in enumerate(LINKS):
+            _draw_link_column(
+                renderer,
+                cr,
+                code,
+                content_x + idx * (col_w + _DOCS_COL_GAP),
+                docs_y,
+                col_w,
+                text_h,
+                qr_size,
+            )
+
+
+def _draw_link_column(
+    renderer: Any,
+    cr: Any,
+    code: LinkCode,
+    x: float,
+    y: float,
+    w: float,
+    text_h: float,
+    qr_size: float,
+) -> None:
+    """A caption over its QR, both centred in the column.
+
+    An operator at the station has no keyboard for a URL and often no second
+    screen, so the code is the usable half; the caption is what tells someone
+    reading over their shoulder where it leads.
+    """
+    renderer._set_ui_font(cr, _DOCS_FONT)
+    rows = []
+    for row, authored in enumerate(code.lines):
+        heart = _DOCS_FONT + _HEART_GAP if code.contribution and row == 0 else 0.0
+        line = renderer._truncate_text_to_width(cr, authored, w - heart)
+        rows.append((line, heart, cr.text_extents(line)))
+    qr_y = y + text_h + _DOCS_GAP
+    if code.contribution:
+        content_w = max([qr_size] + [ext.width + heart for _, heart, ext in rows])
+        top = y + _DOCS_LINE_H + rows[0][2].y_bearing
+        _draw_contribution_frame(cr, x + (w - content_w) / 2.0, top, content_w, qr_y + qr_size - top, w)
+    for row, (line, heart, ext) in enumerate(rows):
+        lead = heart > 0.0
+        left = x + (w - ext.width - heart) / 2.0
+        baseline = y + (row + 1) * _DOCS_LINE_H
+        if lead:
+            draw_heart(cr, left + _DOCS_FONT / 2.0, baseline - _DOCS_FONT * 0.35, _DOCS_FONT)
+            cr.set_source_rgb(*COLOR_ACCENT)
+        else:
+            cr.set_source_rgba(*COLOR_TEXT_MUTED)
+        cr.move_to(left + heart, baseline)
+        cr.show_text(line)
+    draw_link_qr(cr, code, x + (w - qr_size) / 2.0, qr_y, qr_size)
+
+
+def _draw_contribution_frame(cr: Any, x: float, y: float, w: float, h: float, col_w: float) -> None:
+    """The dashed edge that marks the Support OpenFollow column as a request, around its content box."""
+    pad = min(_FRAME_PAD, (col_w + _DOCS_COL_GAP - w) / 2.0)
+    cr.save()
+    draw_rounded_rect(cr, x - pad, y - pad, w + 2 * pad, h + 2 * pad, PANEL_RADIUS)
+    cr.set_source_rgba(*COLOR_SUPPORT_BORDER)
+    cr.set_line_width(1.5)
+    cr.set_dash(SUPPORT_DASH)
+    cr.stroke()
+    cr.restore()
+
+
+def _draw_settings_info_card(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    x: float,
+    y: float,
+    w: float,
+) -> float:
+    """Render IP/Source info card matching bottom-left panel; return y-cursor."""
+    # The card is wider than the bottom-left panel, so the source string gets
+    # a longer budget here.
+    rows = build_info_panel_rows(state, source_max_len=64)
+    # Surface unbound controller pads so operators can spot stray input.
+    # 1-based to match the marker-card badge + OSC ``:cN``.
+    if state.unbound_controller_indices:
+        joined = ", ".join(f"Ctrl{i + 1}" for i in state.unbound_controller_indices)
+        rows.append(("Unbound controllers:", joined))
+    row_h = 20.0
+    card_h = row_h * len(rows) + 14.0
+    draw_panel_background(renderer, cr, x, y, w, card_h, radius=PANEL_RADIUS)
+    row_y = y + 17.0
+    label_w = 110.0
+    for label, value in rows:
+        renderer._set_ui_font(cr, 10.5, bold=True)
+        cr.set_source_rgba(*COLOR_TEXT_MUTED)
+        cr.move_to(x + 12.0, row_y)
+        cr.show_text(label)
+        renderer._set_ui_font(cr, 11.5)
+        cr.set_source_rgb(*COLOR_TEXT)
+        max_value_w = max(40.0, w - label_w - 24.0)
+        safe = renderer._truncate_text_to_width(cr, value, max_value_w)
+        cr.move_to(x + 12.0 + label_w, row_y)
+        cr.show_text(safe)
+        row_y += row_h
+    return y + card_h + 10.0
+
+
+def _draw_settings_error_box(
+    renderer: Any,
+    cr: Any,
+    message: str,
+    action: str,
+    x: float,
+    y: float,
+    w: float,
+) -> float:
+    """Render the red-bordered failure box for the Settings modal.
+
+    Two weights, matching the web UI's ``.notice.error`` and its
+    ``.notice-sub``: what the station saw carries the emphasis, the step to try
+    sits under it, lighter. The text keeps the HUD's normal colours; the box
+    carries the red.
+    """
+    label = "ERROR"
+    pad = 12.0
+    title_size = 11.0
+    body_size = 13.0
+    sign_size = 16.0
+    text_x = x + pad + sign_size + 10.0
+    text_w = x + w - pad - text_x
+    # Same size as the observation, per the web ``.notice-sub``: weight and
+    # opacity carry the subordination, and a smaller face on a projected screen
+    # costs legibility the distinction is not worth.
+    action_size = body_size
+    body_lines = _wrap_error_message(renderer, cr, message, text_w, body_size)
+    body_line_h = body_size + 6.0
+    action_lines = _wrap_error_message(renderer, cr, action, text_w, action_size, bold=False) if action.strip() else []
+    action_line_h = action_size + 6.0
+    body_h = body_line_h * len(body_lines) + action_line_h * len(action_lines)
+    if action_lines:
+        body_h += 4.0
+    card_h = pad * 2 + title_size + 6.0 + body_h
+
+    draw_level_box(cr, "error", x, y, w, card_h, radius=PANEL_RADIUS, line_width=2.0)
+
+    draw_warning_sign(cr, x + pad + sign_size / 2, y + pad + sign_size / 2, size=sign_size)
+
+    renderer._set_ui_font(cr, title_size, bold=True)
+    cr.set_source_rgba(*COLOR_TEXT_MUTED)
+    cr.move_to(text_x, y + pad + title_size - 2.0)
+    cr.show_text(label)
+
+    renderer._set_ui_font(cr, body_size, bold=True)
+    cr.set_source_rgb(*COLOR_TEXT)
+    line_y = y + pad + title_size + 6.0 + body_size
+    for line in body_lines:
+        cr.move_to(text_x, line_y)
+        cr.show_text(line)
+        line_y += body_line_h
+
+    if action_lines:
+        line_y += 4.0
+        renderer._set_ui_font(cr, action_size, bold=False)
+        cr.set_source_rgba(*COLOR_TEXT_MUTED)
+        for line in action_lines:
+            cr.move_to(text_x, line_y)
+            cr.show_text(line)
+            line_y += action_line_h
+    return y + card_h + 10.0
+
+
+def _wrap_error_message(
+    renderer: Any,
+    cr: Any,
+    message: str,
+    max_w: float,
+    font_size: float,
+    bold: bool = True,
+) -> list[str]:
+    """Greedy word-wrap respecting ``max_w`` at the given font size and weight.
+
+    ``bold`` must match the render weight (bold glyphs are wider). Returns at
+    least one line.
+    """
+    renderer._set_ui_font(cr, font_size, bold=bold)
+    if not message:
+        return [""]
+    words = message.split()
+    if not words:
+        return [message]
+
+    # Hard-wrap single tokens wider than max_w to prevent overflow.
+    def _split_long(token: str) -> list[str]:
+        if cr.text_extents(token).width <= max_w:
+            return [token]
+        chunks: list[str] = []
+        buf = ""
+        for ch in token:
+            candidate = buf + ch
+            if cr.text_extents(candidate).width <= max_w:
+                buf = candidate
+            else:
+                if buf:
+                    chunks.append(buf)
+                buf = ch
+        chunks.append(buf)
+        return chunks
+
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        pieces = _split_long(word)
+        for i, piece in enumerate(pieces):
+            if not current:
+                current = piece
+                continue
+            sep = "" if i > 0 else " "
+            candidate = f"{current}{sep}{piece}"
+            if cr.text_extents(candidate).width <= max_w:
+                current = candidate
+            else:
+                lines.append(current)
+                current = piece
+    lines.append(current)
+    return lines
+
+
+def _wrap_lines(
+    renderer: Any, cr: Any, text: str, max_w: float, font_size: float, *, bold: bool, max_lines: int
+) -> list[str]:
+    """*text* wrapped at a space to *max_w*, the last of *max_lines* cut with an ellipsis."""
+    lines = _wrap_error_message(renderer, cr, text, max_w, font_size, bold=bold)
+    if len(lines) > max_lines:
+        rest = " ".join(lines[max_lines - 1 :])
+        lines = [*lines[: max_lines - 1], renderer._truncate_text_to_width(cr, rest, max_w)]
+    return lines
+
+
+def draw_settings_overlay(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    draw_modal_scrim(cr, w, h, alpha=0.56)
+    draw_settings_menu(renderer, cr, state, w, h)
+
+
+def draw_about_screen(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    """Render the read-only About / license screen.
+
+    Self-contained Cairo text – no WebKit dependency – so the program name,
+    version, copyright, the AGPLv3-or-later + full no-warranty notice, the
+    project link and the not-for-safety-critical-use warning are always
+    reachable on the device, even when the embedded browser isn't available.
+    """
+    from openfollow import __version__
+
+    panel_w = panel_width(w)
+    panel_h = screen_height(h)
+    panel_x, panel_y, panel_w, panel_h = draw_modal_shell(
+        renderer,
+        cr,
+        w,
+        h,
+        title="ABOUT",
+        subtitle="Version, license and project links.",
+        panel_w=panel_w,
+        panel_h=panel_h,
+    )
+
+    cx = panel_x + panel_w / 2.0
+    cursor_y = panel_y + 72.0
+
+    def _line(
+        text: str,
+        size: float,
+        color: tuple[float, ...],
+        *,
+        bold: bool = False,
+        gap: float = 6.0,
+    ) -> None:
+        nonlocal cursor_y
+        renderer._set_ui_font(cr, size, bold=bold)
+        # Style palette mixes RGB (COLOR_ACCENT / COLOR_TEXT) and RGBA
+        # (COLOR_TEXT_MUTED carries a dimming alpha); pick the right setter.
+        if len(color) == 4:
+            cr.set_source_rgba(*color)
+        else:
+            cr.set_source_rgb(*color)
+        ext = cr.text_extents(text)
+        cr.move_to(cx - ext.width / 2.0 - ext.x_bearing, cursor_y + ext.height)
+        cr.show_text(text)
+        cursor_y += ext.height + gap
+
+    def _para(
+        text: str,
+        size: float,
+        color: tuple[float, ...],
+        *,
+        bold: bool = False,
+        gap: float = 16.0,
+        line_gap: float = 2.0,
+        balanced: bool = False,
+    ) -> None:
+        """Greedy word-wrap a paragraph to the panel width, drawing each
+        wrapped line centered. Tight ``line_gap`` between a paragraph's
+        own lines; the larger ``gap`` applies only after its last line.
+        ``balanced`` evens out a two-line wrap."""
+        renderer._set_ui_font(cr, size, bold=bold)
+        max_w = panel_w - 64.0
+        wrapped: list[str] = []
+        current = ""
+        for word in text.split():
+            candidate = f"{current} {word}".strip()
+            if not current or cr.text_extents(candidate).width <= max_w:
+                current = candidate
+            else:
+                wrapped.append(current)
+                current = word
+        # pragma: no branch – every ``_para`` caller passes a non-empty
+        # paragraph, so the loop always leaves ``current`` holding the
+        # final line; the empty-``current`` arm is defensive only.
+        if current:  # pragma: no branch
+            wrapped.append(current)
+        if balanced and len(wrapped) == 2:
+            # The break that keeps the wider line shortest; the greedy break is
+            # one of the candidates, so the result always fits.
+            words = text.split()
+            split = min(
+                range(1, len(words)),
+                key=lambda i: max(
+                    cr.text_extents(" ".join(words[:i])).width, cr.text_extents(" ".join(words[i:])).width
+                ),
+            )
+            wrapped = [" ".join(words[:split]), " ".join(words[split:])]
+        for i, ln in enumerate(wrapped):
+            last = i == len(wrapped) - 1
+            _line(ln, size, color, bold=bold, gap=gap if last else line_gap)
+
+    # Wordmark logo as the headline; fall back to the text name when the SVG
+    # logo can't be rendered (Rsvg unavailable / load failed).
+    logo_handle = getattr(renderer, "_logo_handle", None)
+    if logo_handle is not None:
+        logo_w = min(panel_w * 0.42, 240.0)
+        logo_h = renderer._draw_logo(cr, cx - logo_w / 2.0, cursor_y, logo_w)
+        cursor_y += logo_h + 16.0
+    else:
+        _line("OpenFollow", 30, COLOR_ACCENT, bold=True, gap=4.0)
+    _line(f"Version {__version__}", 13, COLOR_TEXT_MUTED, gap=18.0)
+    _line("Copyright (C) 2026 The OpenFollow Project", 13, COLOR_TEXT, gap=4.0)
+    _line(
+        "Paul Hermann · Michel Honold · Vinzenz Schultz",
+        12,
+        COLOR_TEXT_MUTED,
+        gap=18.0,
+    )
+    _line("Licensed under the GNU AGPL v3 or later.", 13, COLOR_TEXT, gap=8.0)
+    _para(
+        "OpenFollow is distributed in the hope that it will be useful, but "
+        "WITHOUT ANY WARRANTY; without even the implied warranty of "
+        "MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU "
+        "Affero General Public License for more details.",
+        11,
+        COLOR_TEXT_MUTED,
+        gap=16.0,
+    )
+    _line(
+        "More Information, Source and License: openfollow.app",
+        12,
+        COLOR_TEXT,
+        gap=18.0,
+    )
+    _para(
+        "Built on Debian GNU/Linux and Raspberry Pi OS – not affiliated with or "
+        "endorsed by the Debian Project, Raspberry Pi Ltd, or Software in the "
+        "Public Interest.",
+        11,
+        COLOR_TEXT_MUTED,
+        gap=18.0,
+    )
+    _para(
+        "OpenFollow is intended to coordinate visual and audio elements of a "
+        "production and should not be used for safety critical applications.",
+        12,
+        COLOR_TEXT,
+        bold=True,
+        gap=4.0,
+        balanced=True,
+    )
+
+
+def draw_about_overlay(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    draw_modal_scrim(cr, w, h, alpha=0.56)
+    draw_about_screen(renderer, cr, state, w, h)
+
+
+_CORNER_ICON_X = _CORNER_ICON_Y = 10.0
+_CORNER_ICON_SIZE = 24.0
+# The menu list's lines run longer than the HUD's.
+_MENU_HELP_W = 260.0
+_MENU_HELP_GAP = 8.0
+
+
+def _draw_corner_help(renderer: Any, cr: Any, sections: HelpSections, panel_w: float) -> None:
+    """A help panel under the icon in the top-left corner; nothing when *sections* is empty."""
+    help_h = help_block_height(renderer, cr, panel_w - 24.0, sections)
+    if help_h <= 0:
+        return
+    panel_x = 10.0
+    panel_y = _CORNER_ICON_Y + _CORNER_ICON_SIZE + 4.0
+    draw_panel_background(renderer, cr, panel_x, panel_y, panel_w, help_h + 20.0, radius=PANEL_RADIUS)
+    draw_help_block(renderer, cr, panel_x + 12.0, panel_y + 18.0, panel_w - 24.0, sections)
+
+
+def draw_menu_help(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    """The menus' one key list, in the HUD help's corner, while any menu screen is open."""
+    renderer._draw_icon(cr, _CORNER_ICON_X, _CORNER_ICON_Y, _CORNER_ICON_SIZE)
+    # Clear of the centred menu, which starts nearer the edge on a narrower window.
+    menu_x = (w - panel_width(w)) / 2.0
+    panel_w = min(_MENU_HELP_W, menu_x - 10.0 - _MENU_HELP_GAP)
+    _draw_corner_help(renderer, cr, _help_sections_for(renderer, "menus", state), panel_w)
+
+
+def draw_hud(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    # Controller badges render per-marker card; unbound pads in Settings menu.
+    draw_bottom_left_info_panel(renderer, cr, state, w, h)
+
+    icon_size = _CORNER_ICON_SIZE
+    icon_x, icon_y = _CORNER_ICON_X, _CORNER_ICON_Y
+    renderer._draw_icon(cr, icon_x, icon_y, icon_size)
+
+    if state.show_hud_help:
+        _draw_corner_help(renderer, cr, _help_sections_for(renderer, "normal", state), max(160.0, min(220.0, w - 20.0)))
+    else:
+        renderer._set_ui_font(cr, 9)
+        cr.set_source_rgba(*COLOR_TEXT_MUTED)
+        help_key = key_label(state.keyboard_labels.get("toggle_help") or "h", fallback="")
+        help_btn = friendly_button_label(state.button_labels.get("toggle_help") or "Y")
+        parts = [p for p in (help_key, help_btn) if p]
+        if parts:
+            hint = f"{' / '.join(parts)}: help"
+            cr.move_to(icon_x + icon_size + 4.0, icon_y + icon_size * 0.7)
+            cr.show_text(hint)
+
+    draw_system_stats(renderer, cr, state, w)
+
+    # card_h 67 (was 64): the speed number (top-anchored at y+47) and the
+    # bottom-anchored speed bar (y + h - 14) were only ~3px apart; the extra
+    # 3px lands between them for readability without crowding the text above.
+    card_w, card_h, card_m = 180, 67, 8
+    card_x = w - 16 - card_w
+    # The assist-mode AI-output ghost is scene-only – it has no marker card.
+    card_markers = [t for t in state.markers if not t.is_assist_ghost]
+    for i, t in enumerate(card_markers):
+        card_y = marker_card_y(i, h, card_h=card_h, card_margin=card_m, bottom_padding=14.0)
+        draw_marker_card(renderer, cr, card_x, card_y, card_w, card_h, t, t.marker_id == state.selected_id, state)
+
+    # Virtual fader stack mirroring marker-card visual weight on bottom-left.
+    draw_virtual_faders(renderer, cr, state, h)
+
+    # Top-right status badge; rendered last so modals sit on top.
+    draw_status_badge(renderer, cr, state, w, h)
+
+
+def build_info_panel_rows(state: OverlayState, *, source_max_len: int = 38) -> list[tuple[str, str]]:
+    """Label/value rows shared by the bottom-left panel and the Settings card.
+
+    The two recovery routes an operator has when the web UI is unreachable are
+    reading the address off this panel and browsing ``<hostname>.local`` – the
+    running system's hostname, not the station name the config asks for, since
+    a rename that was skipped would otherwise send them to a name avahi never
+    answers on. Both rows show in normal operation rather than only in the
+    broken state, because a row that appears only when things break is a row
+    nobody has learned to look for. The hostname row is the one exception: it
+    is omitted when the host has no usable name, where naming nothing beats
+    naming something wrong.
+    """
+    ip_value = state.ip_text or "Unavailable"
+    if state.ip_is_fallback:
+        # Without this an operator reads a 169.254 address as a working lease
+        # and waits for a station that will never appear on the show LAN.
+        ip_value = f"{ip_value} - DHCP unavailable"
+    rows = [("IP Address:", ip_value)]
+    if state.hostname_text:
+        rows.append(("Web address:", state.hostname_text))
+    rows.append(
+        ("Video Source:", format_source_text(state.video_source_type, state.source_label, max_len=source_max_len))
+    )
+    rows.append(("Station:", state.station_name or "OpenFollow"))
+    return rows
+
+
+def draw_bottom_left_info_panel(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    rows = build_info_panel_rows(state)
+
+    label_size = 9.5
+    value_size = 10.8
+    side_padding = 12.0
+    row_h = INFO_PANEL_ROW_H
+    # Derived, not fixed: the hostname row is absent on a host with no usable
+    # name, and the fader stack above reserves this same height.
+    panel_h = info_panel_height(len(rows))
+
+    # Memoize layout + truncated values so unchanged panel skips measurement.
+    cache_key = (tuple(rows), w, h)
+    cached = renderer._info_panel_cache
+    if cached is not None and cached[0] == cache_key:
+        layout, rows = cached[1]
+    else:
+        renderer._set_ui_font(cr, label_size, bold=True)
+        label_w = max(cr.text_extents(label).width for label, _ in rows)
+        renderer._set_ui_font(cr, value_size)
+        value_w = max(cr.text_extents(value).width for _, value in rows)
+        layout = bottom_left_info_panel_layout(
+            frame_width=w,
+            frame_height=h,
+            label_w=label_w,
+            value_w=value_w,
+            side_padding=side_padding,
+            panel_h=panel_h,
+        )
+        rows = [(label, renderer._truncate_text_to_width(cr, value, layout.value_max_w)) for label, value in rows]
+        renderer._info_panel_cache = (cache_key, (layout, rows))
+
+    panel_x = layout.panel_x
+    panel_y = layout.panel_y
+    panel_w = layout.panel_w
+    label_x = layout.label_x
+    value_x = layout.value_x
+
+    # When the Settings menu carries a banner or the receiver
+    # surfaces an error_message, the bottom-left info panel turns red
+    # so operators glancing at the HUD spot the failure even when
+    # they don't have the Settings menu open. Matches the trigger
+    # condition for the Settings menu's red-bordered error box. An output
+    # that is down or failing turns it red too; the sentence is a top-right
+    # status row.
+    in_error = bool(
+        state.settings_menu_banner or state.error_message or state.video_failure_text or state.network_alerts
+    )
+    if in_error:
+        draw_level_box(cr, "error", panel_x, panel_y, panel_w, panel_h, radius=PANEL_RADIUS, line_width=1.6)
+    else:
+        draw_panel_background(renderer, cr, panel_x, panel_y, panel_w, panel_h, radius=PANEL_RADIUS)
+
+    renderer._set_ui_font(cr, label_size, bold=True)
+    cr.set_source_rgba(*COLOR_TEXT_MUTED)
+    for i, (label, _value) in enumerate(rows):
+        cr.move_to(label_x, panel_y + row_h * (i + 1))
+        cr.show_text(label)
+
+    renderer._set_ui_font(cr, value_size)
+    cr.set_source_rgb(*COLOR_TEXT)
+    for i, (_label, value) in enumerate(rows):
+        cr.move_to(value_x, panel_y + row_h * (i + 1))
+        cr.show_text(value)
+
+
+def draw_system_stats(renderer: Any, cr: Any, state: OverlayState, w: int) -> None:
+    stats_text = build_system_stats_text(state.cpu_percent, state.ram_percent, state.temperature)
+
+    renderer._set_ui_font(cr, 11)
+    ext = cr.text_extents(stats_text)
+    panel_w = ext.width + 20
+    panel_h = 24
+    panel_x = w - panel_w - 10
+
+    draw_panel(renderer, cr, panel_x, 10, panel_w, panel_h, stats_text, 11)
+
+
+def draw_panel_background(
+    renderer: Any, cr: Any, x: float, y: float, w: float, h: float, radius: float = PANEL_RADIUS
+) -> None:
+    # Shared overlay-card chrome (translucent fill + soft border) so every
+    # panel reads in the same visual language as the operator-message cards.
+    draw_card_background(cr, x, y, w, h, radius)
+
+
+def draw_panel(renderer: Any, cr: Any, x: float, y: float, w: float, h: float, text: str, font_size: float) -> None:
+    draw_panel_background(renderer, cr, x, y, w, h)
+
+    cr.set_source_rgb(*COLOR_TEXT)
+    renderer._set_ui_font(cr, font_size)
+    ext = cr.text_extents(text)
+    tx = x + (w - ext.width) / 2 - ext.x_bearing
+    ty = y + (h - ext.height) / 2 - ext.y_bearing
+    cr.move_to(tx, ty)
+    cr.show_text(text)
+
+
+def _draw_offline_mark(cr: Any, cx: float, cy: float, r: float) -> None:
+    """Off-white disc with a cross cut into it: an offline marker, a drive that can't be written."""
+    cr.save()
+    cr.set_source_rgb(*COLOR_TEXT)
+    cr.arc(cx, cy, r, 0, 6.2832)
+    cr.fill()
+    arm = r * 0.45
+    cr.set_source_rgb(*COLOR_BG_BASE)
+    cr.set_line_width(1.5)
+    cr.move_to(cx - arm, cy - arm)
+    cr.line_to(cx + arm, cy + arm)
+    cr.move_to(cx + arm, cy - arm)
+    cr.line_to(cx - arm, cy + arm)
+    cr.stroke()
+    cr.restore()
+
+
+_CARD_BORDER_W = 3.5
+_CARD_BORDER_W_SELECTED = 4.0
+
+
+def draw_marker_card(
+    renderer: Any,
+    cr: Any,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    t: MarkerOverlayData,
+    selected: bool,
+    state: OverlayState | None = None,
+) -> None:
+    radius = PANEL_RADIUS
+
+    # Viewer-only markers: use Cairo group for uniform alpha; skip grouping for controlled markers (hot path).
+    use_group = not t.is_controlled
+    if use_group:
+        cr.push_group()
+    try:
+        # Solid background; border uses marker color for per-card identity. A
+        # card whose controller is missing turns red so it reads across a room.
+        missing = t.is_controlled and t.controller_idx is not None and not t.controller_connected
+        if missing:
+            cr.set_source_rgba(*COLOR_WARNING_FILL)
+        else:
+            cr.set_source_rgb(*COLOR_BG_BASE)
+        draw_rounded_rect(cr, x, y, w, h, radius)
+        cr.fill()
+        if t.identify_flash:
+            cr.set_source_rgba(*COLOR_ACCENT_SOFT)
+            draw_rounded_rect(cr, x, y, w, h, radius)
+            cr.fill()
+
+        # Solid, so neither the video nor the card fill tints it; selection reads by width.
+        cr.set_source_rgb(*parse_hex(t.color))
+        draw_rounded_rect(cr, x, y, w, h, radius)
+        cr.set_line_width(_CARD_BORDER_W_SELECTED if selected else _CARD_BORDER_W)
+        cr.stroke()
+        if t.identify_flash:
+            cr.set_source_rgb(*COLOR_ACCENT)
+            draw_rounded_rect(cr, x, y, w, h, radius)
+            cr.set_line_width(5.0)
+            cr.stroke()
+
+        renderer._set_ui_font(cr, 10)
+
+        dot_r = 4.5
+        ring_w = 2.5
+        # 2 px clear of the selected border's inner edge, ring included.
+        inset = _CARD_BORDER_W_SELECTED / 2 + 2.0 + dot_r + 1.5 + ring_w / 2
+        dot_x = x + w - inset
+        dot_y = y + inset
+        if t.online:
+            cr.set_source_rgb(*COLOR_OK)
+            cr.arc(dot_x, dot_y, dot_r, 0, 6.2832)
+            cr.fill()
+            cr.set_source_rgba(*COLOR_OK, 0.3)
+            cr.set_line_width(ring_w)
+            cr.arc(dot_x, dot_y, dot_r + 1.5, 0, 6.2832)
+            cr.stroke()
+        else:
+            _draw_offline_mark(cr, dot_x, dot_y, dot_r + 1.0)
+
+        # Controller badge top-left (controlled markers only). 1-based to match
+        # the OSC ``:cN`` reference.
+        badge_right: float | None = None
+        if t.is_controlled and t.controller_idx is not None:
+            if t.controller_connected:
+                renderer._set_ui_font(cr, 9)
+                cr.set_source_rgb(*COLOR_TEXT)
+                badge = f"C{t.controller_idx + 1}"
+            else:
+                renderer._set_ui_font(cr, 9, bold=True)
+                cr.set_source_rgb(*COLOR_TEXT)
+                badge = f"C{t.controller_idx + 1} missing"
+            cr.move_to(x + 8, y + 14)
+            cr.show_text(badge)
+            badge_right = x + 8 + cr.text_extents(badge).width
+
+        if selected:
+            cr.set_source_rgb(*COLOR_ACCENT)
+        else:
+            cr.set_source_rgb(*COLOR_TEXT)
+        renderer._set_ui_font(cr, 13, bold=True)
+        # Catalog name preferred over M<id> synthetic label; fallback when no catalog entry.
+        label = t.name if t.name else f"M{t.marker_id}"
+        ext = cr.text_extents(label)
+        name_x = x + (w - ext.width) / 2
+        # Centred, unless that runs into the badge or the status dot; then
+        # centred in the space between them, shortened if it still won't fit.
+        left = badge_right + 6 if badge_right is not None else x + 8
+        right = x + w - 18
+        if name_x < left or name_x + ext.width > right:
+            label = renderer._truncate_text_to_width(cr, label, right - left)
+            ext = cr.text_extents(label)
+            name_x = left + (right - left - ext.width) / 2
+        cr.move_to(name_x, y + 18)
+        cr.show_text(label)
+
+        cr.set_source_rgba(*COLOR_TEXT_MUTED)
+        renderer._set_ui_font(cr, 10)
+        display_z = t.z
+        if state is not None and state.z_display_from_stage and state.grid_config:
+            display_z = t.z - state.grid_config[5]
+        # Position/speed in active unit system; state can be None → default metric.
+        us = state.unit_system if state is not None else UnitSystem.METRIC
+        pos = (
+            f"{format_length_compact(t.x, us)}  "
+            f"{format_length_compact(t.y, us)}  "
+            f"{format_length_compact(display_z, us)}"
+        )
+        ext = cr.text_extents(pos)
+        cr.move_to(x + (w - ext.width) / 2, y + 34)
+        cr.show_text(pos)
+
+        speed = max(0.0, float(t.speed) if t.speed is not None else 0.0)
+        cr.set_source_rgb(*COLOR_TEXT)
+        renderer._set_ui_font(cr, 9)
+        stxt = format_speed(speed, us)
+        # Per-marker gamepad fader appended to speed line; only when marker_fader is provisioned.
+        if t.marker_fader is not None:
+            stxt = f"{stxt}   F {t.marker_fader:.2f}"
+        ext = cr.text_extents(stxt)
+        cr.move_to(x + (w - ext.width) / 2, y + 47)
+        cr.show_text(stxt)
+
+        # Viewer-only markers omit speed bar (control-context affordance); speed text stays.
+        if t.is_controlled:
+            bar_w, bar_h = 124, 8
+            bar_x = x + (w - bar_w) / 2
+            bar_y = y + h - 14
+
+            # Slightly rounded ends (2.5px) to match card chrome without full pill.
+            bar_radius = 2.5
+            cr.set_source_rgba(0.08, 0.08, 0.1, 0.9)
+            draw_rounded_rect(cr, bar_x, bar_y, bar_w, bar_h, bar_radius)
+            cr.fill()
+
+            min_spd = state.min_speed if state is not None else 0.1
+            max_spd = state.max_speed if state is not None else 3.0
+            spd_range = max_spd - min_spd
+            ratio = min((speed - min_spd) / spd_range, 1.0) if spd_range > 0 else 0
+            ratio = max(ratio, 0.0)
+            if ratio > 0.001:
+                sr, sg, sb = speed_color(speed - min_spd, spd_range)
+                bar_gradient = cairo.LinearGradient(bar_x, bar_y, bar_x + bar_w * ratio, bar_y)
+                bar_gradient.add_color_stop_rgb(0, sr * 0.8, sg * 0.8, sb * 0.8)
+                bar_gradient.add_color_stop_rgb(1, sr, sg, sb)
+                # Clip progress fill to rounded track for rounded corners + crisp edge.
+                # try/finally so a fill error can't leave the clip save on the
+                # stack – the caller's outer ``restore`` would otherwise pop
+                # this instead of its own (misaligned state on the next frame).
+                cr.save()
+                try:
+                    draw_rounded_rect(cr, bar_x, bar_y, bar_w, bar_h, bar_radius)
+                    cr.clip()
+                    cr.set_source(bar_gradient)
+                    cr.rectangle(bar_x, bar_y, bar_w * ratio, bar_h)
+                    cr.fill()
+                finally:
+                    cr.restore()
+    finally:
+        # Always balance the group stack, even if the body raised: an open
+        # group would redirect the caller's "Overlay Error" fallback
+        # (video/overlay.py) onto the unpopped group surface, so neither the
+        # HUD nor the error banner would reach the screen on that frame.
+        if use_group:
+            cr.pop_group_to_source()
+            cr.paint_with_alpha(0.6)
+
+
+def draw_virtual_faders(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    h: int,
+) -> None:
+    """Stack virtual faders on bottom-left; mirroring marker card visual language."""
+    if not state.virtual_faders_display:
+        return
+    card_w = 180.0
+    card_h = 28.0
+    card_m = 6.0
+    # Left edge aligned with info panel for shared left margin.
+    card_x = 10.0
+    # The info panel below grows with its row count, so reserve its real
+    # height rather than a fixed one.
+    bottom_padding = fader_stack_bottom_padding(len(build_info_panel_rows(state)))
+    for i, vf in enumerate(state.virtual_faders_display):
+        card_y = virtual_fader_card_y(
+            i,
+            h,
+            card_h=card_h,
+            card_margin=card_m,
+            bottom_padding=bottom_padding,
+        )
+        draw_virtual_fader_card(
+            renderer,
+            cr,
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            vf,
+        )
+
+
+def draw_virtual_fader_card(
+    renderer: Any,
+    cr: Any,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    vf: VirtualFaderDisplayData,
+) -> None:
+    """One virtual fader row. Layout:
+
+    - Background panel (gradient + accent border) via the shared
+      :func:`draw_panel_background`, so the fader card and the
+      marker card share the same chrome.
+    - Name on the left, padded inside the panel.
+    - Value on the right, two-decimals. Muted colour + the
+      "(not picked up)" suffix when the fader's pickup gate
+      hasn't engaged yet.
+    """
+    draw_panel_background(renderer, cr, x, y, w, h, radius=PANEL_RADIUS)
+
+    # baseline-ish; matches the marker card's internal vertical rhythm.
+    text_y = y + h * 0.65
+
+    # Measure the value text first so the name budget reflects the
+    # space the right-aligned value actually needs. The previous
+    # ``w * 0.55`` heuristic could let a long "(not picked up)"
+    # suffix overlap the name on narrower cards.
+    renderer._set_ui_font(cr, 11)
+    if vf.picked_up:
+        value_text = f"{vf.value:.2f}"
+    else:
+        value_text = f"{vf.value:.2f} (not picked up)"
+    value_ext = cr.text_extents(value_text)
+    # Padding budget: 10 px each side for the card edges + an 8 px
+    # gap between name and value so they don't visually fuse.
+    name_budget = max(0.0, w - value_ext.width - 10.0 - 10.0 - 8.0)
+
+    # Name on the left – bold so it reads as a label, not a value.
+    renderer._set_ui_font(cr, 11, bold=True)
+    cr.set_source_rgb(*COLOR_TEXT)
+    cr.move_to(x + 10.0, text_y)
+    name = renderer._truncate_text_to_width(cr, vf.name, name_budget)
+    cr.show_text(name)
+
+    # Value on the right.
+    renderer._set_ui_font(cr, 11)
+    if vf.picked_up:
+        cr.set_source_rgb(*COLOR_TEXT)
+    else:
+        cr.set_source_rgba(*COLOR_TEXT_MUTED)
+    cr.move_to(x + w - 10.0 - value_ext.width, text_y)
+    cr.show_text(value_text)
+
+
+_BUTTON_DISPLAY_NAMES: dict[str, str] = {
+    "A": "A",
+    "B": "B",
+    "X": "X",
+    "Y": "Y",
+    "LB": "Left Bumper",
+    "RB": "Right Bumper",
+    "LT": "Left Trigger",
+    "RT": "Right Trigger",
+    "BACK": "Back / Select",
+    "START": "Start / Menu",
+    "DPAD_UP": "D-Pad Up",
+    "DPAD_DOWN": "D-Pad Down",
+    "DPAD_LEFT": "D-Pad Left",
+    "DPAD_RIGHT": "D-Pad Right",
+}
+
+_BUTTON_SHORT_NAMES: dict[str, str] = {
+    "A": "A",
+    "B": "B",
+    "X": "X",
+    "Y": "Y",
+    "LB": "LB",
+    "RB": "RB",
+    "LT": "LT",
+    "RT": "RT",
+    "BACK": "Back",
+    "START": "Start",
+    "DPAD_UP": "D-Up",
+    "DPAD_DOWN": "D-Down",
+    "DPAD_LEFT": "D-Left",
+    "DPAD_RIGHT": "D-Right",
+}
+
+_HAT_RESULT_NAMES: dict[int, str] = {
+    -1: "hat Up",
+    -2: "hat Down",
+    -3: "hat Left",
+    -4: "hat Right",
+}
+
+
+def draw_button_detection_overlay(renderer: Any, cr: Any, state: OverlayState, w: int, h: int) -> None:
+    """Draw the button detection wizard as a fullscreen modal."""
+    bd = state.button_detection
+    if bd is None or not bd.active:
+        return
+
+    draw_modal_scrim(cr, w, h, alpha=0.72)
+
+    done = bd.step >= bd.total_steps
+    subtitle = f"All {bd.total_steps} steps done" if done else f"Step {bd.step + 1} of {bd.total_steps}"
+    panel_w = panel_width(w)
+    panel_h = screen_height(h)
+    panel_x, panel_y, panel_w, panel_h = draw_modal_shell(
+        renderer,
+        cr,
+        w,
+        h,
+        title="BUTTON DETECTION",
+        subtitle=subtitle,
+        panel_w=panel_w,
+        panel_h=panel_h,
+    )
+
+    content_x = panel_x + 24.0
+    content_w = panel_w - 48.0
+    cursor_y = panel_y + 76.0
+
+    # Not the menus' key list: every pad button here is recorded as the prompted one.
+    if state.keyboard_connected:
+        renderer._set_ui_font(cr, 11)
+        cr.set_source_rgba(*COLOR_TEXT_MUTED)
+        esc = "Esc: Close" if done else "Esc: Cancel"
+        ext = cr.text_extents(esc)
+        cr.move_to(panel_x + (panel_w - ext.width) / 2.0 - ext.x_bearing, panel_y + panel_h - 18.0)
+        cr.show_text(esc)
+
+    # Prompt: "Press: <LABEL>"
+    if bd.current_label:
+        renderer._set_ui_font(cr, 14)
+        cr.set_source_rgba(*COLOR_TEXT_MUTED)
+        prompt_text = "Press button:"
+        ext = cr.text_extents(prompt_text)
+        cr.move_to(panel_x + (panel_w - ext.width) / 2.0, cursor_y)
+        cr.show_text(prompt_text)
+        cursor_y += 10.0
+
+        display_name = _BUTTON_DISPLAY_NAMES.get(bd.current_label, bd.current_label)
+        renderer._set_ui_font(cr, 42 if h >= 720 else 32, bold=True)
+        cr.set_source_rgb(*COLOR_ACCENT)
+        ext = cr.text_extents(display_name)
+        cr.move_to(panel_x + (panel_w - ext.width) / 2.0 - ext.x_bearing, cursor_y + ext.height)
+        cr.show_text(display_name)
+        cursor_y += ext.height + 24.0
+    else:
+        renderer._set_ui_font(cr, 18, bold=True)
+        done_text = "Detection Complete!"
+        ext = cr.text_extents(done_text)
+        sign, gap = 20.0, 8.0
+        text_x = panel_x + (panel_w - ext.width + sign + gap) / 2.0
+        mid_y = cursor_y + 20.0 + ext.y_bearing + ext.height / 2.0
+        draw_success_sign(cr, text_x - gap - sign / 2.0, mid_y, sign)
+        cr.set_source_rgb(*COLOR_OK)
+        cr.move_to(text_x, cursor_y + 20.0)
+        cr.show_text(done_text)
+        cursor_y += 50.0
+
+    # Progress bar
+    bar_h = 6.0
+    bar_x = content_x
+    bar_w = content_w
+    cr.set_source_rgba(0.08, 0.08, 0.1, 0.9)
+    draw_rounded_rect(cr, bar_x, cursor_y, bar_w, bar_h, 3.0)
+    cr.fill()
+    if bd.total_steps > 0:
+        ratio = bd.step / bd.total_steps
+        if ratio > 0:
+            cr.set_source_rgb(*COLOR_ACCENT)
+            draw_rounded_rect(cr, bar_x, cursor_y, bar_w * ratio, bar_h, 3.0)
+            cr.fill()
+    cursor_y += bar_h + 16.0
+
+    # Completed mappings list
+    if bd.completed:
+        renderer._set_ui_font(cr, 10.5, bold=True)
+        cr.set_source_rgb(*COLOR_ACCENT)
+        cr.move_to(content_x, cursor_y)
+        cr.show_text("DETECTED:")
+        cursor_y += 16.0
+
+        col_w = content_w / 2.0
+        row_h = 16.0
+        items = list(bd.completed.items())
+        for i, (label, raw_idx) in enumerate(items):
+            col = i % 2
+            row = i // 2
+            x = content_x + col * col_w
+            y = cursor_y + row * row_h
+
+            short_name = _BUTTON_SHORT_NAMES.get(label, label)
+            renderer._set_ui_font(cr, 10, bold=True)
+            cr.set_source_rgb(*COLOR_TEXT)
+            cr.move_to(x, y)
+            cr.show_text(short_name)
+
+            renderer._set_ui_font(cr, 10)
+            cr.set_source_rgba(*COLOR_TEXT_MUTED)
+            cr.move_to(x + 70.0, y)
+            if raw_idx <= -100:
+                axis_idx = -100 - raw_idx
+                cr.show_text(f"\u2192 axis {axis_idx}")
+            elif raw_idx < 0:
+                cr.show_text(f"\u2192 {_HAT_RESULT_NAMES.get(raw_idx, f'hat {raw_idx}')}")
+            else:
+                cr.show_text(f"\u2192 btn {raw_idx}")
+
+
+# ---------------------------------------------------------------------------
+# Network screens
+# ---------------------------------------------------------------------------
+
+
+_NOTICE_FONT = 11.5
+_NOTICE_LINE_H = 16.0
+_NOTICE_PAD = 7.0
+_NOTICE_SIGN = 14.0
+_NOTICE_MAX_LINES = 3
+_NOTICE_GAP = 8.0
+
+
+def _draw_network_status_row(
+    renderer: Any, cr: Any, x: float, y: float, w: float, level: str, text: str, *, busy: bool = False
+) -> float:
+    """A row in its level's fill and border, led by its sign (the spinner while
+    *busy*); returns the height drawn."""
+    text_x = x + _NOTICE_PAD + _NOTICE_SIGN + 8.0
+    text_w = x + w - _NOTICE_PAD - text_x
+    lines = _wrap_lines(renderer, cr, text, text_w, _NOTICE_FONT, bold=False, max_lines=_NOTICE_MAX_LINES)
+    row_h = len(lines) * _NOTICE_LINE_H + 2 * _NOTICE_PAD
+    draw_level_box(cr, level, x, y, w, row_h, radius=ROW_RADIUS, line_width=1.2)
+    sign_cx = x + _NOTICE_PAD + _NOTICE_SIGN / 2.0
+    sign_cy = y + _NOTICE_PAD + _NOTICE_LINE_H / 2.0
+    if busy:
+        draw_spinner(cr, sign_cx, sign_cy, _NOTICE_SIGN / 2.0 - 1.0, time.monotonic())
+    else:
+        draw_level_sign(cr, level, sign_cx, sign_cy, _NOTICE_SIGN)
+    renderer._set_ui_font(cr, _NOTICE_FONT)
+    cr.set_source_rgb(*COLOR_TEXT)
+    for i, line in enumerate(lines):
+        cr.move_to(text_x, y + _NOTICE_PAD + _NOTICE_LINE_H * i + 12.0)
+        cr.show_text(line)
+    return row_h
+
+
+def draw_pi_network_screen(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+) -> None:
+    """Apple Network-pane style: sectioned headers + indented rows.
+
+    Headers and display rows are non-selectable; the cursor only lands
+    on choice / text / action rows. Rows are drawn directly (not via
+    ``draw_selectable_list``) so headers can render bold and unindented
+    while data rows sit indented below them.
+    """
+    net = state.pi_network
+    subtitle = "Address settings for this interface." if net.open_iface else "Interfaces on this station."
+    panel_w = panel_width(w)
+    panel_h = screen_height(h)
+    panel_x, panel_y, panel_w, panel_h = draw_modal_shell(
+        renderer,
+        cr,
+        w,
+        h,
+        title=(net.title or net.open_iface).upper() if net.open_iface else "NETWORK INTERFACES",
+        subtitle=subtitle,
+        panel_w=panel_w,
+        panel_h=panel_h,
+    )
+
+    content_x = panel_x + 16.0
+    content_w = panel_w - 32.0
+    cursor_y = panel_y + 74.0
+
+    if net.banner:
+        level = status_level(net.banner_level)
+        cursor_y += (
+            _draw_network_status_row(renderer, cr, content_x, cursor_y, content_w, level, net.banner, busy=net.busy)
+            + 10.0
+        )
+
+    # Container panel for the row list.
+    list_y = cursor_y
+    list_h = max(160.0, panel_y + panel_h - cursor_y - 14.0)
+    draw_rounded_rect(cr, content_x, list_y, content_w, list_h, PANEL_RADIUS)
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.26)
+    cr.fill()
+    cr.set_source_rgba(*COLOR_BORDER_SOFT)
+    draw_rounded_rect(cr, content_x, list_y, content_w, list_h, PANEL_RADIUS)
+    cr.set_line_width(1.0)
+    cr.stroke()
+
+    inner_x = content_x + 14.0
+    inner_w = content_w - 28.0
+    row_y = list_y + 14.0
+    header_h = 24.0
+    data_row_h = 24.0
+    action_row_h = 30.0
+    spacing_after_header = 4.0
+    spacing_after_section = 10.0
+
+    selected_idx = net.selected_index
+    for idx, row in enumerate(net.rows):
+        kind = row.get("kind", "display")
+        label = str(row.get("label", ""))
+        value = str(row.get("value", ""))
+
+        if kind == "header":
+            # Bold section heading; no chrome, and muted: a heading in a status
+            # colour raises a false alarm on a screen reached when something is
+            # already wrong.
+            renderer._set_ui_font(cr, 12, bold=True)
+            cr.set_source_rgba(*COLOR_TEXT_MUTED)
+            cr.move_to(inner_x, row_y + header_h * 0.75)
+            cr.show_text(label.upper())
+            row_y += header_h + spacing_after_header
+            continue
+
+        if kind == "notice":
+            # Clear of the rows above it, which would otherwise touch its border.
+            if idx > 0 and net.rows[idx - 1].get("kind") not in ("notice", "header"):
+                row_y += _NOTICE_GAP
+            level = status_level(row.get("level"))
+            row_y += _draw_network_status_row(renderer, cr, inner_x, row_y, inner_w, level, label) + 6.0
+            if idx + 1 < len(net.rows) and net.rows[idx + 1].get("kind") == "header":
+                row_y += spacing_after_section
+            continue
+
+        if kind == "action":
+            # Button-styled row.
+            is_selected = idx == selected_idx
+            box_x = inner_x
+            box_w = inner_w
+            box_h = action_row_h
+            if is_selected:
+                cr.set_source_rgba(*COLOR_ACCENT_SOFT)
+                draw_rounded_rect(cr, box_x, row_y, box_w, box_h, ROW_RADIUS)
+                cr.fill()
+                cr.set_source_rgba(COLOR_ACCENT[0], COLOR_ACCENT[1], COLOR_ACCENT[2], 0.42)
+                draw_rounded_rect(cr, box_x, row_y, box_w, box_h, ROW_RADIUS)
+                cr.set_line_width(1.1)
+                cr.stroke()
+                renderer._set_ui_font(cr, 12, bold=True)
+                cr.set_source_rgb(*COLOR_TEXT)
+            else:
+                cr.set_source_rgba(0.18, 0.18, 0.22, 0.7)
+                draw_rounded_rect(cr, box_x, row_y, box_w, box_h, ROW_RADIUS)
+                cr.fill()
+                renderer._set_ui_font(cr, 12)
+                cr.set_source_rgba(*COLOR_TEXT)
+            text = renderer._truncate_text_to_width(cr, label, box_w - 24.0)
+            ext = cr.text_extents(text)
+            cr.move_to(box_x + (box_w - ext.width) / 2.0, row_y + box_h / 2.0 + 4.0)
+            cr.show_text(text)
+            row_y += action_row_h + 4.0
+            continue
+
+        # choice / text / display rows: "label    value"
+        is_selected = idx == selected_idx
+        if is_selected:
+            cr.set_source_rgba(*COLOR_ACCENT_SOFT)
+            draw_rounded_rect(cr, inner_x, row_y - 2.0, inner_w, data_row_h, ROW_RADIUS)
+            cr.fill()
+        label_x = inner_x + 14.0
+        # The label column carries URLs on this screen, not just field names.
+        # At 180 a station's own ``<slug>.local`` - the headline row, and the
+        # line an operator reads out over comms - ellipsised; the values here
+        # are short interface names, so the space belongs on the left.
+        value_x = inner_x + 300.0
+        # A pill sits at the right edge, so the value column has to stop short
+        # of it rather than run underneath.
+        chevron_w = CHEVRON_GUTTER if row.get("opens") else 0.0
+        pill = str(row.get("pill", ""))
+        pill_w = 0.0
+        if pill:
+            renderer._set_ui_font(cr, 10)
+            pill_w = cr.text_extents(pill).width + 16.0
+        # A row with nothing in the value column lends it to the label: an FQDN's
+        # URL runs past the column a ``.local`` one fits in.
+        label_end = value_x - 8.0 if value else inner_x + inner_w - 14.0 - pill_w - chevron_w
+        renderer._set_ui_font(cr, 11.5, bold=is_selected)
+        cr.set_source_rgba(*COLOR_TEXT_MUTED if kind == "display" else COLOR_TEXT)
+        cr.move_to(label_x, row_y + data_row_h * 0.65)
+        cr.show_text(renderer._truncate_text_to_width(cr, label, label_end - label_x))
+        renderer._set_ui_font(cr, 11.5, bold=is_selected)
+        cr.set_source_rgba(*COLOR_TEXT_MUTED if kind == "display" else COLOR_TEXT)
+        cr.move_to(value_x, row_y + data_row_h * 0.65)
+        cr.show_text(renderer._truncate_text_to_width(cr, value, inner_w - (value_x - inner_x) - 14.0 - pill_w))
+        if bool(row.get("opens")):
+            draw_submenu_chevron(cr, inner_x + inner_w - 6.0, row_y + data_row_h / 2.0 - 2.0)
+        if pill:
+            # A state takes its level's chip colours; how the address was come by is neutral.
+            pill_level = row.get("pill_level")
+            level_colors = STATUS_LEVEL_COLORS[status_level(pill_level)] if pill_level else None
+            pill_x = inner_x + inner_w - pill_w - 8.0 - chevron_w
+            pill_y = row_y + 1.0
+            pill_h = data_row_h - 6.0
+            cr.set_source_rgba(*(level_colors[0] if level_colors else (1.0, 1.0, 1.0, 0.07)))
+            # A pill sits in a row, and an inner corner is never rounder than its container.
+            draw_rounded_rect(cr, pill_x, pill_y, pill_w, pill_h, ROW_RADIUS)
+            cr.fill()
+            if level_colors:
+                cr.set_source_rgb(*level_colors[1])
+                draw_rounded_rect(cr, pill_x, pill_y, pill_w, pill_h, ROW_RADIUS)
+                cr.set_line_width(1.0)
+                cr.stroke()
+            renderer._set_ui_font(cr, 10)
+            cr.set_source_rgba(*((*COLOR_TEXT, 1.0) if level_colors else COLOR_TEXT_MUTED))
+            ext = cr.text_extents(pill)
+            cr.move_to(pill_x + (pill_w - ext.width) / 2.0, pill_y + pill_h * 0.72)
+            cr.show_text(pill)
+        row_y += data_row_h
+
+        # Slight extra gap after the last DNS / lease / router row before
+        # the next header to make sections visually distinct.
+        next_idx = idx + 1
+        if next_idx < len(net.rows) and net.rows[next_idx].get("kind") == "header":
+            row_y += spacing_after_section
+
+
+def draw_pi_network_screen_overlay(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+) -> None:
+    draw_modal_scrim(cr, w, h, alpha=0.56)
+    draw_pi_network_screen(renderer, cr, state, w, h)
+
+
+def draw_pi_network_field_edit(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+) -> None:
+    net = state.pi_network
+    # Naming the field alone leaves an operator on a multi-NIC station to
+    # remember which row they opened, and the cost of getting it wrong is
+    # reconfiguring the interface they are reachable on.
+    title = f"Change {net.field_label or 'Value'}".upper()
+    subtitle = net.active_iface
+    panel_w = panel_width(w)
+    panel_h = min(h * 0.30, 240.0)
+    panel_x, panel_y, panel_w, panel_h = draw_modal_shell(
+        renderer,
+        cr,
+        w,
+        h,
+        title=title,
+        subtitle=subtitle,
+        panel_w=panel_w,
+        panel_h=panel_h,
+    )
+
+    box_x = panel_x + 24.0
+    box_y = panel_y + 84.0
+    box_w = panel_w - 48.0
+    box_h = 52.0
+    cr.set_source_rgba(0.12, 0.12, 0.16, 0.95)
+    draw_rounded_rect(cr, box_x, box_y, box_w, box_h, PANEL_RADIUS)
+    cr.fill()
+
+    renderer._set_ui_font(cr, 18.0)
+    cr.set_source_rgba(*COLOR_TEXT)
+    rendered = renderer._truncate_text_to_width(cr, net.field_value, box_w - 40.0)
+    text_x = box_x + 16.0
+    text_y = box_y + box_h / 2.0 + 6.0
+    cr.move_to(text_x, text_y)
+    cr.show_text(rendered)
+
+    # A d-pad cursor names one digit, so it is underlined in place. Without
+    # this the operator presses left/right and nothing moves, then presses up
+    # and a digit changes somewhere they cannot see. A typed value keeps the
+    # end-of-string caret instead.
+    caret = net.field_caret_offset
+    cr.set_source_rgba(*COLOR_ACCENT)
+    if 0 <= caret < len(rendered):
+        before = cr.text_extents(rendered[:caret]).x_advance
+        width = cr.text_extents(rendered[caret]).x_advance
+        underline_y = box_y + box_h - 12.0
+        cr.set_line_width(2.2)
+        cr.move_to(text_x + before, underline_y)
+        cr.line_to(text_x + before + width, underline_y)
+        cr.stroke()
+    else:
+        cursor_x = text_x + cr.text_extents(rendered).x_advance + 1.0
+        cr.set_line_width(1.6)
+        cr.move_to(cursor_x, box_y + 14.0)
+        cr.line_to(cursor_x, box_y + box_h - 14.0)
+        cr.stroke()
+
+
+def draw_pi_network_field_edit_overlay(
+    renderer: Any,
+    cr: Any,
+    state: OverlayState,
+    w: int,
+    h: int,
+) -> None:
+    draw_modal_scrim(cr, w, h, alpha=0.56)
+    draw_pi_network_field_edit(renderer, cr, state, w, h)

@@ -1,0 +1,1801 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""Unit-level coverage for pure helpers in :mod:`openfollow.web.routes`.
+
+Complements :mod:`tests.test_web_helpers` (the large happy-path
+apply/get-section matrix) and :mod:`tests.test_web_server` (integration
+routes against a real Bottle app) by walking the remaining edge
+branches in the coercion + validation helpers that:
+
+* Can be driven without a ``bottle.Bottle`` instance or a ``request`` /
+  ``response`` proxy (no HTTP path needed).
+* The happy-path integration suite never reaches (malformed import
+  payloads, unsupported OverflowError types, wizard camera edge inputs).
+
+Targeted helpers:
+
+* ``_as_float`` / ``_as_optional_float`` / ``_as_int`` / ``_as_positive_int``
+  OverflowError + None / blank-string branches.
+* ``_as_int_list`` ValueError on malformed CSV + tuple input.
+* ``_parse_vertices`` malformed entries (non-list root, short pair,
+  non-numeric coord).
+* ``_apply_zone_fields`` vertex/field interaction + ``__post_init__``
+  re-run.
+* ``_wizard_camera_params`` error surface (non-dict, missing key,
+  non-numeric value) – each raises a distinct exception that the
+  ``/api/wizard/*`` routes translate to HTTP 400.
+* ``_apply_import_data`` applying every section from one import.
+
+``_is_private_peer_ip`` and ``_load_json_body`` already have parametrised
+coverage in :mod:`tests.test_web_helpers`; we rely on those rather than
+duplicating here.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:  # Python 3.10 – project floor is >=3.10 (tomllib is 3.11+)
+    import tomli as tomllib  # type: ignore[no-redef]
+
+import numpy as np
+import pytest
+
+import openfollow.web.routes as routes_module
+from openfollow.configuration import AppConfig, DetectionMaskConfig, TriggerZoneConfig
+from openfollow.web.routes import (
+    _apply_import_data,
+    _apply_mask_fields,
+    _apply_zone_fields,
+    _as_float,
+    _as_float_or_zero,
+    _as_int,
+    _as_int_list,
+    _as_optional_float,
+    _as_positive_int,
+    _config_to_toml,
+    _find_by_id,
+    _parse_vertices,
+    _swap_for_direction,
+    _wizard_camera_params,
+    apply_section_data,
+    build_interface_assignment_rows,
+    strip_device_local_fields,
+)
+
+pytestmark = pytest.mark.unit
+
+
+class _Item:
+    """Minimal ``.id``-bearing stand-in for the id-keyed config rows."""
+
+    def __init__(self, item_id: str) -> None:
+        self.id = item_id
+
+
+class TestFindById:
+    def test_returns_index_and_item_on_match(self) -> None:
+        items = [_Item("a"), _Item("b"), _Item("c")]
+        found = _find_by_id(items, "b")
+        assert found is not None
+        idx, item = found
+        assert idx == 1
+        assert item is items[1]
+
+    def test_returns_none_when_missing(self) -> None:
+        assert _find_by_id([_Item("a")], "z") is None
+
+    def test_returns_first_match(self) -> None:
+        items = [_Item("dup"), _Item("dup")]
+        found = _find_by_id(items, "dup")
+        assert found is not None and found[0] == 0
+
+
+class TestSwapForDirection:
+    def test_up_swaps_with_predecessor(self) -> None:
+        items = ["a", "b", "c"]
+        assert _swap_for_direction(items, 1, "up") is True
+        assert items == ["b", "a", "c"]
+
+    def test_down_swaps_with_successor(self) -> None:
+        items = ["a", "b", "c"]
+        assert _swap_for_direction(items, 1, "down") is True
+        assert items == ["a", "c", "b"]
+
+    def test_top_up_is_noop_returns_false(self) -> None:
+        items = ["a", "b"]
+        assert _swap_for_direction(items, 0, "up") is False
+        assert items == ["a", "b"]
+
+    def test_bottom_down_is_noop_returns_false(self) -> None:
+        items = ["a", "b"]
+        assert _swap_for_direction(items, 1, "down") is False
+        assert items == ["a", "b"]
+
+    def test_unknown_direction_is_noop_returns_false(self) -> None:
+        items = ["a", "b"]
+        assert _swap_for_direction(items, 0, "sideways") is False
+        assert items == ["a", "b"]
+
+
+# --------------------------------------------------------------------------- #
+# _as_float / _as_optional_float / _as_int / _as_positive_int
+# --------------------------------------------------------------------------- #
+
+
+class TestAsFloatEdgeCases:
+    def test_overflow_from_huge_int_falls_back_to_default(self) -> None:
+        """``float(10**5000)`` raises ``OverflowError`` – the helper
+        must catch it so a crafted JSON payload can't 500 the request.
+        """
+        assert _as_float(10**5000, default=42.0) == 42.0
+
+    def test_typeerror_from_object_falls_back_to_default(self) -> None:
+        assert _as_float(object(), default=1.5) == 1.5
+
+    def test_none_falls_back_to_default(self) -> None:
+        assert _as_float(None, default=7.5) == 7.5
+
+    def test_valid_numeric_string_is_parsed(self) -> None:
+        assert _as_float("3.14", default=0.0) == pytest.approx(3.14)
+
+
+class TestAsFloatOrZero:
+    """``_as_float_or_zero`` has a three-way contract for
+    ``grid.max_height``:
+
+    - ``None`` / empty / whitespace-only string → ``0.0`` (operator's
+      intentional "clear" – disables ``[fz]`` / ``[ifz]``).
+    - Valid finite number → that number.
+    - Anything else (non-numeric, overflow, ``inf`` / ``nan``) →
+      preserve the ``default`` (previous value). Matches every
+      other coerce helper's "bad input → preserve current" rule
+      so a crafted payload like ``{"max_height": "tall"}`` cannot
+      silently disable every binding by collapsing to ``0.0``.
+    """
+
+    def test_none_collapses_to_zero(self) -> None:
+        assert _as_float_or_zero(None, default=4.0) == 0.0
+
+    def test_empty_string_collapses_to_zero(self) -> None:
+        assert _as_float_or_zero("", default=4.0) == 0.0
+
+    def test_blank_string_collapses_to_zero(self) -> None:
+        assert _as_float_or_zero("   ", default=4.0) == 0.0
+
+    def test_non_numeric_string_preserves_default(self) -> None:
+        """Malformed payload preserves the previous value instead of
+        silently zeroing."""
+        assert _as_float_or_zero("tall", default=4.0) == 4.0
+
+    def test_overflow_preserves_default(self) -> None:
+        assert _as_float_or_zero(10**5000, default=4.0) == 4.0
+
+    def test_inf_string_preserves_default(self) -> None:
+        """``float("1e5000")`` overflows silently to ``inf`` – the
+        helper's finiteness check rejects it so the previous value
+        is kept rather than disabling every ``[fz]`` row."""
+        assert _as_float_or_zero("1e5000", default=4.0) == 4.0
+        assert _as_float_or_zero("inf", default=4.0) == 4.0
+        assert _as_float_or_zero("-inf", default=4.0) == 4.0
+
+    def test_nan_string_preserves_default(self) -> None:
+        assert _as_float_or_zero("nan", default=4.0) == 4.0
+
+    def test_valid_number_is_parsed(self) -> None:
+        assert _as_float_or_zero("3.5", default=4.0) == pytest.approx(3.5)
+        assert _as_float_or_zero(7, default=4.0) == pytest.approx(7.0)
+
+    def test_zero_input_stays_zero(self) -> None:
+        """Distinct from 'preserve current' – explicit ``0`` is a
+        valid finite number, so the parser returns ``0.0`` even when
+        the prior value was non-zero."""
+        assert _as_float_or_zero("0", default=4.0) == 0.0
+        assert _as_float_or_zero(0.0, default=4.0) == 0.0
+
+
+class TestAsOptionalFloat:
+    def test_none_returns_none_regardless_of_default(self) -> None:
+        assert _as_optional_float(None, default=5.0) is None
+
+    def test_blank_string_returns_none(self) -> None:
+        assert _as_optional_float("   ", default=5.0) is None
+
+    def test_malformed_string_falls_back_to_default(self) -> None:
+        assert _as_optional_float("abc", default=5.0) == 5.0
+
+    def test_overflow_falls_back_to_default(self) -> None:
+        assert _as_optional_float(10**5000, default=5.0) == 5.0
+
+    def test_valid_number_is_returned_as_float(self) -> None:
+        assert _as_optional_float(42, default=5.0) == 42.0
+
+
+class TestAsIntEdgeCases:
+    def test_float_inf_raises_overflow_and_returns_default(self) -> None:
+        """``int(float('inf'))`` raises ``OverflowError`` – catching it
+        protects the request handler from 500ing on JSON ``1e400``.
+        """
+        assert _as_int(float("inf"), default=10) == 10
+
+    def test_none_falls_back_to_default(self) -> None:
+        assert _as_int(None, default=3) == 3
+
+    def test_valid_string_parses(self) -> None:
+        assert _as_int("42", default=0) == 42
+
+
+class TestAsOptionalInt:
+    """``_as_optional_int`` distinguishes "operator cleared the input"
+    (``None``) from "operator typed something invalid" (default), since
+    the underlying field is :class:`int | None` and the two states have
+    different semantics in the runtime."""
+
+    def test_none_returns_none_regardless_of_default(self) -> None:
+        from openfollow.web.routes import _as_optional_int
+
+        assert _as_optional_int(None, default=5) is None
+
+    def test_empty_string_returns_none(self) -> None:
+        from openfollow.web.routes import _as_optional_int
+
+        assert _as_optional_int("", default=5) is None
+
+    def test_whitespace_string_returns_none(self) -> None:
+        from openfollow.web.routes import _as_optional_int
+
+        assert _as_optional_int("   ", default=5) is None
+
+    def test_valid_int_returns_int(self) -> None:
+        from openfollow.web.routes import _as_optional_int
+
+        assert _as_optional_int("3", default=None) == 3
+        assert _as_optional_int(0, default=None) == 0
+        assert _as_optional_int(7, default=None) == 7
+
+    def test_malformed_string_falls_back_to_default(self) -> None:
+        from openfollow.web.routes import _as_optional_int
+
+        assert _as_optional_int("abc", default=5) == 5
+        assert _as_optional_int("abc", default=None) is None
+
+    def test_float_inf_overflows_and_falls_back(self) -> None:
+        from openfollow.web.routes import _as_optional_int
+
+        assert _as_optional_int(float("inf"), default=5) == 5
+
+    def test_bool_collapses_to_none(self) -> None:
+        """``bool`` is an ``int`` subclass, so a crafted POST with
+        ``default_fader=true`` would otherwise silently save fader 1.
+        ``OscTransmitterConfig.__post_init__`` already collapses bool
+        inputs to ``None``; the web parser agrees so save-time and
+        POST-time coercion stay in lockstep."""
+        from openfollow.web.routes import _as_optional_int
+
+        assert _as_optional_int(True, default=5) is None
+        assert _as_optional_int(False, default=5) is None
+
+
+class TestAsPositiveInt:
+    def test_zero_clamps_to_one(self) -> None:
+        """Used for fields that will be divided by the value (e.g.
+        ``eval_fps``) – must never return 0 or the handler would
+        ZeroDivisionError downstream.
+        """
+        assert _as_positive_int(0, default=5) == 1
+
+    def test_negative_clamps_to_one(self) -> None:
+        assert _as_positive_int(-10, default=5) == 1
+
+    def test_valid_positive_passes_through(self) -> None:
+        assert _as_positive_int(30, default=5) == 30
+
+    def test_malformed_falls_back_then_clamps(self) -> None:
+        """Malformed value → default. If the default is also < 1, the
+        final clamp still guarantees ``>= 1``.
+        """
+        assert _as_positive_int("abc", default=0) == 1
+
+
+# --------------------------------------------------------------------------- #
+# _as_int_list
+# --------------------------------------------------------------------------- #
+
+
+class TestAsIntList:
+    def test_malformed_csv_returns_default(self) -> None:
+        """``"1,abc,3"`` – one non-int entry should revert the whole
+        list to default rather than silently dropping ``abc``.  Operators
+        editing config.toml by hand should see the old value preserved,
+        not partially applied.
+        """
+        assert _as_int_list("1,abc,3", default=[99]) == [99]
+
+    def test_tuple_input_coerced(self) -> None:
+        """Covers line 509 branch – JSON arrays arrive as ``list``;
+        hand-coded callers may pass ``tuple``.  Both should work.
+        """
+        assert _as_int_list((1, 2, 3), default=[0]) == [1, 2, 3]
+
+    def test_list_with_non_int_returns_default(self) -> None:
+        """Covers lines 512-514 – ``int("abc")`` raises ``ValueError``,
+        ``int(None)`` raises ``TypeError``.  Either collapses the whole
+        list to default.
+        """
+        assert _as_int_list([1, "abc", 3], default=[7]) == [7]
+        assert _as_int_list([1, None, 3], default=[7]) == [7]
+
+    def test_none_input_returns_default(self) -> None:
+        assert _as_int_list(None, default=[1, 2]) == [1, 2]
+
+    def test_non_string_non_iterable_returns_default(self) -> None:
+        assert _as_int_list(42, default=[9]) == [9]
+
+    def test_empty_csv_returns_default(self) -> None:
+        assert _as_int_list("", default=[5]) == [5]
+
+
+# --------------------------------------------------------------------------- #
+# _parse_vertices / _apply_zone_fields
+# --------------------------------------------------------------------------- #
+
+
+class TestParseVertices:
+    def test_non_list_preserves_current(self) -> None:
+        """A malformed payload – e.g. ``"vertices": null`` – must not
+        wipe the existing polygon.
+        """
+        current = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
+        assert _parse_vertices(None, current) == current
+        assert _parse_vertices("oops", current) == current
+        assert _parse_vertices(42, current) == current
+
+    def test_valid_list_of_pairs_is_coerced_to_floats(self) -> None:
+        assert _parse_vertices([[0, 0], [1, 0], [1, 1]], current=[]) == [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
+
+    def test_entries_under_two_elements_are_dropped(self) -> None:
+        assert _parse_vertices([[0, 0], [1]], current=[]) == [[0.0, 0.0]]
+
+    def test_tuple_entries_are_accepted_same_as_lists(self) -> None:
+        assert _parse_vertices([(0, 0), (1, 2)], current=[]) == [[0.0, 0.0], [1.0, 2.0]]
+
+    def test_non_numeric_coord_is_dropped(self) -> None:
+        assert _parse_vertices([[0, 0], ["a", "b"], [2, 2]], current=[]) == [[0.0, 0.0], [2.0, 2.0]]
+
+    def test_extra_columns_past_two_are_truncated(self) -> None:
+        """A three-tuple ``[x, y, z]`` should still produce a 2-D
+        vertex – the extra dim is silently dropped.  This keeps the
+        web UI tolerant of clients that send annotated payloads.
+        """
+        assert _parse_vertices([[1, 2, 3], [4, 5, 6]], current=[]) == [[1.0, 2.0], [4.0, 5.0]]
+
+    def test_empty_list_returns_empty_not_current(self) -> None:
+        """Explicit empty list is NOT the malformed-payload case – the
+        caller really is clearing the polygon.
+        """
+        assert _parse_vertices([], current=[[1, 1]]) == []
+
+
+class TestApplyZoneFields:
+    def test_updates_field_and_reruns_post_init(self) -> None:
+        """Covers the ``zone.__post_init__`` re-run at the end of
+        ``_apply_zone_fields`` – otherwise a hand-crafted payload could
+        set ``trigger_source="everything"`` which the dataclass
+        normally rejects at construction.
+        """
+        zone = TriggerZoneConfig(
+            name="Z1",
+            color="#ff0000",
+            trigger_source="markers",
+            enabled=True,
+            vertices=[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+        )
+        _apply_zone_fields(zone, {"name": "Z1 renamed", "trigger_source": "both"})
+        assert zone.name == "Z1 renamed"
+        assert zone.trigger_source == "both"
+
+    def test_vertices_update_runs_through_parse_vertices(self) -> None:
+        zone = TriggerZoneConfig()
+        _apply_zone_fields(zone, {"vertices": [[0, 0], [1, 0], [2, 0]]})
+        assert zone.vertices == [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]
+
+    def test_invalid_trigger_source_is_normalised_by_post_init(self) -> None:
+        """``__post_init__`` snaps unknown trigger_source values to a
+        safe default – covers the guard against a crafted payload.
+        """
+        zone = TriggerZoneConfig()
+        _apply_zone_fields(zone, {"trigger_source": "garbage"})
+        # Post-init must have rewritten it to an allowed value.
+        assert zone.trigger_source in ("markers", "detection", "both")
+
+
+class TestApplyMaskFields:
+    def test_updates_name_enabled_and_vertices(self) -> None:
+        mask = DetectionMaskConfig(name="M0", enabled=True)
+        _apply_mask_fields(mask, {"name": "Stage", "enabled": False, "vertices": [[0, 0], [1, 0], [1, 1]]})
+        assert mask.name == "Stage"
+        assert mask.enabled is False
+        assert mask.vertices == [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
+
+    def test_absent_keys_are_left_untouched(self) -> None:
+        """A partial PUT toggling ``enabled`` must not wipe the polygon."""
+        mask = DetectionMaskConfig(name="Keep", vertices=[[0.1, 0.1], [0.2, 0.1], [0.2, 0.2]])
+        _apply_mask_fields(mask, {"enabled": False})
+        assert mask.enabled is False
+        assert mask.name == "Keep"
+        assert mask.vertices == [[0.1, 0.1], [0.2, 0.1], [0.2, 0.2]]
+
+    def test_post_init_drops_non_finite_vertices(self) -> None:
+        """The ``__post_init__`` re-run scrubs a crafted non-finite vertex."""
+        mask = DetectionMaskConfig()
+        _apply_mask_fields(mask, {"vertices": [[0.0, 0.0], [float("nan"), 0.5], [1.0, 1.0]]})
+        assert mask.vertices == [[0.0, 0.0], [1.0, 1.0]]
+
+    def test_null_vertices_preserves_existing(self) -> None:
+        """``{"vertices": null}`` must not destructively blank the polygon."""
+        mask = DetectionMaskConfig(vertices=[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])
+        _apply_mask_fields(mask, {"vertices": None})
+        assert mask.vertices == [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
+
+
+# --------------------------------------------------------------------------- #
+# _wizard_camera_params – error matrix (maps to HTTP 400 at the route layer)
+# --------------------------------------------------------------------------- #
+
+
+class TestWizardCameraParams:
+    def test_non_dict_raises_typeerror(self) -> None:
+        with pytest.raises(TypeError):
+            _wizard_camera_params("not a dict")
+
+    def test_missing_key_raises_keyerror(self) -> None:
+        bad = {"pos_x": 0, "pos_y": 0, "pos_z": 0, "pitch": 0, "yaw": 0, "roll": 0}
+        with pytest.raises(KeyError):
+            _wizard_camera_params(bad)
+
+    def test_non_numeric_value_raises_valueerror(self) -> None:
+        with pytest.raises((TypeError, ValueError)):
+            _wizard_camera_params(
+                {
+                    "pos_x": "abc",
+                    "pos_y": 0,
+                    "pos_z": 0,
+                    "pitch": 0,
+                    "yaw": 0,
+                    "roll": 0,
+                    "fov": 60,
+                }
+            )
+
+    def test_valid_input_returns_float64_vector(self) -> None:
+        cam = {
+            "pos_x": 1.0,
+            "pos_y": 2.0,
+            "pos_z": 3.0,
+            "pitch": 4.0,
+            "yaw": 5.0,
+            "roll": 6.0,
+            "fov": 60.0,
+        }
+        vec = _wizard_camera_params(cam)
+        assert vec.dtype == np.float64
+        assert vec.tolist() == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 60.0]
+
+
+# --------------------------------------------------------------------------- #
+# _is_private_peer_ip – LAN/public matrix lives in tests/test_web_helpers.py.
+# Only the IPv6 loopback edge case was new here; it has been folded into the
+# existing parametrized test to keep the SSRF policy in one place.
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# _apply_import_data
+# --------------------------------------------------------------------------- #
+
+
+class TestApplyImportData:
+    def test_every_section_applies_from_one_import(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Video source, camera, detection and both outputs land together."""
+        # ``apply_section_data("video_source", ...)`` imports
+        # ``get_available_input_ids`` lazily from ``openfollow.video.inputs``
+        # – the real helper triggers plugin auto-discovery (NDI probes
+        # library paths, etc).  Patch the module attribute to a
+        # deterministic list so this unit test stays hermetic and
+        # doesn't depend on which plugins happen to auto-register.
+        import openfollow.video.inputs as inputs_module
+
+        monkeypatch.setattr(
+            inputs_module,
+            "get_available_input_ids",
+            lambda: ["rtsp", "ndi"],
+        )
+
+        current = AppConfig(video_source_type="rtsp")
+        assert current.video_source_type == "rtsp"
+
+        payload = {
+            "video_source_type": "ndi",
+            "camera": {"fov": 75.0},
+            "detection": {"enabled": True},
+            "otp_output": {"enabled": True},
+            "rttrpm_output": {"enabled": True},
+        }
+        out = _apply_import_data(current, payload)
+
+        assert out.camera.fov == 75.0
+        assert out.otp_output.enabled is True
+        assert out.rttrpm_output.enabled is True
+        assert out.video_source_type == "ndi"
+        assert out.detection.enabled is True
+
+    def test_preserves_psn_source_iface_regardless_of_payload(self) -> None:
+        """``psn_source_iface`` is device-specific (the NIC name to
+        bind to). The import must NEVER overwrite it, even on a non-skip
+        import – pointing this device at an iface name that may not even
+        exist locally would send PSN binding through the auto-detect
+        fallback on the next restart.
+        """
+        current = replace(AppConfig(), psn_source_iface="eth0")
+        out = _apply_import_data(
+            current,
+            {"psn_source_iface": "wlan0"},
+        )
+        assert out.psn_source_iface == "eth0"
+
+    def test_trigger_zones_list_imports_atomically(self) -> None:
+        """The zones list replaces the existing zones entirely – an
+        empty list clears them, a populated list uses the new set.
+        """
+        current = AppConfig()
+        zones_payload = [
+            {"name": "Zone A", "vertices": [[0, 0], [1, 0], [1, 1], [0, 1]]},
+        ]
+        out = _apply_import_data(
+            current,
+            {"trigger_zones": {"enabled": True, "zones": zones_payload}},
+        )
+        assert len(out.trigger_zones.zones) == 1
+        assert out.trigger_zones.zones[0].name == "Zone A"
+
+    def test_malformed_zones_entry_is_skipped(self) -> None:
+        """A non-dict entry in the zones list must be skipped without
+        raising – a crafted payload shouldn't crash the import.
+        """
+        current = AppConfig()
+        out = _apply_import_data(
+            current,
+            {
+                "trigger_zones": {
+                    "enabled": True,
+                    "zones": [
+                        "garbage",  # not a dict – skipped
+                        {"name": "Valid", "vertices": [[0, 0], [1, 0], [1, 1]]},
+                    ],
+                },
+            },
+        )
+        assert len(out.trigger_zones.zones) == 1
+        assert out.trigger_zones.zones[0].name == "Valid"
+
+    def test_osc_routing_blocks_without_inner_lists_are_skipped(self) -> None:
+        """An ``osc_transmitters`` / ``osc_destinations`` block whose inner
+        list key is absent or non-list is skipped, not applied – a crafted
+        payload can't crash the import or wipe the existing rows."""
+        current = AppConfig()
+        out = _apply_import_data(
+            current,
+            {
+                "osc_transmitters": {},  # no "transmitters" list → skipped
+                "osc_destinations": {"destinations": "nope"},  # not a list → skipped
+            },
+        )
+        assert out.osc_transmitters.transmitters == []
+
+    def test_window_dimensions_imported_as_ints(self) -> None:
+        current = AppConfig()
+        out = _apply_import_data(current, {"window_width": 1920, "window_height": 1080})
+        assert out.window_width == 1920
+        assert out.window_height == 1080
+
+    def test_web_pin_not_overwritten_by_import(self) -> None:
+        # web_pin is device-local (login credential): an imported config must
+        # not rewrite this station's PIN.
+        current = AppConfig(web_pin="9999")
+        out = _apply_import_data(current, {"web_pin": "1234"})
+        assert out.web_pin == "9999"
+
+    def test_web_port_not_overwritten_by_import(self) -> None:
+        # web_port is device-local (local bind): import preserves it.
+        current = AppConfig(web_port=8080)
+        out = _apply_import_data(current, {"web_port": 1234})
+        assert out.web_port == 8080
+
+
+# --------------------------------------------------------------------------- #
+# apply_section_data – video recovery timers (stall_timeout / heal_interval)
+# --------------------------------------------------------------------------- #
+
+
+class TestVideoRecoveryTimerSection:
+    def test_recovery_timers_parsed_and_clamped(self) -> None:
+        """The video_source section parses ``stall_timeout`` /
+        ``heal_interval`` (coerced to float, floored at 0)."""
+        cfg = AppConfig(stall_timeout=3.0, heal_interval=5.0)
+        changed = apply_section_data(
+            cfg,
+            "video_source",
+            {"stall_timeout": "1.5", "heal_interval": "8"},
+        )
+        assert changed is True
+        assert cfg.stall_timeout == 1.5
+        assert cfg.heal_interval == 8.0
+
+    def test_recovery_timers_floor_negative_to_zero(self) -> None:
+        cfg = AppConfig(stall_timeout=3.0, heal_interval=5.0)
+        apply_section_data(
+            cfg,
+            "video_source",
+            {"stall_timeout": "-2", "heal_interval": "-1"},
+        )
+        assert cfg.stall_timeout == 0.0
+        assert cfg.heal_interval == 0.0
+
+    def test_recovery_timers_reject_non_finite(self) -> None:
+        """A crafted ``inf``/``nan`` must NOT be saved – it would survive
+        ``float()`` and later crash ``int(timeout*1000)`` in the watchdog.
+        Non-finite input preserves the current value (matches AppConfig
+        coercion, since apply_section_data doesn't re-run __post_init__)."""
+        cfg = AppConfig(stall_timeout=3.0, heal_interval=5.0)
+        apply_section_data(
+            cfg,
+            "video_source",
+            {"stall_timeout": "inf", "heal_interval": "nan"},
+        )
+        assert cfg.stall_timeout == 3.0
+        assert cfg.heal_interval == 5.0
+
+
+# --------------------------------------------------------------------------- #
+# apply_section_data – ``psn_source_iface``
+# --------------------------------------------------------------------------- #
+
+
+class TestPsnSourceIfaceSection:
+    """The PSN form's network-source pin. The legacy raw-IP
+    ``psn_source_ip`` was removed because operators left stale IPs in
+    their configs and bricked the box on the next network change;
+    pinning the stable interface name avoids that footgun."""
+
+    def test_psn_section_accepts_iface(self) -> None:
+        cfg = AppConfig(psn_source_iface="")
+        apply_section_data(cfg, "psn", {"psn_source_iface": "eth0"})
+        assert cfg.psn_source_iface == "eth0"
+
+    def test_psn_section_strips_whitespace(self) -> None:
+        """Mirrors AppConfig.__post_init__ – without stripping at the
+        web-save path, the stored value desyncs from the runtime
+        canonical form on every reload."""
+        cfg = AppConfig(psn_source_iface="")
+        apply_section_data(cfg, "psn", {"psn_source_iface": "  wlan0  "})
+        assert cfg.psn_source_iface == "wlan0"
+
+    def test_general_section_accepts_iface(self) -> None:
+        """The General section reads/writes the same field – the
+        Settings page legacy entry point must keep working."""
+        cfg = AppConfig(psn_source_iface="")
+        apply_section_data(cfg, "general", {"psn_source_iface": "eth0"})
+        assert cfg.psn_source_iface == "eth0"
+
+    def test_import_preserves_psn_source_iface(self) -> None:
+        """Importing a config from another box must not clobber this
+        device's iface pin: the iface name (and the local NIC it refers
+        to) is device-specific."""
+        local_cfg = AppConfig(psn_source_iface="eth0")
+        imported = _apply_import_data(local_cfg, {"psn_source_iface": "different"})
+        assert imported.psn_source_iface == "eth0"
+
+
+# --------------------------------------------------------------------------- #
+# ``_load_json_body`` malformed / null-literal / valid-object paths are all
+# covered by ``tests/test_web_helpers.py`` (``test_load_json_body_*``). This
+# file no longer duplicates them.
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# _license_file_path / _read_license_text fallbacks
+# --------------------------------------------------------------------------- #
+
+
+class TestLicenseHelpers:
+    """The /about page falls back gracefully when the bundled
+    repo-root ``LICENSE`` isn't present (e.g. an installed wheel)."""
+
+    def test_license_file_path_none_when_absent(self, monkeypatch) -> None:
+        real_is_file = Path.is_file
+
+        def fake_is_file(self: Path) -> bool:
+            # Only the LICENSE lookup reports missing; leave every other
+            # path probe (imports, stat calls, …) behaving normally.
+            return False if self.name == "LICENSE" else real_is_file(self)
+
+        monkeypatch.setattr(Path, "is_file", fake_is_file)
+        assert routes_module._license_file_path() is None
+
+    def test_read_license_text_none_when_no_file(self, monkeypatch) -> None:
+        monkeypatch.setattr(routes_module, "_license_file_path", lambda: None)
+        assert routes_module._read_license_text() is None
+
+    def test_read_license_text_none_on_read_error(self, monkeypatch, tmp_path) -> None:
+        # Point at a directory so ``read_text`` raises IsADirectoryError
+        # (an OSError subclass) and the helper swallows it.
+        monkeypatch.setattr(routes_module, "_license_file_path", lambda: tmp_path)
+        assert routes_module._read_license_text() is None
+
+
+class TestBundledDocResolution:
+    def test_repo_root_candidate(self) -> None:
+        # LICENSE ships at the repo root in a source checkout.
+        assert routes_module._bundled_doc_path("LICENSE") is not None
+
+    def test_none_when_absent(self) -> None:
+        assert routes_module._bundled_doc_path("definitely-not-a-file.xyz") is None
+
+    def test_share_dir_fallback(self, monkeypatch, tmp_path) -> None:
+        (tmp_path / "NOTICES.md").write_text("x")
+        monkeypatch.setattr(routes_module, "_SHARE_DOC_DIR", tmp_path)
+        assert routes_module._bundled_doc_path("NOTICES.md") == tmp_path / "NOTICES.md"
+
+
+class TestThirdPartyNotices:
+    def test_none_when_no_file(self, monkeypatch) -> None:
+        monkeypatch.setattr(routes_module, "_bundled_doc_path", lambda name: None)
+        assert routes_module._third_party_notices_html() is None
+
+    def test_none_on_read_error(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(routes_module, "_bundled_doc_path", lambda name: tmp_path)
+        assert routes_module._third_party_notices_html() is None
+
+    def test_renders_markdown(self, monkeypatch, tmp_path) -> None:
+        doc = tmp_path / "THIRD_PARTY_NOTICES.md"
+        doc.write_text("# Title\n\n| A | B |\n|---|---|\n| 1 | 2 |\n")
+        monkeypatch.setattr(routes_module, "_bundled_doc_path", lambda name: doc)
+        html = routes_module._third_party_notices_html()
+        assert html is not None
+        assert "<h1>Title</h1>" in html
+        assert "<table" in html
+
+
+# ---------------------------------------------------------------------------
+# strip_device_local_fields
+# ---------------------------------------------------------------------------
+
+
+class TestStripDeviceLocalFields:
+    """Device-local fields must NEVER cross machines via the peer-
+    broadcast or full-config-import paths. Helper used at both ends
+    (broadcaster-forward and peer-receive) so an older / out-of-date
+    sender can't poison the receiver."""
+
+    def test_psn_section_drops_source_iface(self) -> None:
+        scrubbed = strip_device_local_fields(
+            "psn",
+            {
+                "psn_system_name": "Stage A",
+                "psn_mcast_ip": "236.10.10.10",
+                "psn_source_iface": "eth0",
+            },
+        )
+        assert "psn_source_iface" not in scrubbed
+        # Non-device-local PSN fields pass through untouched.
+        assert scrubbed["psn_system_name"] == "Stage A"
+        assert scrubbed["psn_mcast_ip"] == "236.10.10.10"
+
+    def test_general_section_drops_source_iface(self) -> None:
+        """The General section accepts the same field on the form-save
+        path, so it must filter too – broadcasts via ``/api/config/general``
+        would otherwise sneak past the PSN-section guard."""
+        scrubbed = strip_device_local_fields(
+            "general",
+            {"psn_system_name": "X", "psn_source_iface": "wlan0"},
+        )
+        assert "psn_source_iface" not in scrubbed
+        assert scrubbed["psn_system_name"] == "X"
+
+    def test_otp_output_section_drops_source_iface(self) -> None:
+        """The OTP source interface pins THIS device's NIC, like
+        ``psn_source_iface`` – a broadcast/import must not copy it to a peer
+        whose interface names (or networks) differ."""
+        scrubbed = strip_device_local_fields(
+            "otp_output",
+            {"enabled": True, "system_number": 3, "source_iface": "eth0"},
+        )
+        assert "source_iface" not in scrubbed
+        # Non-device-local OTP fields pass through untouched.
+        assert scrubbed["enabled"] is True
+        assert scrubbed["system_number"] == 3
+
+    def test_rttrpm_output_section_drops_source_iface(self) -> None:
+        scrubbed = strip_device_local_fields("rttrpm_output", {"enabled": True, "source_iface": "eth0"})
+        assert scrubbed == {"enabled": True}
+
+    def test_the_interface_assignment_section_is_dropped_whole(self) -> None:
+        """Its per-destination keys are not known in advance, so a field list
+        cannot name them; nothing in the section is this box's to receive."""
+        scrubbed = strip_device_local_fields(
+            "interface_assignment",
+            {"psn_source_iface": "eth0", "osc_destinations.default.source_iface": "eth1"},
+        )
+        assert scrubbed == {}
+
+    def test_osc_section_drops_listen_iface(self) -> None:
+        """The listener pin names a NIC on THIS box. Copied to a peer it would
+        either dangle or resolve to a different network there and take that
+        station's receiver off the one it was on."""
+        scrubbed = strip_device_local_fields(
+            "osc",
+            {"enabled": True, "port": 8765, "listen_iface": "eth1"},
+        )
+        assert "listen_iface" not in scrubbed
+        # Non-device-local OSC fields pass through untouched.
+        assert scrubbed["enabled"] is True
+        assert scrubbed["port"] == 8765
+
+    def test_video_source_section_drops_selected_media(self) -> None:
+        """The Media Gallery selection is a device-local media id – the file
+        lives only on this host. A broadcast/import of the ``video_source``
+        section must not copy it onto a peer, whose store has no such id (it
+        would silently revert the peer's gallery to the Stage default)."""
+        scrubbed = strip_device_local_fields(
+            "video_source",
+            {"video_source_type": "testpattern", "testpattern_selected_media": "0123456789abcdef"},
+        )
+        assert "testpattern_selected_media" not in scrubbed
+        # Non-device-local video-source fields pass through untouched.
+        assert scrubbed["video_source_type"] == "testpattern"
+
+    def test_other_sections_passthrough(self) -> None:
+        """Sections without registered device-local fields return a
+        shallow copy of the input – no mutation, no surprise drops."""
+        data = {"pos_x": 1.0, "pos_y": 2.0}
+        scrubbed = strip_device_local_fields("camera", data)
+        assert scrubbed == data
+        # Returns a fresh dict so callers can mutate safely.
+        assert scrubbed is not data
+
+    def test_returns_fresh_dict_even_with_no_drop(self) -> None:
+        """Idempotent shallow-copy contract for the PSN section when
+        no device-local fields are actually present in the payload."""
+        data = {"psn_system_name": "OnlySystemName"}
+        scrubbed = strip_device_local_fields("psn", data)
+        assert scrubbed == data
+        assert scrubbed is not data
+
+
+# --------------------------------------------------------------------------- #
+# _config_to_toml – diagnostics "effective config" dump
+# --------------------------------------------------------------------------- #
+
+
+class TestConfigToToml:
+    """The diagnostics dump shares ``save_config``'s serialisation, so an
+    int-keyed dict like ``marker_move_speeds`` is stringified instead of
+    raising ``TypeError`` and blanking the whole "Effective config" section."""
+
+    def test_dumps_populated_marker_move_speeds_without_typeerror(self) -> None:
+        cfg = AppConfig(
+            controlled_marker_ids=[1, 2],
+            marker_move_speeds={1: 1.5, 2: 4.0},
+        )
+        toml = _config_to_toml(cfg)
+        # Round-trips: the produced text parses back as valid TOML.
+        parsed = tomllib.loads(toml)
+        assert parsed["marker_move_speeds"] == {"1": 1.5, "2": 4.0}
+
+    def test_empty_marker_move_speeds_still_dumps(self) -> None:
+        toml = _config_to_toml(AppConfig())
+        assert isinstance(toml, str)
+
+
+# --------------------------------------------------------------------------- #
+# apply_section_data: operator messages + osc multicast
+# --------------------------------------------------------------------------- #
+
+
+class TestOperatorMessagesSection:
+    def test_operator_messages_saves_fields(self) -> None:
+        cfg = AppConfig()
+        changed = apply_section_data(
+            cfg,
+            "operator_messages",
+            {"enabled": False, "position": "top", "max_visible": "4"},
+        )
+        assert changed is True
+        assert cfg.operator_messages.enabled is False
+        assert cfg.operator_messages.position == "top"
+        assert cfg.operator_messages.max_visible == 4
+
+    def test_operator_messages_clamps_and_falls_back(self) -> None:
+        # __post_init__ re-runs at the web-save path: out-of-range max_visible
+        # clamps; an invalid position falls back to "bottom".
+        cfg = AppConfig()
+        apply_section_data(
+            cfg,
+            "operator_messages",
+            {"enabled": True, "position": "sideways", "max_visible": "999"},
+        )
+        assert cfg.operator_messages.position == "bottom"
+        assert cfg.operator_messages.max_visible == 20
+
+    def test_osc_multicast_group_saved(self) -> None:
+        cfg = AppConfig()
+        apply_section_data(cfg, "osc", {"multicast_group": "239.1.2.3"})
+        assert cfg.osc.multicast_group == "239.1.2.3"
+
+    def test_osc_invalid_multicast_group_coerces_to_off(self) -> None:
+        # __post_init__ rejects a non-multicast address → "" (off).
+        cfg = AppConfig()
+        apply_section_data(cfg, "osc", {"multicast_group": "10.0.0.1"})
+        assert cfg.osc.multicast_group == ""
+
+    def test_controller_clear_message_bindings_saved(self) -> None:
+        cfg = AppConfig()
+        apply_section_data(
+            cfg,
+            "keyboard",
+            {"key_clear_messages": "c"},
+        )
+        assert cfg.controller.key_clear_messages == "c"
+        apply_section_data(
+            cfg,
+            "gamepad",
+            {"btn_clear_messages": "START"},
+        )
+        assert cfg.controller.btn_clear_messages == "START"
+
+
+# ---------------------------------------------------------------------------
+# Interface Assignment panel
+# ---------------------------------------------------------------------------
+
+
+class TestInterfaceAssignmentRows:
+    """``build_interface_assignment_rows`` resolves every row's live address
+    through the same pin -> station -> auto chain the runtime uses, so the
+    panel shows where a plane will actually bind rather than just its pin."""
+
+    @staticmethod
+    def _ifaces(monkeypatch, spec: dict[str, str]) -> None:
+        import socket
+        from types import SimpleNamespace
+
+        import openfollow.net_utils as net_utils_module
+
+        # An empty address is an interface that exists without one.
+        monkeypatch.setattr(
+            net_utils_module.psutil,
+            "net_if_addrs",
+            lambda: {
+                name: [SimpleNamespace(family=socket.AF_INET, address=addr)] if addr else []
+                for name, addr in spec.items()
+            },
+        )
+
+    def test_the_rows_that_always_ride_the_station_sit_directly_under_it(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5"})
+        rows = build_interface_assignment_rows(AppConfig(psn_source_iface="eth0"))
+        labels = [row["label"] for row in rows]
+        assert labels[:3] == ["Station default", "PSN in / out", "Discovery / marker sync"]
+        # Each is listed once.
+        assert labels.count("PSN in / out") == labels.count("Discovery / marker sync") == 1
+        assert [row["note"] for row in rows[1:3]] == ["Follows station default interface"] * 2
+
+    def test_station_row_owns_psn_source_iface(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5"})
+        cfg = AppConfig(psn_source_iface="eth0")
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        station = rows["Station default"]
+        assert station["key"] == "psn_source_iface"
+        assert station["value"] == "eth0"
+        assert station["address"] == "192.168.1.5"
+        # The station picker has nothing to follow, so it keeps auto-detect.
+        assert station["blank"] == "auto"
+
+    def test_blank_plane_pin_shows_the_station_address(self, monkeypatch) -> None:
+        """An OTP row left on "follow station" must display where it actually
+        points – an empty cell would hide the indirection entirely."""
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5", "eth1": "10.0.0.9"})
+        cfg = AppConfig(psn_source_iface="eth0")
+        cfg.otp_output.source_iface = ""
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["OTP output"]["value"] == ""
+        assert rows["OTP output"]["address"] == "192.168.1.5"
+        assert rows["OTP output"]["blank"] == "station"
+
+    def test_pinned_plane_shows_its_own_address(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5", "eth1": "10.0.0.9"})
+        cfg = AppConfig(psn_source_iface="eth0")
+        cfg.otp_output.source_iface = "eth1"
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["OTP output"]["address"] == "10.0.0.9"
+
+    def test_station_followers_are_read_only(self, monkeypatch) -> None:
+        """PSN and discovery carry the station's identity on the network, so
+        they follow the station pin and must not offer their own dropdown –
+        a picker would imply an independence they don't have."""
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5"})
+        cfg = AppConfig(psn_source_iface="eth0")
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        for label in ("PSN in / out", "Discovery / marker sync"):
+            assert rows[label]["editable"] is False
+            assert rows[label]["key"] == ""
+            assert rows[label]["address"] == "192.168.1.5"
+
+    def test_osc_input_row_follows_the_station_by_default(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5", "eth1": "10.0.0.9"})
+        cfg = AppConfig(psn_source_iface="eth0")
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        osc = rows["OSC input"]
+        assert osc["key"] == "osc.listen_iface"
+        assert osc["blank"] == "station"
+        assert osc["editable"] is True
+        assert osc["address"] == "192.168.1.5"
+
+    def test_osc_input_row_shows_its_own_pin(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5", "eth1": "10.0.0.9"})
+        cfg = AppConfig(psn_source_iface="eth0")
+        cfg.osc.listen_iface = "eth1"
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["OSC input"]["address"] == "10.0.0.9"
+
+    def test_osc_input_row_names_no_interface_when_nothing_is_pinned(self, monkeypatch) -> None:
+        """Unpinned there is no interface to name - the routing table picks one
+        per membership. Naming the auto-detected primary would read as a
+        restriction the socket does not have."""
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5"})
+        cfg = AppConfig(psn_source_iface="")
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["OSC input"]["address"] == "Default interface"
+
+    def test_osc_input_row_says_when_the_pin_governs_nothing(self, monkeypatch) -> None:
+        """The pin moves a multicast membership. With no group configured there
+        is no membership, so an address here would imply the row was doing
+        something to a listener it does not touch."""
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5"})
+        cfg = AppConfig(psn_source_iface="eth0")
+        cfg.osc.multicast_group = ""
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["OSC input"]["address"] == "No multicast group"
+
+    @pytest.mark.parametrize(
+        ("eth9", "state"),
+        [(None, "Not connected"), ("", "Interface down")],
+        ids=["adapter-gone", "no-address"],
+    )
+    def test_osc_input_row_reports_a_down_pin(self, monkeypatch, eth9: str | None, state: str) -> None:
+        """Fails closed on the group: no membership is held, so an address here
+        would claim a subscription that does not exist. An unplugged adapter
+        and one without an address are told apart."""
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5", **({} if eth9 is None else {"eth9": eth9})})
+        cfg = AppConfig(psn_source_iface="eth0")
+        cfg.osc.listen_iface = "eth9"
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["OSC input"]["address"] == state
+        assert rows["OSC input"]["outage"] is True
+        assert rows["Station default"]["outage"] is False
+
+    def test_a_down_station_puts_its_followers_down_too(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": ""})
+        rows = {r["label"]: r for r in build_interface_assignment_rows(AppConfig(psn_source_iface="eth0"))}
+        assert {label: rows[label]["address"] for label in ("Station default", "PSN in / out")} == {
+            "Station default": "Interface down",
+            "PSN in / out": "Interface down",
+        }
+        assert rows["PSN in / out"]["outage"] is True
+
+    def test_a_row_names_its_pin_by_label_for_the_bundle(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5"})
+        cfg = AppConfig(psn_source_iface="eth0", interface_labels={"eth0": "Lighting"})
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["Station default"]["value_display"] == "Lighting (eth0)"
+        assert rows["OTP output"]["value_display"] == ""
+
+    def test_an_inheriting_osc_row_agrees_with_the_station_row(self, monkeypatch) -> None:
+        """Both read one resolution. A second NIC walk could disagree with the
+        row above if an address moves mid-render."""
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5"})
+        cfg = AppConfig(psn_source_iface="eth0")
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["OSC input"]["address"] == rows["Station default"]["address"]
+
+    def _video_row(self, monkeypatch, **fields: object) -> dict:
+        self._ifaces(monkeypatch, {"eth0": "192.0.2.10", "eth1": "198.51.100.10"})
+        cfg = AppConfig(**fields)
+        return next(r for r in build_interface_assignment_rows(cfg) if r["label"].startswith("Video input"))
+
+    @pytest.mark.parametrize(
+        ("source", "name", "url"),
+        [("srt", "SRT", {}), ("rtsp", "RTSP", {}), ("rtp", "RTP", {"rtp_url": "rtp://239.1.1.1:5004"})],
+    )
+    def test_a_network_video_input_is_pinned_here(self, monkeypatch, source: str, name: str, url: dict) -> None:
+        row = self._video_row(monkeypatch, video_source_type=source, video_input_iface="eth1", **url)
+        assert row["label"] == f"Video input ({name})"
+        assert row["editable"] is True
+        assert row["key"] == "video_input_iface"
+        assert row["value"] == "eth1"
+        assert row["address"] == "198.51.100.10"
+        # Blank follows the station interface, like every output.
+        assert row["blank"] == "station"
+
+    def test_an_unpinned_video_input_follows_the_station(self, monkeypatch) -> None:
+        row = self._video_row(monkeypatch, video_source_type="srt", psn_source_iface="eth0")
+        assert row["value"] == ""
+        assert row["address"] == "192.0.2.10"
+
+    @staticmethod
+    def _pick(monkeypatch, source: str | None) -> list[str]:
+        """The Pi's routing choice, answering *source* for every destination."""
+        from openfollow import net_utils
+
+        asked: list[str] = []
+
+        def _route_source(address: str, port: int = 0) -> str | None:
+            asked.append(address)
+            return source
+
+        monkeypatch.setattr(net_utils, "route_source", _route_source)
+        return asked
+
+    @pytest.mark.parametrize(
+        ("fields", "target"),
+        [
+            ({"video_source_type": "srt", "srt_host": "srt://203.0.113.20:5000"}, "203.0.113.20"),
+            ({"video_source_type": "rtsp", "rtsp_url": "rtsp://203.0.113.21/stream"}, "203.0.113.21"),
+            ({"video_source_type": "rtp", "rtp_url": "rtp://239.1.1.1:5004"}, "239.1.1.1"),
+        ],
+        ids=["srt-camera", "rtsp-camera", "rtp-group"],
+    )
+    def test_with_nothing_pinned_the_video_row_shows_the_pis_pick(self, monkeypatch, fields: dict, target: str) -> None:
+        """Nothing pinned at all: the Pi picks, and the row says what it picked."""
+        asked = self._pick(monkeypatch, "198.51.100.10")
+        row = self._video_row(monkeypatch, **fields)
+        assert row["address"] == "eth1 – 198.51.100.10"
+        assert asked == [target]
+
+    @pytest.mark.parametrize("station", ["", "eth0"], ids=["nothing", "station"])
+    @pytest.mark.parametrize("url", ["rtp://0.0.0.0:5004", "rtp://[::]:5004"], ids=["ipv4", "ipv6"])
+    def test_an_rtp_wildcard_receives_on_every_interface_unless_pinned_itself(
+        self, monkeypatch, station: str, url: str
+    ) -> None:
+        """Only a pin of its own narrows the wildcard; the station's does not reach it."""
+        asked = self._pick(monkeypatch, "198.51.100.10")
+        row = self._video_row(monkeypatch, video_source_type="rtp", rtp_url=url, psn_source_iface=station)
+        assert row["address"] == "All interfaces"
+        assert row["blank"] == "all"
+        assert asked == []
+
+        pinned = self._video_row(monkeypatch, video_source_type="rtp", rtp_url=url, video_input_iface="eth1")
+        assert pinned["address"] == "198.51.100.10"
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"video_source_type": "rtp", "rtp_url": "rtp://0.0.0.0:70000"},
+            {"video_source_type": "rtsp", "rtsp_url": "rtsp://[2001:db8::5/s"},
+            {"video_source_type": "srt", "srt_host": "srt://[2001:db8::5:5000"},
+        ],
+        ids=["rtp-port", "rtsp-bracket", "srt-bracket"],
+    )
+    def test_a_url_that_does_not_parse_still_renders_the_panel(self, monkeypatch, fields: dict) -> None:
+        row = self._video_row(monkeypatch, psn_source_iface="eth0", **fields)
+        assert row["editable"] is True
+        assert row["address"]
+
+    def test_an_rtp_url_that_does_not_parse_is_not_the_wildcard(self, monkeypatch) -> None:
+        """Nothing is received from it, so it keeps the station's pin rather than reading as healthy everywhere."""
+        row = self._video_row(
+            monkeypatch, video_source_type="rtp", rtp_url="rtp://0.0.0.0:70000", psn_source_iface="eth0"
+        )
+        assert row["address"] == "192.0.2.10"
+        assert row.get("blank") != "all"
+
+    def test_the_pick_says_when_nothing_routes_there(self, monkeypatch) -> None:
+        self._pick(monkeypatch, None)
+        row = self._video_row(monkeypatch, video_source_type="srt", srt_host="srt://203.0.113.20:5000")
+        assert row["address"] == "No route"
+
+    def test_the_pick_names_an_address_no_interface_holds(self, monkeypatch) -> None:
+        self._pick(monkeypatch, "203.0.113.99")
+        row = self._video_row(monkeypatch, video_source_type="srt", srt_host="srt://203.0.113.20:5000")
+        assert row["address"] == "203.0.113.99"
+
+    @staticmethod
+    def _names(monkeypatch, answers: dict, gate=None, barrier=None) -> list[str]:
+        """``getaddrinfo`` answering from *answers* (an address, or a list of them,
+        IPv6 first); a name missing there fails. The shared resolvers start empty."""
+        import socket
+
+        from openfollow import net_utils
+
+        net_utils.HOST_RESOLVER.clear()
+        net_utils.IPV4_RESOLVER.clear()
+        looked_up: list[str] = []
+
+        def _getaddrinfo(host, _port, family=0, *_a, **_k):
+            looked_up.append(host)
+            if gate is not None:
+                gate.wait(5)
+            if barrier is not None:
+                barrier.wait(2)
+            if host not in answers:
+                raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+            found = answers[host] if isinstance(answers[host], list) else [answers[host]]
+            return [
+                (socket.AF_INET6 if ":" in a else socket.AF_INET, socket.SOCK_DGRAM, 17, "", (a, 0))
+                for a in found
+                if family != socket.AF_INET or ":" not in a
+            ]
+
+        monkeypatch.setattr(net_utils.socket, "getaddrinfo", _getaddrinfo)
+        return looked_up
+
+    @pytest.fixture(autouse=True)
+    def _fresh_resolvers(self):
+        """The panel shares the station's resolvers; nothing a test resolves outlives it."""
+        from openfollow import net_utils
+
+        yield
+        net_utils.HOST_RESOLVER.clear()
+        net_utils.IPV4_RESOLVER.clear()
+
+    def test_the_pick_resolves_a_name_once_for_many_renders(self, monkeypatch) -> None:
+        asked = self._pick(monkeypatch, "198.51.100.10")
+        looked_up = self._names(monkeypatch, {"camera.example": "203.0.113.20"})
+        for _ in range(2):
+            row = self._video_row(monkeypatch, video_source_type="srt", srt_host="srt://camera.example:5000")
+            assert row["address"] == "eth1 – 198.51.100.10"
+        assert asked == ["203.0.113.20", "203.0.113.20"]
+        assert looked_up == ["camera.example"]
+
+    def test_the_pick_says_a_name_does_not_resolve_and_remembers_it(self, monkeypatch) -> None:
+        looked_up = self._names(monkeypatch, {})
+        for _ in range(2):
+            row = self._video_row(monkeypatch, video_source_type="srt", srt_host="srt://nowhere.example:5000")
+            assert row["address"] == "Name not resolved"
+        assert looked_up == ["nowhere.example"]
+
+    def test_the_pick_does_not_hold_the_page_for_a_slow_name(self, monkeypatch) -> None:
+        import threading
+
+        gate = threading.Event()
+        monkeypatch.setattr(routes_module, "_ROUTE_PICK_WAIT_S", 0.01)
+        self._names(monkeypatch, {"slow.example": "203.0.113.20"}, gate=gate)
+        try:
+            row = self._video_row(monkeypatch, video_source_type="srt", srt_host="srt://slow.example:5000")
+            assert row["address"] == "Resolving name"
+        finally:
+            gate.set()
+            for worker in [t for t in threading.enumerate() if t.name == "host-dns"]:
+                worker.join(5)
+
+    def test_the_pick_waits_once_for_every_name_on_the_page(self, monkeypatch) -> None:
+        """Every lookup starts before any row waits, so names resolve side by side
+        within one wait rather than one wait each: here none answers until all three run."""
+        import threading
+
+        from openfollow.configuration import OscDestinationConfig
+
+        monkeypatch.setattr(routes_module, "_ROUTE_PICK_WAIT_S", 5.0)
+        self._pick(monkeypatch, "198.51.100.10")
+        names = {f"osc{i}.example": f"203.0.113.{i}" for i in range(3)}
+        self._names(monkeypatch, names, barrier=threading.Barrier(3))
+        self._ifaces(monkeypatch, {"eth1": "198.51.100.10"})
+        cfg = AppConfig()
+        cfg.rttrpm_output.host = ""
+        cfg.osc_destinations.destinations = [
+            OscDestinationConfig(id=f"d{i}", name=f"d{i}", host=host, port=8000) for i, host in enumerate(names)
+        ]
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert [rows[f"OSC Destination d{i}"]["address"] for i in range(3)] == ["eth1 – 198.51.100.10"] * 3
+
+    def test_a_sender_row_reads_the_address_its_ipv4_output_uses(self, monkeypatch) -> None:
+        """A dual-stack name sorted IPv6 first: OSC and RTTrPM send to its A record."""
+        asked = self._pick(monkeypatch, "198.51.100.10")
+        self._names(monkeypatch, {"dual.example": ["2001:db8::20", "203.0.113.20"]})
+        self._ifaces(monkeypatch, {"eth1": "198.51.100.10"})
+        cfg = AppConfig()
+        cfg.rttrpm_output.host = "dual.example"
+        build_interface_assignment_rows(cfg)
+        assert asked == ["203.0.113.20"]
+
+    def test_the_panel_shows_the_answer_the_output_already_has(self, monkeypatch) -> None:
+        """One resolver per family for the station: the camera's name the pin check
+        resolved, and the OSC destination the sender resolved, are not looked up again."""
+        from openfollow.osc import service as osc_service
+        from openfollow.video.inputs._pin import check_video_pin
+
+        self._pick(monkeypatch, "198.51.100.10")
+        looked_up = self._names(monkeypatch, {"camera.example": "203.0.113.20", "osc.example": "203.0.113.21"})
+        self._ifaces(monkeypatch, {"eth1": "198.51.100.10"})
+        monkeypatch.setattr("openfollow.video.inputs._pin.route_source", lambda _a, _p=0: "198.51.100.10")
+        check_video_pin("eth1", "camera.example", 5000, forced_device=False)
+        osc_service._resolve_host("osc.example")
+        cfg = AppConfig(video_source_type="srt", srt_host="srt://camera.example:5000")
+        cfg.rttrpm_output.host = "osc.example"
+        build_interface_assignment_rows(cfg)
+        assert sorted(looked_up) == ["camera.example", "osc.example"]
+
+    def test_a_tcp_destination_is_looked_up_over_both_families(self, monkeypatch) -> None:
+        """A TCP connection tries every family, so an AAAA-only name is reachable, not "Name not resolved"."""
+        from openfollow.configuration import OscDestinationConfig
+
+        asked = self._pick(monkeypatch, "2001:db8::10")
+        self._names(monkeypatch, {"v6.example": ["2001:db8::20"]})
+        cfg = AppConfig()
+        cfg.osc_destinations.destinations = [
+            OscDestinationConfig(id="tcp", name="tcp", host="v6.example", port=8000, protocol="tcp"),
+            OscDestinationConfig(id="udp", name="udp", host="v6.example", port=8000),
+        ]
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["OSC Destination tcp"]["address"] == "2001:db8::10"
+        assert rows["OSC Destination udp"]["address"] == "Name not resolved"
+        assert asked == ["2001:db8::20"]
+
+    def test_a_name_that_could_not_be_looked_up_says_so(self, monkeypatch) -> None:
+        """The station could not run the lookup; DNS was never asked."""
+        from openfollow import net_utils
+        from openfollow.web import routes as routes_module
+
+        class _NoThread:
+            def start(self) -> None:
+                raise RuntimeError("can't start new thread")
+
+        resolver = net_utils.BoundedResolver(thread_factory=lambda **_k: _NoThread())
+        monkeypatch.setattr(routes_module, "IPV4_RESOLVER", resolver)
+        cfg = AppConfig()
+        cfg.rttrpm_output.host = "rttrpm.example"
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["RTTrPM output"]["address"] == "Name not looked up"
+
+    def test_an_ipv6_literal_for_an_ipv4_output_says_so(self, monkeypatch) -> None:
+        self._names(monkeypatch, {})
+        cfg = AppConfig()
+        cfg.rttrpm_output.host = "2001:db8::20"
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["RTTrPM output"]["address"] == "Not an IPv4 address"
+
+    def test_a_pinned_video_input_with_no_address_says_so(self, monkeypatch) -> None:
+        row = self._video_row(monkeypatch, video_source_type="rtsp", video_input_iface="eth9")
+        assert row["address"] == "Not connected"
+        assert row["outage"] is True
+
+    def test_a_sender_with_no_destination_is_left_to_the_routing_table(self, monkeypatch) -> None:
+        """Not "All interfaces": an output sends from one interface, not all of them."""
+        self._ifaces(monkeypatch, {"eth0": "192.0.2.10"})
+        cfg = AppConfig()
+        cfg.rttrpm_output.host = ""
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert rows["RTTrPM output"]["address"] == "Per routing table"
+
+    def test_a_camera_on_this_station_reads_as_this_station(self, monkeypatch) -> None:
+        """Its traffic never leaves the box, so no pinned interface's address may stand in for it."""
+        asked = self._pick(monkeypatch, "192.0.2.10")
+        row = self._video_row(
+            monkeypatch, video_source_type="srt", srt_host="srt://192.0.2.10:5000", psn_source_iface="eth1"
+        )
+        assert row["address"] == "This station"
+        assert asked == []
+
+    def test_a_camera_on_this_box_reads_as_loopback(self, monkeypatch) -> None:
+        row = self._video_row(
+            monkeypatch, video_source_type="srt", srt_host="srt://127.0.0.1:5000", video_input_iface="eth1"
+        )
+        assert row["address"] == "Loopback"
+        assert row["editable"] is True
+
+    @pytest.mark.parametrize(
+        ("source", "label", "note"),
+        [
+            ("ndi", "Video input (NDI®)", "Not supported – NDI® chooses its own interface"),
+            ("testpattern", "Video input (Media Gallery)", "Not a network input"),
+        ],
+    )
+    def test_a_video_input_that_cannot_be_pinned_explains_why(
+        self, monkeypatch, source: str, label: str, note: str
+    ) -> None:
+        from openfollow.video.inputs import get_input_class
+
+        assert get_input_class(source) is not None
+        row = self._video_row(monkeypatch, video_source_type=source, video_input_iface="eth1")
+        assert row["label"] == label
+        assert row["editable"] is False
+        assert row["key"] == ""
+        assert row["note"] == note
+        assert row["address"] == ""
+        # The saved pin is kept for when a network input is chosen again.
+        assert row["value"] == "eth1"
+
+    def test_an_unknown_video_input_is_read_only(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": "192.0.2.10"})
+        cfg = AppConfig()
+        cfg.video_source_type = "gone"
+        row = next(r for r in build_interface_assignment_rows(cfg) if r["label"].startswith("Video input"))
+        assert row["label"] == "Video input (gone)"
+        assert row["editable"] is False
+        assert row["note"] == "Not a network input"
+
+    def test_saving_the_panel_sets_the_video_input_pin(self, monkeypatch) -> None:
+        cfg = AppConfig(video_source_type="srt")
+        apply_section_data(cfg, "interface_assignment", {"video_input_iface": "  eth1  "})
+        assert cfg.video_input_iface == "eth1"
+        apply_section_data(cfg, "interface_assignment", {"video_input_iface": ""})
+        assert cfg.video_input_iface == ""
+
+    def test_every_editable_row_maps_to_a_known_target(self, monkeypatch) -> None:
+        """Guards the panel against growing a control the save path can't
+        write – the row list and the target map have to stay in step."""
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5"})
+        # A network video input, so the Video input row is a control too.
+        cfg = AppConfig(video_source_type="srt")
+        rows = build_interface_assignment_rows(cfg)
+        editable = {r["key"] for r in rows if r["editable"]}
+        destinations = {f"osc_destinations.{dest.id}.source_iface" for dest in cfg.osc_destinations.destinations}
+        assert editable == set(routes_module._INTERFACE_ASSIGNMENT_TARGETS) | destinations
+
+    @staticmethod
+    def _row(cfg: AppConfig, label: str) -> dict:
+        return next(r for r in build_interface_assignment_rows(cfg) if r["label"] == label)
+
+    def test_the_rttrpm_row_follows_the_station_and_its_own_pin(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5", "eth1": "10.0.0.9"})
+        cfg = AppConfig(psn_source_iface="eth0")
+        cfg.rttrpm_output.host = "198.51.100.20"
+        row = self._row(cfg, "RTTrPM output")
+        assert (row["key"], row["blank"], row["address"]) == ("rttrpm_output.source_iface", "station", "192.168.1.5")
+        # Hidden with its section while experimental features are.
+        assert row["experimental"] is True
+
+        cfg.rttrpm_output.source_iface = "eth1"
+        assert self._row(cfg, "RTTrPM output")["address"] == "10.0.0.9"
+        cfg.rttrpm_output.source_iface = "eth9"
+        assert self._row(cfg, "RTTrPM output")["address"] == "Not connected"
+
+    def test_a_sender_with_nothing_configured_shows_the_pis_pick(self, monkeypatch) -> None:
+        """No pin anywhere means the Pi routes each destination; the row shows
+        where it routes this one now, not an auto-detected address it is not bound to."""
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5", "eth1": "10.0.0.9"})
+        asked = TestInterfaceAssignmentRows._pick(monkeypatch, "10.0.0.9")
+        cfg = AppConfig()
+        cfg.rttrpm_output.host = "198.51.100.20"
+        cfg.osc_destinations.destinations[0].host = "198.51.100.21"
+        assert self._row(cfg, "RTTrPM output")["address"] == "eth1 – 10.0.0.9"
+        assert self._row(cfg, "OSC Destination Default")["address"] == "eth1 – 10.0.0.9"
+        assert "198.51.100.20" in asked and "198.51.100.21" in asked
+
+    def test_the_pis_pick_names_its_interface_by_label(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5", "eth1": "10.0.0.9"})
+        TestInterfaceAssignmentRows._pick(monkeypatch, "10.0.0.9")
+        cfg = AppConfig(interface_labels={"eth1": "Lighting"})
+        cfg.rttrpm_output.host = "198.51.100.20"
+        assert self._row(cfg, "RTTrPM output")["address"] == "Lighting (eth1) – 10.0.0.9"
+
+    def test_a_render_reads_which_interfaces_exist_once(self, monkeypatch) -> None:
+        """Both passes of a render share one read, however many rows are down."""
+        import openfollow.net_utils as net_utils_module
+
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5"})
+        reads: list[int] = []
+        real = net_utils_module.present_interfaces
+        monkeypatch.setattr(net_utils_module, "present_interfaces", lambda: reads.append(1) or real())
+        cfg = AppConfig(psn_source_iface="eth0")
+        cfg.otp_output.source_iface = "eth8"
+        cfg.osc.listen_iface = "eth9"
+        rows = {r["label"]: r for r in build_interface_assignment_rows(cfg)}
+        assert (rows["OTP output"]["address"], rows["OSC input"]["address"]) == ("Not connected", "Not connected")
+        assert reads == [1]
+
+    def test_a_loopback_destination_reads_loopback(self, monkeypatch) -> None:
+        self._ifaces(monkeypatch, {"eth0": "192.168.1.5"})
+        cfg = AppConfig(psn_source_iface="eth0")
+        assert cfg.rttrpm_output.host == "127.0.0.1"
+        assert self._row(cfg, "RTTrPM output")["address"] == "Loopback"
+        assert self._row(cfg, "OSC Destination Default")["address"] == "Loopback"
+
+    def test_each_osc_destination_gets_a_row(self, monkeypatch) -> None:
+        from openfollow.configuration import OscDestinationConfig, OscDestinationsConfig
+
+        self._ifaces(monkeypatch, {"eth1": "10.0.0.9"})
+        cfg = AppConfig()
+        cfg.osc_destinations = OscDestinationsConfig(
+            destinations=[
+                OscDestinationConfig(id="foh", name="FOH console", host="198.51.100.20", source_iface="eth1"),
+                OscDestinationConfig(id="media", name="", host="198.51.100.30", port=7000),
+            ]
+        )
+        rows = {r["key"]: r for r in build_interface_assignment_rows(cfg)}
+        foh = rows["osc_destinations.foh.source_iface"]
+        assert (foh["label"], foh["value"], foh["address"], foh["blank"]) == (
+            "OSC Destination FOH console",
+            "eth1",
+            "10.0.0.9",
+            "station",
+        )
+        assert rows["osc_destinations.media.source_iface"]["label"] == "OSC Destination 198.51.100.30:7000"
+
+
+class TestApplyInterfaceAssignment:
+    """The panel writes across several owning dataclasses in one save."""
+
+    def test_writes_top_level_and_sub_config_pins(self) -> None:
+        cfg = AppConfig()
+        apply_section_data(
+            cfg,
+            "interface_assignment",
+            {"psn_source_iface": "eth0", "otp_output.source_iface": "eth1"},
+        )
+        assert cfg.psn_source_iface == "eth0"
+        assert cfg.otp_output.source_iface == "eth1"
+
+    def test_strips_whitespace_like_post_init(self) -> None:
+        """A stray-space pin would compare unequal to the stored value on
+        every hot-reload pass and trigger a needless socket rebind."""
+        cfg = AppConfig()
+        apply_section_data(
+            cfg,
+            "interface_assignment",
+            {"psn_source_iface": "  eth0  ", "otp_output.source_iface": "\teth1 "},
+        )
+        assert cfg.psn_source_iface == "eth0"
+        assert cfg.otp_output.source_iface == "eth1"
+
+    def test_writes_the_osc_listener_pin(self) -> None:
+        """The panel is the only editing surface for this field, so a save that
+        skipped it would leave the row visibly set and the socket unmoved."""
+        cfg = AppConfig()
+        apply_section_data(cfg, "interface_assignment", {"osc.listen_iface": "  eth1 "})
+        assert cfg.osc.listen_iface == "eth1"
+
+    def test_absent_key_leaves_current_value(self) -> None:
+        cfg = AppConfig(psn_source_iface="eth0")
+        cfg.otp_output.source_iface = "eth1"
+        apply_section_data(cfg, "interface_assignment", {"psn_source_iface": "eth2"})
+        assert cfg.psn_source_iface == "eth2"
+        assert cfg.otp_output.source_iface == "eth1"
+
+    def test_blank_clears_a_pin(self) -> None:
+        """Selecting "follow station interface" has to be able to undo a pin."""
+        cfg = AppConfig()
+        cfg.otp_output.source_iface = "eth1"
+        apply_section_data(cfg, "interface_assignment", {"otp_output.source_iface": ""})
+        assert cfg.otp_output.source_iface == ""
+
+    def test_none_pin_preserves_current(self) -> None:
+        cfg = AppConfig(psn_source_iface="eth0")
+        apply_section_data(cfg, "interface_assignment", {"psn_source_iface": None})
+        assert cfg.psn_source_iface == "eth0"
+
+    @pytest.mark.parametrize("bad", [0, True, ["eth0"]])
+    def test_non_string_pin_still_stores_a_string(self, bad: object) -> None:
+        """A crafted POST must never leave a non-string in a field the runtime
+        hands to socket binding. Matching the existing ``psn`` / ``otp_output``
+        save paths, the value is stringified rather than rejected: the result
+        is a nonsense interface name that resolves to nothing and falls through
+        to the station pin, so output degrades rather than crashing."""
+        cfg = AppConfig(psn_source_iface="eth0")
+        apply_section_data(cfg, "interface_assignment", {"psn_source_iface": bad})
+        assert isinstance(cfg.psn_source_iface, str)
+
+    def test_post_init_reruns_on_touched_configs(self) -> None:
+        """The re-run is what stops a crafted POST bypassing validation a
+        hand-edited TOML would trip – prove it by smuggling an out-of-range
+        sibling field past the parser and watching it get clamped."""
+        cfg = AppConfig()
+        cfg.otp_output.port = 999999
+        apply_section_data(cfg, "interface_assignment", {"otp_output.source_iface": "eth1"})
+        assert cfg.otp_output.port == 65535
+
+    def test_untouched_config_is_not_renormalised(self) -> None:
+        """``__post_init__`` runs only on the dataclasses the save touched, so
+        a panel save can't silently rewrite an unrelated section."""
+        cfg = AppConfig()
+        cfg.otp_output.port = 999999
+        apply_section_data(cfg, "interface_assignment", {"psn_source_iface": "eth0"})
+        assert cfg.otp_output.port == 999999
+
+
+class TestWebBindNotice:
+    """The lockout warning for a pinned web UI. The pin is the one plane that
+    fails open, so what the notice promises has to match what the runtime will
+    actually bind - a warning about a lockout that cannot happen sends the
+    operator to undo a pin that is costing them nothing."""
+
+    @staticmethod
+    def _cfg(**kw):
+        from openfollow.configuration import AppConfig
+
+        cfg = AppConfig()
+        for key, value in kw.items():
+            setattr(cfg, key, value)
+        return cfg
+
+    def test_no_pin_says_nothing(self) -> None:
+        cfg = self._cfg(web_bind="", web_bind_iface="")
+        assert routes_module.build_web_bind_notice(cfg, ("0.0.0.0", "none"), 80) == ""
+
+    def test_an_explicit_address_outranks_the_pin_and_says_nothing(self) -> None:
+        cfg = self._cfg(web_bind="10.0.0.5", web_bind_iface="eth1")
+        assert routes_module.build_web_bind_notice(cfg, ("10.0.0.5", "iface"), 80) == ""
+
+    def test_a_resolved_pin_names_the_url_that_will_answer(self) -> None:
+        cfg = self._cfg(web_bind="", web_bind_iface="eth1")
+        notice = routes_module.build_web_bind_notice(cfg, ("10.0.0.9", "iface"), 80)
+        assert "answers only on http://10.0.0.9." in notice
+        assert "Network screen" in notice
+
+    def test_the_port_is_the_one_actually_bound(self) -> None:
+        """A station that could not take :80 is serving on the fallback, and a
+        URL naming the wrong port fails exactly like the wrong address."""
+        cfg = self._cfg(web_bind="", web_bind_iface="eth1")
+        assert "http://10.0.0.9:8080" in routes_module.build_web_bind_notice(cfg, ("10.0.0.9", "iface"), 8080)
+
+    def test_a_down_interface_promises_the_fallback_not_a_lockout(self) -> None:
+        """``resolve_web_bind`` returns the wildcard for a pin it cannot
+        honour, so the UI answers *everywhere* after a restart. Saying it
+        answers only on that interface is the opposite of what will happen."""
+        cfg = self._cfg(web_bind="", web_bind_iface="eth1")
+        notice = routes_module.build_web_bind_notice(cfg, ("0.0.0.0", "down"), 80)
+        assert "After a restart the web UI answers only on" not in notice
+        assert "eth1 has no address" in notice
+        assert "serves the web UI on every interface" in notice
+        # ... and says what would restore the pin, rather than how to undo it.
+        assert "once that interface has an address at startup" in notice
+
+    def test_a_down_interface_is_named_by_its_label(self) -> None:
+        cfg = self._cfg(web_bind="", web_bind_iface="eth1")
+        cfg.interface_labels = {"eth1": "Office"}
+        notice = routes_module.build_web_bind_notice(cfg, ("0.0.0.0", "down"), 80)
+        assert notice.startswith("Office (eth1) has no address")
+        assert "It answers only on Office (eth1) once" in notice
+        assert routes_module._web_bind_address(cfg, ("0.0.0.0", "down")) == "Office (eth1) is down - all interfaces"
+
+
+class TestRequestLocalAddr:
+    """``request_local_addr`` is the address half: the station address this
+    request was answered on. The Network card names it, because the interface
+    alone reads as a claim about topology the operator can contradict - Linux
+    answers for any of its addresses on whatever interface a request arrives
+    on, so this can be a VLAN's address reached over the untagged LAN."""
+
+    KEY = "SERVER_ADDR"
+
+    def test_returns_the_address_the_connection_was_answered_on(self) -> None:
+        assert routes_module.request_local_addr({self.KEY: "169.254.32.55"}) == "169.254.32.55"
+
+    def test_strips_surrounding_whitespace(self) -> None:
+        assert routes_module.request_local_addr({self.KEY: "  10.0.0.9  "}) == "10.0.0.9"
+
+    @pytest.mark.parametrize("addr", ["", "   ", None])
+    def test_blank_address_is_unknown(self, addr: object) -> None:
+        assert routes_module.request_local_addr({self.KEY: addr}) == ""
+
+    def test_missing_key_is_unknown(self) -> None:
+        assert routes_module.request_local_addr({}) == ""
+
+    def test_loopback_is_unknown(self) -> None:
+        """The on-screen embedded browser, which no interface change can
+        disconnect - naming 127.0.0.1 would invite a pointless warning."""
+        assert routes_module.request_local_addr({self.KEY: "127.0.0.1"}) == ""
+
+    def test_an_ipv6_address_is_returned_as_it_is(self) -> None:
+        """No interface will match it (the lookup is IPv4-only), so the marker
+        stays off - but the address itself is still what answered."""
+        assert routes_module.request_local_addr({self.KEY: "2001:db8::1"}) == "2001:db8::1"
+
+
+class TestRequestLocalIface:
+    """``request_local_iface`` answers "which adapter did this operator reach
+    us on", which guards them from editing that adapter and dropping their own
+    session. It reads the connection's local address, not the Host header:
+    with the default wildcard bind the operator usually arrives via
+    ``<slug>.local``, so the header holds a name."""
+
+    KEY = "SERVER_ADDR"
+
+    def test_resolves_a_local_address_to_its_interface(self, monkeypatch) -> None:
+        import socket
+        from types import SimpleNamespace
+
+        import openfollow.net_utils as net_utils_module
+
+        monkeypatch.setattr(
+            net_utils_module.psutil,
+            "net_if_addrs",
+            lambda: {
+                "eth0": [SimpleNamespace(family=socket.AF_INET, address="192.168.1.5")],
+                "eth1": [SimpleNamespace(family=socket.AF_INET, address="10.0.0.9")],
+            },
+        )
+        assert routes_module.request_local_iface({self.KEY: "10.0.0.9"}) == "eth1"
+
+    def test_missing_key_yields_no_marker(self) -> None:
+        """Any WSGI server that doesn't supply the address (a test harness, a
+        future front-end) must degrade to no marker, not raise."""
+        assert routes_module.request_local_iface({}) == ""
+
+    @pytest.mark.parametrize("addr", ["", "   ", None])
+    def test_blank_address_yields_no_marker(self, addr: object) -> None:
+        assert routes_module.request_local_iface({self.KEY: addr}) == ""
+
+    def test_loopback_yields_no_marker(self) -> None:
+        """A loopback connection is the on-screen embedded browser, which no
+        interface change can disconnect – marking one would be misleading."""
+        assert routes_module.request_local_iface({self.KEY: "127.0.0.1"}) == ""
+
+    def test_unknown_address_yields_no_marker(self, monkeypatch) -> None:
+        """Rather than guess when the address matches no local interface: a
+        missing marker is a missed warning, a wrong one points at the wrong
+        adapter."""
+        import openfollow.net_utils as net_utils_module
+
+        monkeypatch.setattr(net_utils_module.psutil, "net_if_addrs", dict)
+        assert routes_module.request_local_iface({self.KEY: "203.0.113.7"}) == ""
+
+
+class TestApplyInterfaceAssignmentSenders:
+    """The sender rows save onto RTTrPM and each OSC destination."""
+
+    @staticmethod
+    def _cfg() -> AppConfig:
+        from openfollow.configuration import OscDestinationConfig, OscDestinationsConfig
+
+        cfg = AppConfig()
+        cfg.osc_destinations = OscDestinationsConfig(
+            destinations=[
+                OscDestinationConfig(id="foh", host="198.51.100.20"),
+                OscDestinationConfig(id="media.v2", host="198.51.100.30", source_iface="eth2"),
+            ]
+        )
+        return cfg
+
+    def test_writes_rttrpm_and_destination_pins(self) -> None:
+        """A key for a destination deleted in another tab must not stop the rest saving."""
+        cfg = self._cfg()
+        apply_section_data(
+            cfg,
+            "interface_assignment",
+            {
+                "rttrpm_output.source_iface": " eth1 ",
+                "osc_destinations.gone.source_iface": "eth9",
+                "osc_destinations.foh.source_iface": " eth3 ",
+                "osc_destinations.media.v2.source_iface": "",
+            },
+        )
+        assert cfg.rttrpm_output.source_iface == "eth1"
+        assert [d.source_iface for d in cfg.osc_destinations.destinations] == ["eth3", ""]
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "osc_destinations.gone.source_iface",
+            "osc_destinations.foh.host",
+            "osc_destinations..source_iface",
+            "osc_destinations.source_iface",
+        ],
+        ids=["deleted-destination", "other-field", "empty-id", "no-id"],
+    )
+    def test_keys_that_name_no_destination_pin_change_nothing(self, key: str) -> None:
+        cfg = self._cfg()
+        apply_section_data(cfg, "interface_assignment", {key: "eth9"})
+        assert [(d.host, d.source_iface) for d in cfg.osc_destinations.destinations] == [
+            ("198.51.100.20", ""),
+            ("198.51.100.30", "eth2"),
+        ]
+
+    def test_a_non_string_value_keeps_the_pin(self) -> None:
+        cfg = self._cfg()
+        apply_section_data(cfg, "interface_assignment", {"osc_destinations.media.v2.source_iface": None})
+        assert cfg.osc_destinations.destinations[1].source_iface == "eth2"

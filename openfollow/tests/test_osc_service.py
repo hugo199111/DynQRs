@@ -1,0 +1,1882 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""Tests for the unified OSC service.
+
+Combines two test styles:
+
+- **Unit** (default ``pytestmark``): hermetic, monkeypatch
+  ``SimpleUDPClient``, exercise cache + error paths + listener
+  lifecycle without touching the network.
+- **Integration**: real UDP socket round-trips through ``OscService``
+  to prove the migrated send/receive paths still produce wire-identical
+  bytes to the legacy ``OscOutputClient`` / ``OscInputHandler``.
+
+The integration block catches any regression in OSC behaviour.
+"""
+
+from __future__ import annotations
+
+import logging
+import socket
+import threading
+import time
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+import openfollow.osc.service as service_module
+from openfollow.net_egress import Egress
+from openfollow.net_utils import InterfaceUnavailable
+from openfollow.osc.service import (
+    _PYTHONOSC_AVAILABLE,
+    ClientStats,
+    OscService,
+)
+from tests._ports import bind_free_udp_port
+
+pytestmark = pytest.mark.unit
+
+# ---------------------------------------------------------------------------
+# Fakes for hermetic unit coverage
+# ---------------------------------------------------------------------------
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.closed = False
+        self.close_exc: Exception | None = None
+        self.sockopts: list[tuple[int, int, int]] = []
+
+    def setsockopt(self, level: int, optname: int, value: int) -> None:
+        self.sockopts.append((level, optname, value))
+
+    def close(self) -> None:
+        if self.close_exc is not None:
+            raise self.close_exc
+        self.closed = True
+
+
+class _FakeClient:
+    """Stands in for ``pythonosc.udp_client.SimpleUDPClient``.
+
+    Records every send into a class-level list so tests can assert on
+    ``calls`` after the service routes through the cache. ``send_exc``
+    forces a failure path.
+    """
+
+    instances: list[_FakeClient] = []
+
+    def __init__(self, host: str, port: int, allow_broadcast: bool = False) -> None:
+        self.host = host
+        self.port = port
+        self.allow_broadcast = allow_broadcast
+        self.calls: list[tuple[str, list[Any]]] = []
+        self._sock = _FakeSocket()
+        self.send_exc: Exception | None = None
+        _FakeClient.instances.append(self)
+
+    def send_message(self, address: str, args: list[Any]) -> None:
+        if self.send_exc is not None:
+            raise self.send_exc
+        self.calls.append((address, args))
+
+
+class _ExplodingClient:
+    def __init__(self, host: str, port: int, allow_broadcast: bool = False) -> None:
+        raise OSError(f"DNS failure for {host}:{port}")
+
+
+@pytest.fixture(autouse=True)
+def _reset_fake_clients() -> None:
+    _FakeClient.instances.clear()
+
+
+@pytest.fixture
+def patched_service(monkeypatch: pytest.MonkeyPatch) -> OscService:
+    """OscService with ``SimpleUDPClient`` replaced by ``_FakeClient``.
+
+    ``_resolve_host`` is stubbed to identity so the fake hostnames the
+    tests use ("h", "h1", …) reach ``_FakeClient`` verbatim without a real
+    DNS lookup – keeps the unit suite hermetic.
+    """
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _FakeClient)
+    monkeypatch.setattr(service_module, "_resolve_host", lambda host: host)
+    return OscService()
+
+
+# ---------------------------------------------------------------------------
+# send() – happy path
+# ---------------------------------------------------------------------------
+
+
+def test_send_routes_to_fake_client(patched_service: OscService) -> None:
+    patched_service.send("/cue/1/go", host="127.0.0.1", port=53000)
+    assert len(_FakeClient.instances) == 1
+    assert _FakeClient.instances[0].calls == [("/cue/1/go", [])]
+
+
+def test_send_passes_args_through(patched_service: OscService) -> None:
+    patched_service.send(
+        "/marker/0",
+        [1.5, -2.0, 0.25],
+        host="10.0.0.5",
+        port=9000,
+    )
+    assert _FakeClient.instances[0].calls == [
+        ("/marker/0", [1.5, -2.0, 0.25]),
+    ]
+
+
+def test_send_caches_per_target(patched_service: OscService) -> None:
+    patched_service.send("/a", host="h1", port=1)
+    patched_service.send("/b", host="h1", port=1)
+    patched_service.send("/c", host="h2", port=1)
+    # Two cache entries – same host:port reuses, different host opens fresh.
+    assert len(_FakeClient.instances) == 2
+
+
+def test_send_updates_total_sent_counter(patched_service: OscService) -> None:
+    patched_service.send("/a", host="h", port=1)
+    patched_service.send("/b", host="h", port=1)
+    stats = patched_service.stats_for("h", 1)
+    assert stats.total_sent == 2
+    assert stats.total_errors == 0
+
+
+# ---------------------------------------------------------------------------
+# send() – guard rails
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("address", ["", None])
+def test_send_drops_empty_address(
+    patched_service: OscService,
+    address: Any,
+) -> None:
+    patched_service.send(address or "", host="h", port=1)
+    assert _FakeClient.instances == []
+
+
+@pytest.mark.parametrize(
+    "host,port",
+    [("", 53000), ("127.0.0.1", 0), ("127.0.0.1", -1)],
+)
+def test_send_drops_invalid_target(
+    patched_service: OscService,
+    host: str,
+    port: int,
+) -> None:
+    patched_service.send("/foo", host=host, port=port)
+    assert _FakeClient.instances == []
+
+
+def test_send_with_unknown_protocol_warns_and_drops(
+    patched_service: OscService,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``udp`` and ``tcp`` are the supported transports; anything else
+    (a hand-edited ``protocol = "raw"`` in TOML, say) is rejected at
+    send time with a warning and a drop. The ``OscTransmitterConfig``
+    save-time coercion already pins ``protocol`` to the allowed set,
+    so this is defence-in-depth for crafted configs."""
+    with caplog.at_level(logging.WARNING):
+        patched_service.send(
+            "/x",
+            host="h",
+            port=1,
+            protocol="raw",
+        )
+    assert _FakeClient.instances == []
+    assert any("unknown protocol" in rec.message for rec in caplog.records)
+
+
+def test_send_warns_once_when_pythonosc_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(service_module, "_PYTHONOSC_AVAILABLE", False)
+    svc = OscService()
+    with caplog.at_level(logging.WARNING):
+        svc.send("/a", host="h", port=1)
+        svc.send("/b", host="h", port=1)
+    warnings = [r for r in caplog.records if "python-osc not installed" in r.message]
+    assert len(warnings) == 1
+
+
+# ---------------------------------------------------------------------------
+# send() – error paths
+# ---------------------------------------------------------------------------
+
+
+def test_send_with_client_construction_error_returns_silently(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _ExplodingClient)
+    monkeypatch.setattr(service_module, "_resolve_host", lambda host: host)
+    svc = OscService()
+    with caplog.at_level(logging.ERROR):
+        svc.send("/a", host="bogus", port=1)
+    assert any("Failed to create OSC client" in r.message for r in caplog.records)
+    # No entry cached because client construction blew up.
+    assert svc.stats_for("bogus", 1) == ClientStats()
+
+
+def test_send_message_failure_increments_error_counter(
+    patched_service: OscService,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Prime the cache, then make subsequent sends raise.
+    patched_service.send("/ok", host="h", port=1)
+    _FakeClient.instances[0].send_exc = OSError("net unreachable")
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            patched_service.send("/x", host="h", port=1)
+    stats = patched_service.stats_for("h", 1)
+    assert stats.total_errors == 3
+    assert "net unreachable" in stats.last_error
+    # First few errors logged at WARNING.
+    warnings = [r for r in caplog.records if "OSC send" in r.message]
+    assert len(warnings) >= 1
+
+
+def test_send_error_throttle_quiet_after_burst(
+    patched_service: OscService,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    patched_service.send("/ok", host="h", port=1)
+    _FakeClient.instances[0].send_exc = ValueError("bad address")
+    # 30 failures should produce ≤ 5 + 0 (no multiple-of-100 hit) log entries.
+    with caplog.at_level(logging.WARNING):
+        for _ in range(30):
+            patched_service.send("/x", host="h", port=1)
+    warnings = [r for r in caplog.records if "OSC send" in r.message]
+    assert len(warnings) <= 5
+
+
+# ---------------------------------------------------------------------------
+# evict() / shutdown_clients()
+# ---------------------------------------------------------------------------
+
+
+def test_evict_closes_socket_and_drops_entry(
+    patched_service: OscService,
+) -> None:
+    patched_service.send("/a", host="h", port=1)
+    fake = _FakeClient.instances[0]
+    patched_service.evict("h", 1)
+    assert fake._sock.closed is True
+    # Subsequent send creates a fresh client.
+    patched_service.send("/b", host="h", port=1)
+    assert len(_FakeClient.instances) == 2
+
+
+def test_evict_missing_key_is_noop(patched_service: OscService) -> None:
+    patched_service.evict("never-cached", 1)
+
+
+def test_evict_tolerates_socket_close_error(
+    patched_service: OscService,
+) -> None:
+    patched_service.send("/a", host="h", port=1)
+    _FakeClient.instances[0]._sock.close_exc = OSError("already closed")
+    patched_service.evict("h", 1)
+    # No crash – and the entry is still dropped.
+    assert patched_service.stats_for("h", 1).total_sent == 0
+
+
+def test_evict_skips_close_when_client_has_no_sock_attribute(
+    patched_service: OscService,
+) -> None:
+    patched_service.send("/a", host="h", port=1)
+    _FakeClient.instances[0]._sock = None  # type: ignore[assignment]
+    patched_service.evict("h", 1)
+
+
+def test_shutdown_clients_skips_close_when_sock_attribute_missing(
+    patched_service: OscService,
+) -> None:
+    patched_service.send("/a", host="h", port=1)
+    _FakeClient.instances[0]._sock = None  # type: ignore[assignment]
+    patched_service.shutdown_clients()
+
+
+@pytest.mark.parametrize(
+    "loser_sock_state",
+    [
+        "with_sock",  # close path
+        "no_sock",  # skip close (line 275 False arm)
+        "close_raises",  # close raises OSError (line 278-279)
+    ],
+)
+def test_get_or_create_client_loses_construction_race(
+    monkeypatch: pytest.MonkeyPatch,
+    loser_sock_state: str,
+) -> None:
+    """Cover the race-resolution arm of ``_get_or_create_client``: when
+    a concurrent caller seats a cache entry while we were still
+    constructing ours, our newly-built client is discarded and the
+    existing entry is returned. Three sub-cases for the loser's socket:
+    normal close, no ``_sock`` attribute, and close raising OSError."""
+    svc = OscService()
+    winner_holder: dict[str, _FakeClient] = {}
+
+    class _RaceClient(_FakeClient):
+        def __init__(self, host: str, port: int, allow_broadcast: bool = False) -> None:
+            super().__init__(host, port, allow_broadcast)
+            # Configure this loser's socket per parametrised state.
+            if loser_sock_state == "no_sock":
+                self._sock = None  # type: ignore[assignment]
+            elif loser_sock_state == "close_raises":
+                self._sock.close_exc = OSError("loser close failed")
+            # Seed the cache with a winner under the same key –
+            # simulates 'another thread won the race'.
+            if "winner" not in winner_holder:
+                winner = _FakeClient("seeded", 0)
+                winner_holder["winner"] = winner
+                from openfollow.osc.service import _ClientEntry
+
+                # Cache key is ``(host, port, protocol, framing, egress)``;
+                # UDP entries pin to ``"length_prefix"``.
+                svc._cache[(host, port, "udp", "length_prefix", None)] = _ClientEntry(client=winner)
+
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _RaceClient)
+    monkeypatch.setattr(service_module, "_resolve_host", lambda host: host)
+    svc.send("/x", host="race-host", port=1)
+    # The seeded 'winner' handled the send regardless of the loser's
+    # socket state.
+    assert winner_holder["winner"].calls == [("/x", [])]
+
+
+def test_shutdown_clients_drains_cache(patched_service: OscService) -> None:
+    patched_service.send("/a", host="h1", port=1)
+    patched_service.send("/b", host="h2", port=2)
+    patched_service.shutdown_clients()
+    for fake in _FakeClient.instances:
+        assert fake._sock.closed is True
+
+
+def test_shutdown_clients_tolerates_close_errors(
+    patched_service: OscService,
+) -> None:
+    patched_service.send("/a", host="h", port=1)
+    _FakeClient.instances[0]._sock.close_exc = OSError("boom")
+    patched_service.shutdown_clients()
+
+
+def test_stats_for_unknown_target_returns_empty(
+    patched_service: OscService,
+) -> None:
+    assert patched_service.stats_for("never", 0) == ClientStats()
+
+
+# ---------------------------------------------------------------------------
+# Framing in the cache key
+# ---------------------------------------------------------------------------
+
+
+class _FakeTcpSender:
+    """Stands in for ``TcpOscSender`` so the framing-cache tests stay
+    hermetic – no listener required, just a record of what framing each
+    cached client was constructed with."""
+
+    instances: list[_FakeTcpSender] = []
+
+    def __init__(self, host: str, port: int, framing: str, *, egress: object = None) -> None:
+        self.egress = egress
+        self.host = host
+        self.port = port
+        self.framing = framing
+        self.calls: list[tuple[str, list[Any]]] = []
+        self.closed = False
+        _FakeTcpSender.instances.append(self)
+
+    def send_message(self, address: str, args: list[Any]) -> None:
+        self.calls.append((address, args))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def patched_tcp_service(monkeypatch: pytest.MonkeyPatch) -> OscService:
+    """OscService whose TCP construction is redirected to ``_FakeTcpSender``
+    so framing-dispatch can be asserted without opening sockets."""
+    _FakeTcpSender.instances.clear()
+    monkeypatch.setattr(service_module, "TcpOscSender", _FakeTcpSender)
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _FakeClient)
+    monkeypatch.setattr(service_module, "_resolve_host", lambda host: host)
+    return OscService()
+
+
+def test_tcp_send_constructs_sender_with_chosen_framing(
+    patched_tcp_service: OscService,
+) -> None:
+    patched_tcp_service.send(
+        "/x",
+        host="h",
+        port=1,
+        protocol="tcp",
+        framing="slip",
+    )
+    patched_tcp_service.send(
+        "/y",
+        host="h",
+        port=1,
+        protocol="tcp",
+        framing="length_prefix",
+    )
+    framings = [s.framing for s in _FakeTcpSender.instances]
+    assert framings == ["slip", "length_prefix"]
+
+
+def test_tcp_cache_separates_entries_by_framing(
+    patched_tcp_service: OscService,
+) -> None:
+    patched_tcp_service.send(
+        "/a",
+        host="h",
+        port=1,
+        protocol="tcp",
+        framing="slip",
+    )
+    patched_tcp_service.send(
+        "/b",
+        host="h",
+        port=1,
+        protocol="tcp",
+        framing="length_prefix",
+    )
+    assert len(_FakeTcpSender.instances) == 2
+
+
+def test_tcp_cache_reuses_entry_for_same_framing(
+    patched_tcp_service: OscService,
+) -> None:
+    """Same host/port/protocol/framing → one cached sender across
+    multiple sends."""
+    for _ in range(3):
+        patched_tcp_service.send(
+            "/x",
+            host="h",
+            port=1,
+            protocol="tcp",
+            framing="slip",
+        )
+    assert len(_FakeTcpSender.instances) == 1
+    assert len(_FakeTcpSender.instances[0].calls) == 3
+
+
+def test_udp_framing_is_pinned_in_cache_key(
+    patched_service: OscService,
+) -> None:
+    """UDP rows ignore framing in the cache key – two sends that differ
+    only in their (meaningless-for-UDP) framing share one cached client.
+    Otherwise every UDP row would double-cache by accident when the
+    framing field round-trips through TOML."""
+    patched_service.send(
+        "/a",
+        host="h",
+        port=1,
+        protocol="udp",
+        framing="slip",
+    )
+    patched_service.send(
+        "/b",
+        host="h",
+        port=1,
+        protocol="udp",
+        framing="length_prefix",
+    )
+    assert len(_FakeClient.instances) == 1
+
+
+def test_stats_for_with_tcp_framing_is_isolated(
+    patched_tcp_service: OscService,
+) -> None:
+    """Per-framing stats follow the cache-key separation."""
+    patched_tcp_service.send(
+        "/a",
+        host="h",
+        port=1,
+        protocol="tcp",
+        framing="slip",
+    )
+    slip_stats = patched_tcp_service.stats_for(
+        "h",
+        1,
+        protocol="tcp",
+        framing="slip",
+    )
+    other_stats = patched_tcp_service.stats_for(
+        "h",
+        1,
+        protocol="tcp",
+        framing="length_prefix",
+    )
+    assert slip_stats.total_sent == 1
+    assert other_stats == ClientStats()
+
+
+def test_evict_with_tcp_framing_only_drops_matching_entry(
+    patched_tcp_service: OscService,
+) -> None:
+    patched_tcp_service.send(
+        "/a",
+        host="h",
+        port=1,
+        protocol="tcp",
+        framing="slip",
+    )
+    patched_tcp_service.send(
+        "/b",
+        host="h",
+        port=1,
+        protocol="tcp",
+        framing="length_prefix",
+    )
+    patched_tcp_service.evict("h", 1, protocol="tcp", framing="slip")
+    # Only the SLIP sender was closed.
+    closed = [s for s in _FakeTcpSender.instances if s.closed]
+    assert len(closed) == 1
+    assert closed[0].framing == "slip"
+
+
+def test_send_with_unknown_framing_falls_back_to_slip(
+    patched_tcp_service: OscService,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Bogus framing value (programmatic caller bypassing config-layer
+    coercion) doesn't break send – it warns and uses the default."""
+    with caplog.at_level(logging.WARNING):
+        patched_tcp_service.send(
+            "/x",
+            host="h",
+            port=1,
+            protocol="tcp",
+            framing="bogus",
+        )
+    assert _FakeTcpSender.instances[0].framing == "slip"
+    assert any("unknown TCP framing" in rec.message for rec in caplog.records)
+
+
+def test_send_udp_with_bogus_framing_does_not_warn(
+    patched_tcp_service: OscService,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Framing is TCP-only. UDP bogus framing now stays silent since
+    framing is always length_prefix for UDP anyway."""
+    with caplog.at_level(logging.WARNING):
+        patched_tcp_service.send(
+            "/x",
+            host="h",
+            port=1,
+            protocol="udp",
+            framing="bogus",
+        )
+    assert not any("framing" in rec.message for rec in caplog.records)
+
+
+def test_cache_framing_unknown_tcp_value_normalises_to_slip(
+    patched_tcp_service: OscService,
+) -> None:
+    """``evict`` / ``stats_for`` accept a framing arg without re-running
+    the validation that ``send`` does. ``_cache_framing`` is the
+    defensive normaliser that prevents a stray TCP framing value from
+    fragmenting the cache lookup. Send with ``"slip"`` so the entry
+    seats under the canonical key, then look it up via
+    ``stats_for(framing="bogus")`` – the normaliser maps it back to
+    ``"slip"`` and the existing entry is found."""
+    patched_tcp_service.send(
+        "/x",
+        host="h",
+        port=1,
+        protocol="tcp",
+        framing="slip",
+    )
+    stats = patched_tcp_service.stats_for(
+        "h",
+        1,
+        protocol="tcp",
+        framing="bogus",
+    )
+    assert stats.total_sent == 1
+
+
+# ---------------------------------------------------------------------------
+# Subscribe / unsubscribe
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_subscribe_replaces_prior_handler() -> None:
+    svc = OscService()
+    seen: list[str] = []
+    svc.subscribe("/foo", lambda *_: seen.append("first"))
+    svc.subscribe("/foo", lambda *_: seen.append("second"))
+    # Only the second handler should fire.
+    handlers = svc._dispatcher.handlers_for_address("/foo")
+    # pythonosc returns a list of Handler tuples (callable, args, ...);
+    # asserting exactly one mapping is the contract here.
+    assert len(list(handlers)) == 1
+
+
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_unsubscribe_missing_pattern_is_noop() -> None:
+    svc = OscService()
+    svc.unsubscribe("/never-mapped")
+
+
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_unsubscribe_present_pattern_drops_handler() -> None:
+    svc = OscService()
+    svc.subscribe("/foo", lambda *_: None)
+    svc.unsubscribe("/foo")
+    # Pattern is gone – a re-subscribe replaces a fresh handler, not
+    # a stale one.
+    assert "/foo" not in svc._subscriptions
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher map-mutation vs dispatch iteration race
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_subscribe_during_dispatch_does_not_break_iteration() -> None:
+    """A ``subscribe`` that adds a new pattern while the listener thread is
+    mid-dispatch must not raise ``RuntimeError: dictionary changed size
+    during iteration``.
+
+    Reproduces the steady-state race: an inbound packet is being dispatched
+    (``call_handlers_for_packet`` iterates the dispatcher map) at the exact
+    instant a config toggle calls ``subscribe`` and seats a new map key. On a
+    bare ``pythonosc.Dispatcher`` the live generator trips over the resized
+    dict; the guarded dispatcher snapshots its match set first."""
+    from pythonosc.osc_message_builder import OscMessageBuilder
+
+    svc = OscService()
+    fired: list[str] = []
+
+    def _mutating_handler(address: str, *_args: Any) -> None:
+        # Mid-dispatch subscribe → adds a new dict key in the dispatcher map.
+        svc.subscribe("/late/pattern", lambda *_: None)
+        fired.append(address)
+
+    # Two matching patterns so the dispatch loop iterates the map more than
+    # once after the mutation lands.
+    svc.subscribe("/marker/0", _mutating_handler)
+    svc.subscribe("/marker/1", lambda *_: None)
+
+    datagram = OscMessageBuilder(address="/marker/0").build().dgram
+    # Must complete without RuntimeError, and the handler must have run.
+    svc._dispatcher.call_handlers_for_packet(datagram, ("127.0.0.1", 1))
+    assert fired == ["/marker/0"]
+
+
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_guarded_dispatcher_still_matches_patterns() -> None:
+    """The lock guard must not change dispatch semantics: a subscribed
+    glob pattern still routes a matching address to its handler."""
+    from pythonosc.osc_message_builder import OscMessageBuilder
+
+    svc = OscService()
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    svc.subscribe("/marker/*", lambda addr, *args: seen.append((addr, args)))
+    datagram = OscMessageBuilder(address="/marker/2").build().dgram
+    svc._dispatcher.call_handlers_for_packet(datagram, ("127.0.0.1", 1))
+    assert seen == [("/marker/2", ())]
+
+
+# ---------------------------------------------------------------------------
+# TCP transport wiring (service-level)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_send_with_tcp_protocol_uses_tcp_sender() -> None:
+    from openfollow.osc.transport import TcpOscSender
+
+    svc = OscService()
+    # Send to port 1 (refused). The send raises OSError internally,
+    # which the service catches and counts as a stat error. The cache
+    # should hold the TcpOscSender.
+    svc.send("/x", host="127.0.0.1", port=1, protocol="tcp")
+    cached = list(svc._cache.values())
+    assert len(cached) == 1
+    assert isinstance(cached[0].client, TcpOscSender)
+    # ``shutdown_clients`` must dispatch to ``TcpOscSender.close()`` –
+    # if it tried to close a ``_sock`` attribute the call would silently
+    # leak the reader thread (there isn't one yet) and the test would
+    # still pass; but the type-aware close path was the whole point.
+    svc.shutdown_clients()
+    assert svc._cache == {}
+
+
+# ---------------------------------------------------------------------------
+# Listener lifecycle (real UDP – fast, but counts as integration)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_listener_starts_and_subscribers_receive() -> None:
+    """End-to-end: send via OscService.send → receive via subscribe.
+
+    Proves the unified service preserves both sides of the existing OSC
+    behaviour without a regression."""
+    svc = OscService()
+    received: list[tuple[str, tuple[Any, ...]]] = []
+
+    def _handler(address: str, *args: Any) -> None:
+        received.append((address, args))
+
+    svc.subscribe("/marker/*", _handler)
+    port = bind_free_udp_port(lambda p: svc.start_listener(p, allowed_ips=()))
+
+    try:
+        svc.send("/marker/0", [1.0, 2.0, 3.0], host="127.0.0.1", port=port)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not received:
+            time.sleep(0.01)
+        assert received, "subscriber did not receive packet"
+        addr, args = received[0]
+        assert addr == "/marker/0"
+        assert list(args) == [1.0, 2.0, 3.0]
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_listener_idempotent_on_same_params() -> None:
+    svc = OscService()
+    port = bind_free_udp_port(lambda p: svc.start_listener(p, allowed_ips=()))
+    listener = svc._listener
+    svc.start_listener(port, allowed_ips=())
+    # Same listener instance – the second call short-circuited.
+    assert svc._listener is listener
+    svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_listener_restart_on_changed_params() -> None:
+    svc = OscService()
+    bind_free_udp_port(lambda p: svc.start_listener(p, allowed_ips=()))
+    first = svc._listener
+    port_b = bind_free_udp_port(lambda p: svc.start_listener(p, allowed_ips=()))
+    assert svc._listener is not first
+    assert svc.listener_port == port_b
+    svc.shutdown()
+
+
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_restart_listener_on_bind_failure_raises() -> None:
+    """Hard-signal contract: bind failure raises OSError so the
+    hot-reload dispatcher can revert the config."""
+    svc = OscService()
+    # Bind a foreign socket on a port, then ask the service to bind it too.
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    blocker.bind(("127.0.0.1", 0))
+    port = blocker.getsockname()[1]
+    try:
+        with pytest.raises(OSError):
+            svc.restart_listener(port=port, allowed_ips=())
+    finally:
+        blocker.close()
+
+
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_stop_listener_idempotent_when_not_running() -> None:
+    svc = OscService()
+    svc.stop_listener()  # no-op
+    svc.stop_listener()  # still no-op
+
+
+def test_listener_status_defaults_when_stopped() -> None:
+    """Diagnostics accessor reports the idle state without a running listener."""
+    svc = OscService()
+    assert svc.listener_status() == {
+        "port": None,
+        "multicast_group": "",
+        "multicast_iface": "",
+        "multicast_joined": False,
+        "allowed_sender_ips": [],
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_listener_with_allowlist_logs_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    svc = OscService()
+    with caplog.at_level(logging.INFO):
+        bind_free_udp_port(lambda p: svc.start_listener(p, allowed_ips=["127.0.0.1"]))
+    info_records = [r for r in caplog.records if "accepting packets only" in r.message]
+    assert len(info_records) == 1
+    svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_listener_without_allowlist_warns_about_exposure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    svc = OscService()
+    with caplog.at_level(logging.WARNING):
+        bind_free_udp_port(lambda p: svc.start_listener(p, allowed_ips=()))
+    warnings = [r for r in caplog.records if "no sender allowlist" in r.message]
+    assert len(warnings) == 1
+    svc.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Allowlist – _FilteredOSCUDPServer.verify_request
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+class TestFilteredOSCUDPServerVerifyRequest:
+    """Direct hermetic checks for the allowlist filter – start_listener
+    integration above proves the wiring; these prove the matrix."""
+
+    def _server(self, allowed: frozenset[str]) -> Any:
+        svc = OscService()
+        bind_free_udp_port(lambda p: svc.start_listener(p, allowed_ips=allowed))
+        srv = svc._listener
+        try:
+            yield srv
+        finally:
+            svc.shutdown()
+
+    def test_empty_allowlist_accepts_all(self) -> None:
+        gen = self._server(frozenset())
+        srv = next(gen)
+        assert srv.verify_request(object(), ("10.0.0.1", 1234)) is True
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+    def test_populated_allowlist_blocks_others(self) -> None:
+        gen = self._server(frozenset({"127.0.0.1"}))
+        srv = next(gen)
+        assert srv.verify_request(object(), ("10.0.0.1", 1)) is False
+        assert srv.verify_request(object(), ("127.0.0.1", 1)) is True
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+    def test_str_address_fails_closed(self) -> None:
+        """LSP-widening from socketserver's ``str | tuple`` address type
+        forces us to handle the str case; we treat it as 'not in
+        allowlist' so verification fails closed."""
+        gen = self._server(frozenset({"127.0.0.1"}))
+        srv = next(gen)
+        assert srv.verify_request(object(), "/some/unix/socket") is False
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Context-manager + shutdown
+# ---------------------------------------------------------------------------
+
+
+def test_context_manager_calls_shutdown(
+    patched_service: OscService,
+) -> None:
+    with patched_service as svc:
+        svc.send("/x", host="h", port=1)
+    # Cache drained at __exit__.
+    fake = _FakeClient.instances[0]
+    assert fake._sock.closed is True
+
+
+# ---------------------------------------------------------------------------
+# Integration: wire-format parity with legacy OscOutputClient
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_send_produces_real_udp_datagram_at_expected_address() -> None:
+    """The unified service emits the same UDP datagram bytes the legacy
+    ``OscOutputClient`` would. Bind a raw UDP socket as the receiver,
+    send via ``OscService``, assert the datagram arrives addressed to
+    the right OSC method."""
+    received: list[bytes] = []
+    stop = threading.Event()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.settimeout(0.1)
+
+    def _serve() -> None:
+        while not stop.is_set():
+            try:
+                data, _ = sock.recvfrom(4096)
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            received.append(data)
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    svc = OscService()
+    try:
+        svc.send("/cue/1/go", host="127.0.0.1", port=port)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not received:
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        svc.shutdown()
+        thread.join(timeout=1.0)
+        sock.close()
+    assert received, "no datagram received"
+    # OSC encodes the address as a 4-byte-aligned NUL-padded string at
+    # the start of the message – the path appears verbatim.
+    assert received[0].startswith(b"/cue/1/go")
+
+
+# ---------------------------------------------------------------------------
+# Multicast group join
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSocket:
+    """Minimal socket stand-in capturing ``setsockopt`` for the multicast
+    join helper unit tests; ``raise_oserror`` forces the failure path."""
+
+    def __init__(self, *, raise_oserror: bool = False) -> None:
+        self.opts: list[tuple[int, int, bytes]] = []
+        self._raise = raise_oserror
+
+    def setsockopt(self, level: int, optname: int, value: bytes) -> None:
+        if self._raise:
+            raise OSError("join failed")
+        self.opts.append((level, optname, value))
+
+
+def test_join_multicast_group_success() -> None:
+    sock = _RecordingSocket()
+    assert service_module._join_multicast_group(sock, "239.1.2.3", 9000) is True
+    assert len(sock.opts) == 1
+    level, optname, value = sock.opts[0]
+    assert level == socket.IPPROTO_IP
+    assert optname == socket.IP_ADD_MEMBERSHIP
+    assert value == socket.inet_aton("239.1.2.3") + socket.inet_aton("0.0.0.0")
+
+
+def test_join_multicast_group_swallows_oserror(caplog: pytest.LogCaptureFixture) -> None:
+    sock = _RecordingSocket(raise_oserror=True)
+    with caplog.at_level(logging.WARNING):
+        result = service_module._join_multicast_group(sock, "239.1.2.3", 9000)  # must not raise
+    assert result is False
+    assert any("could not join multicast group" in r.message for r in caplog.records)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_restart_listener_joins_multicast_group(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``restart_listener`` joins the group on the bound socket and records
+    it as listener state; ``stop_listener`` clears it. The join is stubbed."""
+    svc = OscService()
+    calls: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        service_module,
+        "_join_multicast_group",
+        lambda sock, group, port, *, iface_ip="", iface="": calls.append((group, port, iface_ip)) or True,
+    )
+    with caplog.at_level(logging.WARNING):
+        port = bind_free_udp_port(lambda p: svc.restart_listener(port=p, allowed_ips=(), multicast_group="239.1.2.3"))
+    try:
+        assert calls == [("239.1.2.3", port, "")]
+        assert svc._listener_multicast_group == "239.1.2.3"
+        assert svc.listener_port == port
+        assert any("joined multicast group 239.1.2.3" in r.message for r in caplog.records)
+        # Diagnostics accessor reflects the live join.
+        status = svc.listener_status()
+        assert status["multicast_group"] == "239.1.2.3"
+        assert status["multicast_joined"] is True
+        assert status["port"] == port
+    finally:
+        svc.shutdown()
+    # stop_listener (via shutdown) resets the recorded group + join flag.
+    assert svc._listener_multicast_group == ""
+    assert svc.listener_status()["multicast_joined"] is False
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_restart_listener_failed_join_omits_joined_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed multicast join must not produce a misleading 'joined' log."""
+    svc = OscService()
+    monkeypatch.setattr(service_module, "_join_multicast_group", lambda *a, **kw: False)
+    with caplog.at_level(logging.WARNING):
+        bind_free_udp_port(lambda p: svc.restart_listener(port=p, allowed_ips=(), multicast_group="239.1.2.3"))
+    try:
+        assert not any("joined multicast group" in r.message for r in caplog.records)
+        # Group requested but join failed → status distinguishes the two.
+        status = svc.listener_status()
+        assert status["multicast_group"] == "239.1.2.3"
+        assert status["multicast_joined"] is False
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_listener_with_allowlist_and_group_logs_info(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    svc = OscService()
+    monkeypatch.setattr(service_module, "_join_multicast_group", lambda *a, **kw: True)
+    with caplog.at_level(logging.INFO):
+        bind_free_udp_port(lambda p: svc.start_listener(p, allowed_ips=["127.0.0.1"], multicast_group="239.4.5.6"))
+    try:
+        assert any("joined multicast group 239.4.5.6" in r.message for r in caplog.records)
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_start_listener_idempotent_with_same_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = OscService()
+    monkeypatch.setattr(service_module, "_join_multicast_group", lambda *a, **kw: None)
+    port = bind_free_udp_port(lambda p: svc.start_listener(p, allowed_ips=(), multicast_group="239.1.2.3"))
+    first = svc._listener
+    svc.start_listener(port, allowed_ips=(), multicast_group="239.1.2.3")
+    assert svc._listener is first  # same params → no rebind
+    svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_start_listener_rebinds_on_group_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = OscService()
+    monkeypatch.setattr(service_module, "_join_multicast_group", lambda *a, **kw: None)
+    port = bind_free_udp_port(lambda p: svc.start_listener(p, allowed_ips=(), multicast_group="239.1.2.3"))
+    first = svc._listener
+    svc.start_listener(port, allowed_ips=(), multicast_group="239.9.9.9")
+    assert svc._listener is not first  # group change → rebind
+    assert svc._listener_multicast_group == "239.9.9.9"
+    svc.shutdown()
+
+
+def test_join_multicast_group_pins_the_membership_to_an_interface() -> None:
+    """The defect this exists to close. ``INADDR_ANY`` does not subscribe
+    everywhere - the kernel picks one interface by routing table, which is why
+    an unpinned listener took the group on a different adapter from one restart
+    to the next. A resolved address must reach the mreq verbatim."""
+    sock = _RecordingSocket()
+    assert service_module._join_multicast_group(sock, "239.1.2.3", 9000, iface_ip="10.0.0.9") is True
+    _level, _optname, value = sock.opts[0]
+    assert value == socket.inet_aton("239.1.2.3") + socket.inet_aton("10.0.0.9")
+
+
+def test_join_multicast_group_declines_a_down_pin(caplog: pytest.LogCaptureFixture) -> None:
+    """``None`` is "an interface is pinned and has no address". Falling through
+    to INADDR_ANY there would subscribe on a network the operator excluded,
+    which is the whole thing the pin prevents."""
+    sock = _RecordingSocket()
+    with caplog.at_level(logging.ERROR):
+        assert service_module._join_multicast_group(sock, "239.1.2.3", 9000, iface_ip=None) is False
+    assert sock.opts == []
+    assert any("will not take the group on another one" in r.getMessage() for r in caplog.records)
+
+
+def test_join_multicast_group_failure_names_the_interface(caplog: pytest.LogCaptureFixture) -> None:
+    """An operator reading the journal has to know which interface refused the
+    join; without the address the line is the same on every adapter."""
+    sock = _RecordingSocket(raise_oserror=True)
+    with caplog.at_level(logging.WARNING):
+        assert service_module._join_multicast_group(sock, "239.1.2.3", 9000, iface_ip="10.0.0.9") is False
+    assert any("10.0.0.9" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_listener_always_binds_every_interface(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The load-bearing rule. A socket bound to one unicast address receives no
+    multicast and no broadcast at all - the kernel matches a datagram's
+    destination against the bound address, and a group address is neither -
+    while ``IP_ADD_MEMBERSHIP`` still reports success, so the failure is
+    silent. The pin must never reach the bind."""
+    svc = OscService()
+    monkeypatch.setattr(service_module, "_join_multicast_group", lambda *a, **kw: True)
+    bind_free_udp_port(
+        lambda p: svc.restart_listener(
+            port=p,
+            allowed_ips=(),
+            multicast_group="239.1.2.3",
+            multicast_iface="127.0.0.1",
+        )
+    )
+    try:
+        assert svc._listener.socket.getsockname()[0] in ("0.0.0.0", "::")
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_restart_listener_joins_the_group_on_the_pinned_interface(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = OscService()
+    joins: list[tuple[str | None, str]] = []
+    monkeypatch.setattr(
+        service_module,
+        "_join_multicast_group",
+        lambda sock, group, port, *, iface_ip="", iface="": joins.append((iface_ip, iface)) or True,
+    )
+    bind_free_udp_port(
+        lambda p: svc.restart_listener(
+            port=p,
+            allowed_ips=(),
+            multicast_group="239.1.2.3",
+            multicast_iface="10.0.0.9",
+            multicast_iface_name="eth1",
+        )
+    )
+    try:
+        assert joins == [("10.0.0.9", "eth1")]
+        status = svc.listener_status()
+        assert status["multicast_iface"] == "10.0.0.9"
+        assert status["multicast_joined"] is True
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_moving_the_membership_rebuilds_the_socket_that_held_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A membership is released by closing the socket, never by dropping it.
+
+    ``IP_DROP_MEMBERSHIP`` is keyed by interface address, so the case that
+    matters most - a pinned interface that lost its address - is exactly the
+    one where that address no longer resolves. The kernel reports the drop as
+    successful and releases nothing, so the group stays subscribed on an
+    interface the operator has moved off, and the stranded membership outlives
+    the socket, the process, and a link bounce. Closing the socket releases
+    every membership it holds unconditionally.
+    """
+    svc = OscService()
+    monkeypatch.setattr(
+        service_module,
+        "_join_multicast_group",
+        lambda sock, group, port, *, iface_ip="", iface="": iface_ip is not None,
+    )
+    bind_free_udp_port(
+        lambda p: svc.restart_listener(
+            port=p,
+            allowed_ips=(),
+            multicast_group="239.1.2.3",
+            multicast_iface="10.0.0.9",
+        )
+    )
+    held_it = svc._listener
+    try:
+        svc.set_multicast_iface(None)
+        assert svc._listener is not held_it
+        assert held_it.socket.fileno() == -1
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_moving_the_membership_keeps_the_subscriptions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What makes rebuilding the socket affordable: handlers are registered on
+    the service's dispatcher, which every listener generation is handed, so
+    they outlive the socket that was serving them."""
+    svc = OscService()
+    monkeypatch.setattr(
+        service_module,
+        "_join_multicast_group",
+        lambda sock, group, port, *, iface_ip="", iface="": iface_ip is not None,
+    )
+    svc.subscribe("/marker/*", lambda *a: None)
+    bind_free_udp_port(
+        lambda p: svc.restart_listener(
+            port=p,
+            allowed_ips=(),
+            multicast_group="239.1.2.3",
+            multicast_iface="10.0.0.9",
+        )
+    )
+    try:
+        svc.set_multicast_iface("10.0.0.20")
+        assert "/marker/*" in svc._subscriptions
+        assert svc._listener.dispatcher is svc._dispatcher
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_set_multicast_iface_moves_the_membership(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The observer's repoint: the group follows the interface it is pinned
+    to, and the listener goes on serving the same port."""
+    svc = OscService()
+    joins: list[str | None] = []
+    monkeypatch.setattr(
+        service_module,
+        "_join_multicast_group",
+        lambda sock, group, port, *, iface_ip="", iface="": joins.append(iface_ip) or (iface_ip is not None),
+    )
+    port = bind_free_udp_port(
+        lambda p: svc.restart_listener(
+            port=p,
+            allowed_ips=(),
+            multicast_group="239.1.2.3",
+            multicast_iface="10.0.0.9",
+        )
+    )
+    try:
+        assert svc.set_multicast_iface("10.0.0.20") is True
+        assert joins == ["10.0.0.9", "10.0.0.20"]
+        status = svc.listener_status()
+        assert status["multicast_iface"] == "10.0.0.20"
+        assert status["port"] == port
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_set_multicast_iface_none_leaves_the_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What a pinned interface going down has to mean: hold no membership
+    rather than one on an interface the operator excluded. The listener keeps
+    running, so unicast and broadcast are unaffected."""
+    svc = OscService()
+    joins: list[str | None] = []
+    monkeypatch.setattr(
+        service_module,
+        "_join_multicast_group",
+        lambda sock, group, port, *, iface_ip="", iface="": joins.append(iface_ip) or (iface_ip is not None),
+    )
+    port = bind_free_udp_port(
+        lambda p: svc.restart_listener(
+            port=p,
+            allowed_ips=(),
+            multicast_group="239.1.2.3",
+            multicast_iface="10.0.0.9",
+        )
+    )
+    try:
+        assert svc.set_multicast_iface(None) is False
+        assert joins == ["10.0.0.9", None]  # consulted for the down pin, and declined
+        status = svc.listener_status()
+        assert status["multicast_iface"] is None
+        assert status["multicast_joined"] is False
+        assert status["port"] == port  # still listening
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_set_multicast_iface_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Called every poll while the interface is healthy, so an unchanged pin
+    must not churn the membership."""
+    svc = OscService()
+    joins: list[str] = []
+    monkeypatch.setattr(
+        service_module,
+        "_join_multicast_group",
+        lambda sock, group, port, *, iface_ip="", iface="": joins.append("join") or True,
+    )
+    bind_free_udp_port(
+        lambda p: svc.restart_listener(
+            port=p,
+            allowed_ips=(),
+            multicast_group="239.1.2.3",
+            multicast_iface="10.0.0.9",
+        )
+    )
+    unchanged = svc._listener
+    try:
+        joins.clear()
+        assert svc.set_multicast_iface("10.0.0.9") is True
+        assert joins == []
+        assert svc._listener is unchanged
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_a_new_interface_at_the_same_address_takes_the_membership_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A VLAN child shares its parent's link-local address, so an unchanged
+    address does not mean an unchanged interface: the join is selected by name."""
+    svc = OscService()
+    joins: list[tuple[str | None, str]] = []
+    monkeypatch.setattr(
+        service_module,
+        "_join_multicast_group",
+        lambda sock, group, port, *, iface_ip="", iface="": joins.append((iface_ip, iface)) or True,
+    )
+    bind_free_udp_port(
+        lambda p: svc.restart_listener(
+            port=p,
+            allowed_ips=(),
+            multicast_group="239.1.2.3",
+            multicast_iface="169.254.7.7",
+            multicast_iface_name="eth1",
+        )
+    )
+    try:
+        joins.clear()
+        assert svc.set_multicast_iface("169.254.7.7", "eth1.2") is True
+        assert joins == [("169.254.7.7", "eth1.2")]
+        joins.clear()
+        assert svc.set_multicast_iface("169.254.7.7", "eth1.2") is True
+        assert joins == []
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_start_listener_restarts_for_a_new_interface_at_the_same_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = OscService()
+    joins: list[str] = []
+    monkeypatch.setattr(
+        service_module,
+        "_join_multicast_group",
+        lambda sock, group, port, *, iface_ip="", iface="": joins.append(iface) or True,
+    )
+    port = bind_free_udp_port(
+        lambda p: svc.start_listener(
+            p, multicast_group="239.1.2.3", multicast_iface="169.254.7.7", multicast_iface_name="eth1"
+        )
+    )
+    same = {"multicast_group": "239.1.2.3", "multicast_iface": "169.254.7.7"}
+    try:
+        svc.start_listener(port, **same, multicast_iface_name="eth1")
+        assert joins == ["eth1"]
+        svc.start_listener(port, **same, multicast_iface_name="eth1.2")
+        assert joins == ["eth1", "eth1.2"]
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_set_multicast_iface_rejoins_from_holding_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The recovery path. Coming back from a down pin there is no membership to
+    leave, and attempting one would log a spurious failure every time an
+    interface returned."""
+    svc = OscService()
+    joins: list[str | None] = []
+    monkeypatch.setattr(
+        service_module,
+        "_join_multicast_group",
+        lambda sock, group, port, *, iface_ip="", iface="": joins.append(iface_ip) or (iface_ip is not None),
+    )
+    bind_free_udp_port(
+        lambda p: svc.restart_listener(
+            port=p,
+            allowed_ips=(),
+            multicast_group="239.1.2.3",
+            multicast_iface=None,
+        )
+    )
+    try:
+        joins.clear()
+        assert svc.set_multicast_iface("10.0.0.9") is True
+        assert joins == ["10.0.0.9"]
+        assert svc.listener_status()["multicast_joined"] is True
+    finally:
+        svc.shutdown()
+
+
+def test_set_multicast_iface_without_a_listener_is_a_noop() -> None:
+    """The observer polls from housekeeping; a listener that never bound has no
+    socket to move a membership on."""
+    svc = OscService()
+    assert svc.set_multicast_iface("10.0.0.9") is False
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_set_multicast_iface_without_a_group_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no group configured the pin governs nothing."""
+    svc = OscService()
+    bind_free_udp_port(lambda p: svc.restart_listener(port=p, allowed_ips=()))
+    try:
+        assert svc.set_multicast_iface("10.0.0.9") is False
+        assert svc.listener_status()["multicast_iface"] == ""
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_start_listener_rebinds_when_the_interface_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The interface is part of what identifies a listener, so a pin change is
+    not idempotent: it rebuilds the socket, which is the only thing that
+    releases the membership the old one held."""
+    svc = OscService()
+    monkeypatch.setattr(service_module, "_join_multicast_group", lambda *a, **kw: True)
+    port = bind_free_udp_port(
+        lambda p: svc.start_listener(p, allowed_ips=(), multicast_group="239.1.2.3", multicast_iface="10.0.0.9")
+    )
+    first = svc._listener
+    try:
+        svc.start_listener(port, allowed_ips=(), multicast_group="239.1.2.3", multicast_iface="10.0.0.20")
+        assert svc._listener is not first
+        assert first.socket.fileno() == -1
+        assert svc.listener_status()["multicast_iface"] == "10.0.0.20"
+    finally:
+        svc.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_stop_listener_clears_the_membership(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``listener_status`` drives diagnostics and the observer's ``current``; a
+    stale interface there would read as a live membership."""
+    svc = OscService()
+    monkeypatch.setattr(service_module, "_join_multicast_group", lambda *a, **kw: True)
+    bind_free_udp_port(
+        lambda p: svc.start_listener(p, allowed_ips=(), multicast_group="239.1.2.3", multicast_iface="10.0.0.9")
+    )
+    svc.stop_listener()
+    assert svc.listener_status() == {
+        "port": None,
+        "multicast_group": "",
+        "multicast_iface": "",
+        "multicast_joined": False,
+        "allowed_sender_ips": [],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# _udp_dest_class / _make_client – broadcast & multicast socket options
+# --------------------------------------------------------------------------- #
+
+
+def test_make_client_multicast_sets_ttl_and_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _FakeClient)
+    client = service_module._make_client("239.1.2.3", 9000, "udp", "slip")
+    assert client.allow_broadcast is False
+    assert (socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, service_module._MULTICAST_TTL) in client._sock.sockopts
+    assert (socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1) in client._sock.sockopts
+
+
+def test_make_client_limited_broadcast_enables_allow_broadcast(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _FakeClient)
+    client = service_module._make_client("255.255.255.255", 9000, "udp", "slip")
+    assert client.allow_broadcast is True
+    assert client._sock.sockopts == []
+
+
+def test_make_client_directed_broadcast_enables_allow_broadcast(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _FakeClient)
+    client = service_module._make_client("192.168.1.255", 9000, "udp", "slip")
+    assert client.allow_broadcast is True
+
+
+def test_make_client_unicast_leaves_socket_plain(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _FakeClient)
+    client = service_module._make_client("192.168.1.5", 9000, "udp", "slip")
+    assert client.allow_broadcast is False
+    assert client._sock.sockopts == []
+
+
+def test_udp_dest_class_hostname_is_unicast() -> None:
+    # A non-IPv4 literal (hostname) can't be classified – treat as unicast.
+    assert service_module._udp_dest_class("osc.example.com") == "unicast"
+
+
+# --------------------------------------------------------------------------- #
+# _resolve_host – bounded hostname resolution off the scheduler hot path
+# --------------------------------------------------------------------------- #
+
+
+def _answers(address: str) -> Any:
+    """A ``getaddrinfo`` stand-in that resolves every name to *address*."""
+
+    def _getaddrinfo(host: str, *_a: Any, **_k: Any) -> list[tuple[Any, ...]]:
+        return [(socket.AF_INET, socket.SOCK_DGRAM, 17, "", (address, 0))]
+
+    return _getaddrinfo
+
+
+def test_resolve_host_passes_ipv4_literal_through_without_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An IPv4 literal must short-circuit – no DNS lookup at all, so the
+    per-frame send loop never pays for resolution on the common path."""
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("getaddrinfo must not be called for an IP literal")
+
+    monkeypatch.setattr(service_module.socket, "getaddrinfo", _boom)
+    assert service_module._resolve_host("192.168.1.5") == "192.168.1.5"
+
+
+def test_resolve_host_resolves_hostname_to_literal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hostname is resolved to an IPv4 literal that is then handed to
+    ``SimpleUDPClient`` (so pythonosc's own ``getaddrinfo`` resolves
+    instantly instead of blocking on the scheduler thread)."""
+    monkeypatch.setattr(service_module.socket, "getaddrinfo", _answers("10.0.0.7"))
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _FakeClient)
+    client = service_module._make_client("osc.example.com", 9000, "udp", "slip")
+    assert client.host == "10.0.0.7"
+
+
+def test_resolve_host_bounds_slow_dns_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A slow/hung resolver must not stall the caller indefinitely: the
+    lookup is bounded by ``_RESOLVE_TIMEOUT_S`` and surfaces as ``OSError``
+    well before the (10×-longer) lookup would have returned."""
+    monkeypatch.setattr(service_module, "_RESOLVE_TIMEOUT_S", 0.05)
+
+    def _slow(*_a: Any, **_k: Any) -> Any:
+        time.sleep(5.0)
+        return _answers("10.0.0.9")("slow.example.com")
+
+    monkeypatch.setattr(service_module.socket, "getaddrinfo", _slow)
+    start = time.monotonic()
+    # Sub-second deadline must render with its fraction, not round to "0s".
+    with pytest.raises(OSError, match="has not answered within 0.05s"):
+        service_module._resolve_host("slow.example.com")
+    # Bounded: returns near the deadline, not after the 5 s sleep.
+    assert time.monotonic() - start < 1.0
+
+
+def test_resolve_host_says_when_a_lookup_could_not_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Not a DNS failure: the station could not run the lookup at all."""
+    from openfollow.net_utils import BoundedResolver
+
+    class _NoThread:
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(service_module, "_resolver", BoundedResolver(thread_factory=lambda **_k: _NoThread()))
+    with pytest.raises(OSError, match=r"^DNS lookup for 'osc.example.com' could not start: can't start new thread$"):
+        service_module._resolve_host("osc.example.com")
+
+
+def test_resolve_host_relays_lookup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failing lookup surfaces as ``OSError`` so ``_get_or_create_client``
+    logs it and caches nothing (no client for an unresolvable target)."""
+
+    def _fail(*_a: Any, **_k: Any) -> Any:
+        raise socket.gaierror("nodename nor servname provided")
+
+    monkeypatch.setattr(service_module.socket, "getaddrinfo", _fail)
+    with pytest.raises(OSError, match="failed: nodename nor servname provided"):
+        service_module._resolve_host("nope.invalid")
+
+
+def test_resolve_host_caches_failure_to_avoid_respawning_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A repeated failing lookup hits the negative cache and raises without a
+    second resolver thread, bounding thread churn under sustained failure."""
+    calls: list[str] = []
+
+    def _fail(host: str, *_a: Any, **_k: Any) -> Any:
+        calls.append(host)
+        raise socket.gaierror("nodename nor servname provided")
+
+    monkeypatch.setattr(service_module.socket, "getaddrinfo", _fail)
+    for _ in range(2):
+        with pytest.raises(OSError, match="failed: nodename nor servname provided"):
+            service_module._resolve_host("bad.invalid")
+    assert calls == ["bad.invalid"]  # second call short-circuited, no new lookup
+
+
+def test_resolve_host_asks_for_ipv4_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The client, its multicast options and an interface pin are all IPv4."""
+    families: list[int] = []
+
+    def _record(host: str, port: Any, family: int = 0, *_a: Any, **_k: Any) -> Any:
+        families.append(family)
+        return _answers("10.0.0.7")(host)
+
+    monkeypatch.setattr(service_module.socket, "getaddrinfo", _record)
+    assert service_module._resolve_host("osc.example.com") == "10.0.0.7"
+    assert families == [socket.AF_INET]
+    # An address, not a name: DNS was never asked, so the message must not blame it.
+    with pytest.raises(OSError, match=r"^OSC output is IPv4 only, and '2001:db8::7' is not an IPv4 address$"):
+        service_module._resolve_host("2001:db8::7")
+
+
+def test_send_to_slow_hostname_does_not_hang_and_caches_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end on the send path: a target whose DNS lookup hangs is
+    dropped (bounded) rather than wedging the scheduler – no client is
+    cached, matching the existing construction-failure contract."""
+    monkeypatch.setattr(service_module, "_RESOLVE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _FakeClient)
+    monkeypatch.setattr(service_module.socket, "getaddrinfo", lambda *_a, **_k: time.sleep(5.0))
+    svc = OscService()
+    start = time.monotonic()
+    svc.send("/x", host="slow.example.com", port=9000)  # must not hang
+    assert time.monotonic() - start < 1.0
+    assert _FakeClient.instances == []
+    assert svc.stats_for("slow.example.com", 9000) == ClientStats()
+
+
+def test_send_swallows_non_oserror_build_failure(patched_service: OscService) -> None:
+    """send() upholds its 'never raises' contract even when send_message raises a
+    BuildError-like (non OSError/ValueError) exception on an un-encodable arg."""
+    svc = patched_service
+    svc.send("/x", [1], host="127.0.0.1", port=9000)
+    _FakeClient.instances[0].send_exc = RuntimeError("BuildError: un-encodable arg")
+    svc.send("/x", [2], host="127.0.0.1", port=9000)  # must not raise
+    assert svc.stats_for("127.0.0.1", 9000).total_errors == 1
+
+
+@pytest.mark.skipif(not _PYTHONOSC_AVAILABLE, reason="python-osc not installed")
+def test_restart_listener_resets_state_when_thread_start_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the serve thread can't start, the bound listener is torn down and the
+    listener fields reset, so a later stop_listener has nothing half-installed."""
+    svc = OscService()
+
+    class _BadThread:
+        def __init__(self, *a: Any, **k: Any) -> None: ...
+
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(service_module.threading, "Thread", _BadThread)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        bind_free_udp_port(lambda p: svc.restart_listener(port=p, allowed_ips=()))
+    assert svc._listener is None
+    assert svc._listener_thread is None
+    svc.stop_listener()  # clean no-op – nothing half-installed
+
+
+# ---------------------------------------------------------------------------
+# Egress pinning
+# ---------------------------------------------------------------------------
+
+_EGRESS = Egress("eth1", "198.51.100.10")
+_OTHER_EGRESS = Egress("eth2", "203.0.113.10")
+
+
+@pytest.fixture
+def pins(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, Egress, bool]]:
+    calls: list[tuple[object, Egress, bool]] = []
+
+    def _pin(sock: object, egress: Egress, *, multicast: bool = False) -> None:
+        calls.append((sock, egress, multicast))
+
+    monkeypatch.setattr(service_module, "pin_socket_egress", _pin)
+    return calls
+
+
+def _evicting_service(monkeypatch: pytest.MonkeyPatch, closed: list[Any]) -> OscService:
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _FakeClient)
+    monkeypatch.setattr(service_module, "_resolve_host", lambda host: host)
+    return OscService(close_async=closed.extend)
+
+
+def test_a_pinned_udp_client_is_pinned_before_its_first_send(patched_service: OscService, pins: list) -> None:
+    patched_service.send("/x", host="198.51.100.20", port=9000, egress=_EGRESS)
+    client = _FakeClient.instances[0]
+    assert pins == [(client._sock, _EGRESS, False)]
+    assert client.calls == [("/x", [])]
+
+
+def test_a_multicast_destination_is_pinned_as_multicast(patched_service: OscService, pins: list) -> None:
+    patched_service.send("/x", host="239.1.2.3", port=9000, egress=_EGRESS)
+    assert pins[0][2] is True
+
+
+def test_an_unpinned_client_is_left_to_the_os(patched_service: OscService, pins: list) -> None:
+    patched_service.send("/x", host="198.51.100.20", port=9000)
+    assert pins == []
+
+
+def test_the_cache_keeps_one_client_per_interface(patched_service: OscService, pins: list) -> None:
+    for egress in (_EGRESS, _OTHER_EGRESS, _EGRESS, None):
+        patched_service.send("/x", host="198.51.100.20", port=9000, egress=egress)
+    assert len(_FakeClient.instances) == 3
+
+
+def test_a_down_egress_creates_no_client_and_sends_nothing(patched_service: OscService, pins: list) -> None:
+    """Creating one would have nothing to pin to, so it would send unpinned."""
+    patched_service.send("/x", host="198.51.100.20", port=9000, egress=Egress("eth1", ""))
+    assert _FakeClient.instances == []
+    assert pins == []
+
+
+def test_a_refused_pin_closes_its_socket_and_waits_before_retrying(
+    patched_service: OscService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [100.0]
+    # Only this module's clock: time.monotonic itself is shared process-wide.
+    monkeypatch.setattr(service_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    attempts: list[Any] = []
+
+    def _refuse(sock: Any, egress: Egress, *, multicast: bool = False) -> None:
+        attempts.append(sock)
+        raise InterfaceUnavailable("cannot send via eth1")
+
+    monkeypatch.setattr(service_module, "pin_socket_egress", _refuse)
+    for _ in range(5):
+        patched_service.send("/x", host="198.51.100.20", port=9000, egress=_EGRESS)
+    assert len(attempts) == 1
+    assert attempts[0].closed is True
+
+    now[0] += 1.5
+    patched_service.send("/x", host="198.51.100.20", port=9000, egress=_EGRESS)
+    assert len(attempts) == 2
+
+
+def test_send_reports_a_message_that_reached_the_socket(patched_service: OscService, pins: list) -> None:
+    assert patched_service.send("/x", host="198.51.100.20", port=9000) is True
+    assert patched_service.send("/x", host="198.51.100.20", port=9000, egress=_EGRESS) is True
+
+
+def _refuse_pins(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _refuse(sock: Any, egress: Egress, *, multicast: bool = False) -> None:
+        raise InterfaceUnavailable("cannot send via eth1")
+
+    monkeypatch.setattr(service_module, "pin_socket_egress", _refuse)
+
+
+@pytest.mark.parametrize(
+    ("address", "overrides", "setup"),
+    [
+        ("", {}, None),
+        ("/x", {"egress": Egress("eth1", "")}, None),
+        ("/x", {"host": ""}, None),
+        ("/x", {"port": 0}, None),
+        ("/x", {"protocol": "sctp"}, None),
+        ("/x", {"egress": _EGRESS}, "refuse-pin"),
+        ("/x", {}, "send-raises"),
+        ("/x", {}, "no-python-osc"),
+    ],
+    ids=[
+        "no-address",
+        "down-interface",
+        "no-host",
+        "no-port",
+        "unknown-protocol",
+        "refused-pin",
+        "send-raises",
+        "no-dep",
+    ],
+)
+def test_send_reports_a_message_that_never_left(
+    patched_service: OscService, monkeypatch: pytest.MonkeyPatch, address: str, overrides: dict, setup: str | None
+) -> None:
+    """A caller that records the send must not record one that went nowhere."""
+    monkeypatch.setattr(service_module, "time", SimpleNamespace(monotonic=lambda: 100.0))
+    kwargs: dict[str, Any] = {"host": "198.51.100.20", "port": 9000, **overrides}
+    if setup == "refuse-pin":
+        _refuse_pins(monkeypatch)
+    elif setup == "send-raises":
+        patched_service.send("/warm", **kwargs)
+        _FakeClient.instances[0].send_exc = OSError("Network is unreachable")
+    elif setup == "no-python-osc":
+        monkeypatch.setattr(service_module, "_PYTHONOSC_AVAILABLE", False)
+    assert patched_service.send(address, **kwargs) is False
+    # A second attempt inside a refused pin's retry delay is not a send either.
+    assert patched_service.send(address, **kwargs) is False
+
+
+def test_eviction_retries_a_refused_pin_at_once(patched_service: OscService, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Eviction follows an address change, so the pin that was refused may now
+    hold; waiting out the retry delay would drop sends for no reason."""
+    monkeypatch.setattr(service_module, "time", SimpleNamespace(monotonic=lambda: 100.0))
+    attempts: list[Any] = []
+    refuse = [True]
+
+    def _pin(sock: Any, egress: Egress, *, multicast: bool = False) -> None:
+        attempts.append(sock)
+        if refuse[0]:
+            raise InterfaceUnavailable("cannot send via eth1")
+
+    monkeypatch.setattr(service_module, "pin_socket_egress", _pin)
+    patched_service.send("/x", host="198.51.100.20", port=9000, egress=_EGRESS)
+    refuse[0] = False
+    patched_service.evict_egress("eth1")
+    patched_service.send("/x", host="198.51.100.20", port=9000, egress=_EGRESS)
+    assert len(attempts) == 2
+    assert _FakeClient.instances[-1].calls == [("/x", [])]
+
+
+def test_evict_egress_drops_every_client_on_that_interface_only(monkeypatch: pytest.MonkeyPatch, pins: list) -> None:
+    closed: list[Any] = []
+    svc = _evicting_service(monkeypatch, closed)
+    for egress in (_EGRESS, Egress("eth1", "198.51.100.11"), _OTHER_EGRESS, None):
+        svc.send("/x", host="198.51.100.20", port=9000, egress=egress)
+    eth1_clients = _FakeClient.instances[:2]
+
+    svc.evict_egress("eth1")
+    assert closed == eth1_clients
+
+    svc.send("/x", host="198.51.100.20", port=9000, egress=_OTHER_EGRESS)
+    svc.send("/x", host="198.51.100.20", port=9000)
+    assert len(_FakeClient.instances) == 4
+    svc.send("/x", host="198.51.100.20", port=9000, egress=_EGRESS)
+    assert len(_FakeClient.instances) == 5
+
+
+def test_retain_egress_keeps_live_and_unpinned_clients(monkeypatch: pytest.MonkeyPatch, pins: list) -> None:
+    closed: list[Any] = []
+    svc = _evicting_service(monkeypatch, closed)
+    for egress in (_EGRESS, _OTHER_EGRESS, None):
+        svc.send("/x", host="198.51.100.20", port=9000, egress=egress)
+    pinned_eth1, pinned_eth2, _unpinned = _FakeClient.instances
+
+    svc.retain_egress(frozenset({_OTHER_EGRESS}))
+    assert closed == [pinned_eth1]
+    assert pinned_eth2 not in closed
+
+
+def test_eviction_never_waits_on_a_slow_close(monkeypatch: pytest.MonkeyPatch, pins: list) -> None:
+    """A TCP sender's close joins its reader for up to a second; eviction runs
+    on the main loop, which must not stall on it."""
+    release, done = threading.Event(), threading.Event()
+
+    class _SlowSocket(_FakeSocket):
+        def close(self) -> None:
+            release.wait(2.0)
+            done.set()
+
+    class _SlowClient(_FakeClient):
+        def __init__(self, host: str, port: int, allow_broadcast: bool = False) -> None:
+            super().__init__(host, port, allow_broadcast)
+            self._sock = _SlowSocket()
+
+    monkeypatch.setattr(service_module, "SimpleUDPClient", _SlowClient)
+    monkeypatch.setattr(service_module, "_resolve_host", lambda host: host)
+    svc = OscService()
+    svc.send("/x", host="198.51.100.20", port=9000, egress=_EGRESS)
+
+    started = time.monotonic()
+    svc.evict_egress("eth1")
+    assert time.monotonic() - started < 0.5
+    release.set()
+    assert done.wait(2.0)
+
+
+def test_stats_and_evict_address_a_pinned_client_by_its_egress(patched_service: OscService, pins: list) -> None:
+    patched_service.send("/x", host="198.51.100.20", port=9000, egress=_EGRESS)
+    assert patched_service.stats_for("198.51.100.20", 9000, egress=_EGRESS).total_sent == 1
+    assert patched_service.stats_for("198.51.100.20", 9000).total_sent == 0
+    patched_service.evict("198.51.100.20", 9000, egress=_EGRESS)
+    assert _FakeClient.instances[0]._sock.closed is True

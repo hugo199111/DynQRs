@@ -1,0 +1,631 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""Tests for the RTSP video input plugin.
+
+Covers ``create_pipeline`` topology (rtspsrc → decodebin → queue →
+videoconvert), the pad-added callbacks for both ``rtspsrc`` and
+``decodebin``, the hardware-decoder preference hook, and the zero-latency
+``on_bus_async_done`` behaviour.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+from openfollow.video.inputs.rtsp import RtspInput
+from tests._fake_gst import FakeElement, FakePad, FakePipeline, make_fake_gst
+
+pytestmark = pytest.mark.unit
+
+
+class _RecordingFactory:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.ranks: list[int] = []
+
+    def set_rank(self, value: int) -> None:
+        self.ranks.append(value)
+
+
+class TestPreferHardwareDecoders:
+    def test_bumps_v4l2_and_demotes_openh264(self) -> None:
+        from gi.repository import Gst  # noqa: F401
+
+        v4l2 = _RecordingFactory("v4l2h264dec")
+        openh264 = _RecordingFactory("openh264dec")
+        fake = make_fake_gst(
+            known_factories={"v4l2h264dec": v4l2, "openh264dec": openh264},
+        )
+        with patch("gi.repository.Gst", fake):
+            RtspInput._prefer_hardware_decoders()
+
+        assert v4l2.ranks == [fake.Rank.PRIMARY + 1]
+        assert openh264.ranks == [fake.Rank.MARGINAL]
+
+
+class TestCreatePipeline:
+    def _build(self, *, fake=None, config=None) -> FakePipeline:
+        from gi.repository import Gst  # noqa: F401
+
+        fake = fake or make_fake_gst()
+        sink = FakeElement("shared_videosink")
+        with patch("gi.repository.Gst", fake):
+            return RtspInput().create_pipeline(
+                config=config or {},
+                sink=sink,
+                build_overlay_tail=lambda *a: None,
+                prepare_sink=lambda: sink,
+            )
+
+    def test_rtspsrc_configured_with_zero_latency_and_all_transports(self) -> None:
+        pipeline = self._build(config={"rtsp_url": "rtsp://host:554/stream"})
+        rtspsrc = pipeline.get_by_name("rtspsrc")
+        assert rtspsrc is not None
+        assert rtspsrc.properties["location"] == "rtsp://host:554/stream"
+        assert rtspsrc.properties["latency"] == 0
+        assert rtspsrc.properties["drop-on-latency"] is True
+        assert rtspsrc.properties["buffer-mode"] == 0
+        # tcp+udp+multicast = 0b111 = 7
+        assert rtspsrc.properties["protocols"] == 0x7
+
+    def test_missing_rtspsrc_raises(self) -> None:
+        fake = make_fake_gst(missing_elements={"rtspsrc"})
+        with pytest.raises(RuntimeError, match="rtspsrc"):
+            self._build(fake=fake)
+
+    def test_prepare_sink_none_raises(self) -> None:
+        from gi.repository import Gst  # noqa: F401
+
+        with patch("gi.repository.Gst", make_fake_gst()):
+            with pytest.raises(RuntimeError, match="No video sink"):
+                RtspInput().create_pipeline(
+                    config={},
+                    sink=FakeElement("shared_videosink"),
+                    build_overlay_tail=lambda *a: None,
+                    prepare_sink=lambda: None,
+                )
+
+    def test_post_queue_is_leaky(self) -> None:
+        pipeline = self._build()
+        post = pipeline.get_by_name("post_queue")
+        assert post is not None
+        assert post.properties["leaky"] == 2
+
+
+class TestRtspCredentials:
+    """A camera that needs a login and does not get one never connects.
+
+    These pin the login path an operator can reach from the form, and the
+    precedence that decides which credential wins when a URL carries one too.
+    """
+
+    def _rtspsrc(self, config: dict[str, object]):  # noqa: ANN202
+        from gi.repository import Gst  # noqa: F401
+
+        fake = make_fake_gst()
+        sink = FakeElement("shared_videosink")
+        with patch("gi.repository.Gst", fake):
+            pipeline = RtspInput().create_pipeline(
+                config=config,
+                sink=sink,
+                build_overlay_tail=lambda *a: None,
+                prepare_sink=lambda: sink,
+            )
+        src = pipeline.get_by_name("rtspsrc")
+        assert src is not None
+        return src
+
+    def test_credentials_drive_the_element_properties(self) -> None:
+        src = self._rtspsrc(
+            {
+                "rtsp_url": "rtsp://192.168.0.182:554/video/stream1",
+                "rtsp_user": "operator",
+                "rtsp_password": "hunter2",
+            }
+        )
+        assert src.properties["user-id"] == "operator"
+        assert src.properties["user-pw"] == "hunter2"
+        assert src.properties["location"] == "rtsp://192.168.0.182:554/video/stream1"
+
+    @pytest.mark.parametrize("password", ["p@ss:word/1", "with spaces", "  padded  "])
+    def test_password_reaches_the_element_verbatim(self, password: str) -> None:
+        """The point of the field is that it needs no URL-encoding: a password
+        with ``@``, ``:`` or ``/`` breaks a URL but must survive intact here.
+        Edge whitespace is kept too - it can be part of the password and is
+        invisible in a password field, so trimming it would fail auth silently.
+        """
+        src = self._rtspsrc(
+            {
+                "rtsp_url": "rtsp://cam:554/s",
+                "rtsp_user": "operator",
+                "rtsp_password": password,
+            }
+        )
+        assert src.properties["user-pw"] == password
+
+    def test_username_is_trimmed(self) -> None:
+        src = self._rtspsrc({"rtsp_url": "rtsp://cam:554/s", "rtsp_user": "  operator  ", "rtsp_password": "x"})
+        assert src.properties["user-id"] == "operator"
+
+    def test_fields_outrank_a_credential_left_in_the_url(self) -> None:
+        """``rtspsrc`` tries URL userinfo before ``user-id``/``user-pw``, so a
+        stale login in the URL would otherwise beat what the operator typed."""
+        src = self._rtspsrc(
+            {
+                "rtsp_url": "rtsp://stale:old@192.168.0.182:554/s",
+                "rtsp_user": "operator",
+                "rtsp_password": "hunter2",
+            }
+        )
+        assert src.properties["location"] == "rtsp://192.168.0.182:554/s"
+        assert src.properties["user-id"] == "operator"
+        assert src.properties["user-pw"] == "hunter2"
+
+    def test_only_a_password_is_enough_to_take_the_field_path(self) -> None:
+        """Some cameras authenticate on a password alone; an empty username
+        must not drop the whole login back to the URL path."""
+        src = self._rtspsrc({"rtsp_url": "rtsp://stale:old@cam:554/s", "rtsp_user": "", "rtsp_password": "hunter2"})
+        assert src.properties["location"] == "rtsp://cam:554/s"
+        assert src.properties["user-id"] == ""
+        assert src.properties["user-pw"] == "hunter2"
+
+    def test_the_password_renders_as_a_password_input(self) -> None:
+        """A visible credential is a credential in the next screenshot."""
+        html = RtspInput.web_ui_html({"rtsp_user": "operator", "rtsp_password": "hunter2"})
+        assert 'type="password" name="rtsp_password"' in html
+        assert 'type="text" name="rtsp_user"' in html
+        assert html.count('autocomplete="off"') == 2
+
+    def test_the_login_is_labelled_optional(self) -> None:
+        """Most cameras need no login, and a form that doesn't say so reads as
+        two more fields the operator has to work out values for."""
+        html = RtspInput.web_ui_html({})
+        assert "<label>Username (optional)</label>" in html
+        assert "<label>Password (optional)</label>" in html
+
+    @pytest.mark.parametrize("config", [{}, {"rtsp_user": "", "rtsp_password": ""}])
+    def test_blank_fields_leave_the_url_path_untouched(self, config: dict[str, object]) -> None:
+        """Nobody's saved config breaks: with no fields set, a login fused into
+        the URL is handed over exactly as before."""
+        src = self._rtspsrc({"rtsp_url": "rtsp://user:pass@cam:554/s", **config})
+        assert src.properties["location"] == "rtsp://user:pass@cam:554/s"
+        assert "user-id" not in src.properties
+        assert "user-pw" not in src.properties
+
+
+class TestRtspsrcPadAdded:
+    def test_links_rtspsrc_dynamic_pad_into_decodebin(self) -> None:
+        from gi.repository import Gst  # noqa: F401
+
+        fake = make_fake_gst()
+        sink = FakeElement("shared_videosink")
+        with patch("gi.repository.Gst", fake):
+            pipeline = RtspInput().create_pipeline(
+                config={},
+                sink=sink,
+                build_overlay_tail=lambda *a: None,
+                prepare_sink=lambda: sink,
+            )
+        rtspsrc = pipeline.get_by_name("rtspsrc")
+        decodebin = pipeline.get_by_name("decodebin")
+        pad_cb = next(cb for sig, cb in rtspsrc.signals if sig == "pad-added")
+        pad = FakePad("recv_rtp_src_0")
+        pad_cb(rtspsrc, pad)
+        assert pad.linked_to is decodebin.get_static_pad("sink")
+
+    def test_second_pad_added_is_ignored_once_decodebin_is_linked(self) -> None:
+        from gi.repository import Gst  # noqa: F401
+
+        fake = make_fake_gst()
+        sink = FakeElement("shared_videosink")
+        with patch("gi.repository.Gst", fake):
+            pipeline = RtspInput().create_pipeline(
+                config={},
+                sink=sink,
+                build_overlay_tail=lambda *a: None,
+                prepare_sink=lambda: sink,
+            )
+        rtspsrc = pipeline.get_by_name("rtspsrc")
+        pad_cb = next(cb for sig, cb in rtspsrc.signals if sig == "pad-added")
+
+        pad1 = FakePad("recv_rtp_src_0")
+        pad_cb(rtspsrc, pad1)
+        pad2 = FakePad("recv_rtp_src_1")
+        pad_cb(rtspsrc, pad2)
+        # second pad must not link
+        assert pad2.linked_to is None
+
+
+class TestRtspsrcPadAddedFailureArms:
+    """The rtspsrc pad-added callback has three exits: skip when sink_pad
+    is missing, skip when already linked, log-error when link returns
+    non-OK. The existing tests cover the success and second-pad arms;
+    this fills the failure arms."""
+
+    def _get_pad_cb(self):
+        from gi.repository import Gst  # noqa: F401
+
+        fake = make_fake_gst()
+        sink = FakeElement("shared_videosink")
+        with patch("gi.repository.Gst", fake):
+            pipeline = RtspInput().create_pipeline(
+                config={},
+                sink=sink,
+                build_overlay_tail=lambda *a: None,
+                prepare_sink=lambda: sink,
+            )
+        rtspsrc = pipeline.get_by_name("rtspsrc")
+        decodebin = pipeline.get_by_name("decodebin")
+        pad_cb = next(cb for sig, cb in rtspsrc.signals if sig == "pad-added")
+        return pipeline, rtspsrc, decodebin, pad_cb
+
+    def test_pad_added_skips_when_decodebin_static_sink_missing(self) -> None:
+        _pipeline, rtspsrc, decodebin, pad_cb = self._get_pad_cb()
+        decodebin.get_static_pad = lambda _name: None  # type: ignore[method-assign]
+        pad = FakePad("recv_rtp_src_0")
+        pad_cb(rtspsrc, pad)
+        assert pad.linked_to is None
+
+    def test_pad_added_logs_error_when_link_fails(self) -> None:
+        _pipeline, rtspsrc, _decodebin, pad_cb = self._get_pad_cb()
+        pad = FakePad("recv_rtp_src_0", link_returns="some_error")
+        # Must not raise – error arm fires.
+        pad_cb(rtspsrc, pad)
+
+
+class TestRtspsrcPadAddedMediaFilter:
+    """#558: link only the video RTP track. rtspsrc exposes one pad per SDP
+    media track, so an audio-first SDP must not steal the single decodebin
+    sink and drop video entirely."""
+
+    def _get_pad_cb(self):
+        from gi.repository import Gst  # noqa: F401
+
+        fake = make_fake_gst()
+        sink = FakeElement("shared_videosink")
+        with patch("gi.repository.Gst", fake):
+            pipeline = RtspInput().create_pipeline(
+                config={},
+                sink=sink,
+                build_overlay_tail=lambda *a: None,
+                prepare_sink=lambda: sink,
+            )
+        rtspsrc = pipeline.get_by_name("rtspsrc")
+        decodebin = pipeline.get_by_name("decodebin")
+        pad_cb = next(cb for sig, cb in rtspsrc.signals if sig == "pad-added")
+        return decodebin, rtspsrc, pad_cb
+
+    @staticmethod
+    def _caps(value: str):
+        return type("C", (), {"to_string": staticmethod(lambda: value)})()
+
+    def test_audio_first_then_video_links_only_video(self) -> None:
+        decodebin, rtspsrc, pad_cb = self._get_pad_cb()
+        audio = FakePad("recv_rtp_src_0")
+        audio.get_current_caps = lambda: self._caps("application/x-rtp, media=(string)audio, payload=(int)97")
+        pad_cb(rtspsrc, audio)
+        video = FakePad("recv_rtp_src_1")
+        video.get_current_caps = lambda: self._caps("application/x-rtp, media=(string)video, payload=(int)96")
+        pad_cb(rtspsrc, video)
+        assert audio.linked_to is None  # audio skipped – sink stays free
+        assert video.linked_to is decodebin.get_static_pad("sink")
+
+    def test_unreadable_caps_pad_is_linked(self) -> None:
+        # Caps not yet negotiable (no media field) → link rather than stall.
+        decodebin, rtspsrc, pad_cb = self._get_pad_cb()
+        pad = FakePad("recv_rtp_src_0")
+        pad.get_current_caps = lambda: None
+        pad.query_caps = lambda _f: None
+        pad_cb(rtspsrc, pad)
+        assert pad.linked_to is decodebin.get_static_pad("sink")
+
+
+class TestDecodebinPadAddedFailureArms:
+    """The decodebin pad-added callback's failure arms: missing sink
+    pad, already-linked sink pad, NOFORMAT/REFUSED tolerance, and the
+    error arm for any other link result."""
+
+    def _get_decodebin_pad_cb(self):
+        from gi.repository import Gst  # noqa: F401
+
+        fake = make_fake_gst()
+        sink = FakeElement("shared_videosink")
+        with patch("gi.repository.Gst", fake):
+            pipeline = RtspInput().create_pipeline(
+                config={},
+                sink=sink,
+                build_overlay_tail=lambda *a: None,
+                prepare_sink=lambda: sink,
+            )
+        decodebin = pipeline.get_by_name("decodebin")
+        pad_cb = next(cb for sig, cb in decodebin.signals if sig == "pad-added")
+        return pipeline, decodebin, pad_cb
+
+    def test_pad_added_skips_when_post_queue_static_sink_missing(self) -> None:
+        pipeline, decodebin, pad_cb = self._get_decodebin_pad_cb()
+        post_queue = pipeline.get_by_name("post_queue")
+        post_queue.get_static_pad = lambda _name: None  # type: ignore[method-assign]
+        pad = FakePad("src_0")
+        pad_cb(decodebin, pad)
+        assert pad.linked_to is None
+
+    def test_pad_added_skips_when_post_queue_already_linked(self) -> None:
+        pipeline, decodebin, pad_cb = self._get_decodebin_pad_cb()
+        post_queue = pipeline.get_by_name("post_queue")
+        existing = FakePad("existing")
+        existing.link(post_queue.get_static_pad("sink"))
+        pad = FakePad("src_1")
+        pad_cb(decodebin, pad)
+        assert pad.linked_to is None
+
+    def test_pad_added_link_success_logs_info(self) -> None:
+        pipeline, decodebin, pad_cb = self._get_decodebin_pad_cb()
+        pad = FakePad("src_2")
+        pad_cb(decodebin, pad)
+        assert pad.linked_to is pipeline.get_by_name("post_queue").get_static_pad("sink")
+
+    def test_pad_added_noformat_swallowed(self) -> None:
+        """NOFORMAT / REFUSED are tolerated silently – they fall outside
+        the elif's "log error" path."""
+        pipeline, decodebin, pad_cb = self._get_decodebin_pad_cb()
+        pad = FakePad("src_nf", link_returns="noformat")
+        pad_cb(decodebin, pad)  # must not raise; no error log
+
+    def test_pad_added_other_failure_logs_error(self) -> None:
+        pipeline, decodebin, pad_cb = self._get_decodebin_pad_cb()
+        pad = FakePad("src_err", link_returns="some_other_failure")
+        pad_cb(decodebin, pad)
+
+
+class TestRtspElementAddedFailureArms:
+    """The element-added callback covers: factory=None early-return,
+    decoder-with-set_property-TypeError swallow, and unknown-klass
+    fall-through (no decoder branch)."""
+
+    def _get_element_cb(self):
+        from gi.repository import Gst  # noqa: F401
+
+        fake = make_fake_gst()
+        sink = FakeElement("shared_videosink")
+        with patch("gi.repository.Gst", fake):
+            pipeline = RtspInput().create_pipeline(
+                config={},
+                sink=sink,
+                build_overlay_tail=lambda *a: None,
+                prepare_sink=lambda: sink,
+            )
+        decodebin = pipeline.get_by_name("decodebin")
+        element_cb = next(cb for sig, cb in decodebin.signals if sig == "element-added")
+        return decodebin, element_cb
+
+    def test_element_added_factory_none_returns_early(self) -> None:
+        decodebin, element_cb = self._get_element_cb()
+        elem = FakeElement("weird")
+        elem.get_factory = lambda: None  # type: ignore[method-assign]
+        element_cb(decodebin, elem)  # must not raise
+
+    def test_element_added_unknown_klass_skips_decoder_props(self) -> None:
+        decodebin, element_cb = self._get_element_cb()
+        elem = FakeElement("typefind")
+
+        class _Factory:
+            @staticmethod
+            def get_metadata(key: str) -> str:
+                return "Generic" if key == "klass" else ""
+
+            @staticmethod
+            def get_name() -> str:
+                return "typefind"
+
+        elem.get_factory = lambda: _Factory()  # type: ignore[method-assign]
+        element_cb(decodebin, elem)
+        assert "max-threads" not in elem.properties
+
+    def test_element_added_decoder_swallows_typeerror(self) -> None:
+        decodebin, element_cb = self._get_element_cb()
+        dec = FakeElement("v4l2h264dec")
+
+        def _raising(key: str, value: object) -> None:
+            raise TypeError(f"no property {key}")
+
+        dec.set_property = _raising  # type: ignore[method-assign]
+
+        class _Factory:
+            @staticmethod
+            def get_metadata(key: str) -> str:
+                return "Video/Decoder" if key == "klass" else ""
+
+            @staticmethod
+            def get_name() -> str:
+                return "v4l2h264dec"
+
+        dec.get_factory = lambda: _Factory()  # type: ignore[method-assign]
+        element_cb(decodebin, dec)  # must not raise
+
+
+class TestRtspCreatePipelineLinkFailures:
+    def test_post_queue_link_failure_raises(self) -> None:
+        from gi.repository import Gst  # noqa: F401
+
+        # Only one queue is created (post_queue), so failing all queue
+        # kinds breaks exactly that link.
+        fake = make_fake_gst(link_fail_kinds={"queue"})
+        sink = FakeElement("shared_videosink")
+        with patch("gi.repository.Gst", fake):
+            with pytest.raises(RuntimeError, match="post_queue"):
+                RtspInput().create_pipeline(
+                    config={},
+                    sink=sink,
+                    build_overlay_tail=lambda *a: None,
+                    prepare_sink=lambda: sink,
+                )
+
+
+class TestDecodebinElementAdded:
+    def test_sets_decoder_properties(self) -> None:
+        from gi.repository import Gst  # noqa: F401
+
+        fake = make_fake_gst()
+        sink = FakeElement("shared_videosink")
+        with patch("gi.repository.Gst", fake):
+            pipeline = RtspInput().create_pipeline(
+                config={},
+                sink=sink,
+                build_overlay_tail=lambda *a: None,
+                prepare_sink=lambda: sink,
+            )
+        decodebin = pipeline.get_by_name("decodebin")
+        element_cb = next(cb for sig, cb in decodebin.signals if sig == "element-added")
+
+        dec = FakeElement("v4l2h264dec")
+
+        class _Factory:
+            @staticmethod
+            def get_metadata(key: str) -> str:
+                return "Video/Decoder" if key == "klass" else ""
+
+            @staticmethod
+            def get_name() -> str:
+                return "v4l2h264dec"
+
+        dec.get_factory = lambda: _Factory()  # type: ignore[method-assign]
+        element_cb(decodebin, dec)
+
+        assert dec.properties.get("max-threads") == 2
+        assert dec.properties.get("output-corrupt") is False
+
+
+class TestOnBusAsyncDone:
+    def test_forces_zero_latency(self) -> None:
+        pipeline = FakePipeline("rtsp")
+        RtspInput().on_bus_async_done(pipeline)
+        assert pipeline.latency_values == [0]
+
+
+class TestGetSourceLabel:
+    def test_label_returns_url(self) -> None:
+        assert RtspInput.get_source_label({"rtsp_url": "rtsp://cam/stream"}) == "rtsp://cam/stream"
+
+
+# ---------------------------------------------------------------------------
+# source_endpoint – drives the diagnostics reachability section
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("rtsp://198.51.100.10:554/stream", ("198.51.100.10", 554)),
+        ("rtsp://cam.local/stream", ("cam.local", 554)),  # default port
+        ("cam.local:8554/stream", ("cam.local", 8554)),  # schemeless shorthand
+        ("rtsp://admin:pw@198.51.100.10:554/s", ("198.51.100.10", 554)),  # credentials ignored
+    ],
+)
+def test_source_endpoint_parses_a_configured_url(url: str, expected: tuple[str, int]) -> None:
+    endpoint = RtspInput.source_endpoint({"rtsp_url": url})
+    assert endpoint is not None
+    assert (endpoint.host, endpoint.port) == expected
+    assert endpoint.connection_oriented is True
+
+
+@pytest.mark.parametrize("url", ["rtsp://cam.local:notaport/s", "rtsp://cam.local:99999/s"])
+def test_source_endpoint_flags_an_unusable_port_instead_of_defaulting(url: str) -> None:
+    """An omitted port means "the default"; a malformed or out-of-range one
+    means the URL is unusable and GStreamer will fail on it. Substituting 554
+    would have diagnostics probe an endpoint the pipeline never opens."""
+    endpoint = RtspInput.source_endpoint({"rtsp_url": url})
+    assert endpoint is not None
+    assert endpoint.port == 0
+    assert "not a usable number" in endpoint.problem
+
+
+@pytest.mark.parametrize("url", ["", "   ", "rtsp://0.0.0.0:554/stream"])
+def test_source_endpoint_is_none_when_no_host_is_configured(url: str) -> None:
+    """The wildcard placeholder every URL field ships with names no host to
+    reach, so it has to read as unconfigured rather than as a failed address."""
+    assert RtspInput.source_endpoint({"rtsp_url": url}) is None
+
+
+class TestObserveProgress:
+    """RTSP is the one protocol whose middle step is observable: a camera that
+    connects then sends no media looks exactly like one never reached, and the
+    SDP arriving between the two is visible only to ``rtspsrc``."""
+
+    def _wire(self, *, pipeline=None) -> tuple[list, FakeElement]:
+        rtspsrc = FakeElement("rtspsrc")
+        pipeline = pipeline or FakePipeline("rtsp-sink")
+        pipeline.elements.append(rtspsrc)
+        reported: list = []
+        RtspInput().observe_progress(pipeline, reported.append)
+        return reported, rtspsrc
+
+    def test_the_sdp_is_what_gets_watched(self) -> None:
+        _reported, rtspsrc = self._wire()
+        assert [name for name, _cb in rtspsrc.signals] == ["on-sdp"]
+
+    def test_an_sdp_reports_the_server_answered_and_described_its_media(self) -> None:
+        from openfollow.video.failure import ConnectionPhase
+
+        reported, rtspsrc = self._wire()
+        _name, callback = rtspsrc.signals[0]
+        callback(rtspsrc, object())
+
+        assert reported == [ConnectionPhase.TRANSPORT_UP, ConnectionPhase.STREAM_DESCRIBED]
+
+    def test_nothing_is_reported_before_the_server_answers(self) -> None:
+        reported, _rtspsrc = self._wire()
+        assert reported == []
+
+    def test_a_pipeline_without_rtspsrc_is_survivable(self) -> None:
+        reported: list = []
+        RtspInput().observe_progress(FakePipeline("empty"), reported.append)
+        assert reported == []
+
+    def test_a_build_without_the_signal_is_survivable(self) -> None:
+        """Losing the detail must not cost the pipeline."""
+
+        class _NoSignals(FakeElement):
+            def connect(self, signal: str, callback: object) -> None:
+                raise TypeError("unknown signal")
+
+        pipeline = FakePipeline("rtsp-sink")
+        pipeline.elements.append(_NoSignals("rtspsrc"))
+        RtspInput().observe_progress(pipeline, lambda _phase: None)  # must not raise
+
+
+class TestRtspInterfacePin:
+    """rtspsrc can pin only its multicast membership; the rest is a route check."""
+
+    def test_a_pin_sets_the_multicast_membership(self) -> None:
+        src = TestRtspCredentials()._rtspsrc({"rtsp_url": "rtsp://192.0.2.20/stream", "video_input_iface": "eth1"})
+        assert src.properties["multicast-iface"] == "eth1"
+
+    @pytest.mark.parametrize("config", [{}, {"video_input_iface": ""}], ids=["absent", "blank"])
+    def test_no_membership_pin_without_a_pin(self, config: dict[str, object]) -> None:
+        src = TestRtspCredentials()._rtspsrc({"rtsp_url": "rtsp://192.0.2.20/stream", **config})
+        assert "multicast-iface" not in src.properties
+
+    def test_the_pin_is_a_config_field_the_panel_owns(self) -> None:
+        field = next(f for f in RtspInput.config_fields() if f.name == "video_input_iface")
+        assert field.device_editable is False
+        assert RtspInput.config_fields()[0].name == "rtsp_url"
+        assert RtspInput.pins_interface is True
+
+    def _asked(self, config: dict[str, object], monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+        from openfollow.video.inputs import rtsp
+
+        asked: list[tuple] = []
+        monkeypatch.setattr(rtsp, "check_video_pin", lambda *a, **kw: asked.append((a, kw)))
+        RtspInput.preflight(config)
+        return asked
+
+    def test_the_preflight_checks_the_routing_tables_choice(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """rtspsrc's sockets are never bound to a device, on any platform."""
+        asked = self._asked({"rtsp_url": "rtsp://192.0.2.20:8554/stream", "video_input_iface": "eth1"}, monkeypatch)
+        assert asked == [(("eth1", "192.0.2.20", 8554), {"forced_device": False})]
+
+    def test_a_url_with_no_host_checks_only_the_pin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        asked = self._asked({"rtsp_url": "", "video_input_iface": "eth1"}, monkeypatch)
+        assert asked == [(("eth1",), {})]

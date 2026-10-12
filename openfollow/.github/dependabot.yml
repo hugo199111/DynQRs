@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+# Dependabot config: weekly version-bump PRs for pip, GitHub Actions, pre-commit.
+# Complements pip-audit (which flags currently-vulnerable installed deps).
+version: 2
+updates:
+  # Python dependencies. The "pip" ecosystem understands Poetry projects
+  # (reads pyproject.toml + poetry.lock). Minor/patch bumps are grouped
+  # into a single PR per run to keep review noise down; major bumps still
+  # come as individual PRs so they get scrutinised on their own.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # Include indirect dependencies. By default Dependabot bumps only what
+    # pyproject.toml names, so a CVE in a transitive dependency produces no PR
+    # at all - which is how pillow and setuptools sat on known advisories for
+    # two months with both this and pip-audit switched on.
+    allow:
+      - dependency-type: "all"
+    labels:
+      - "dependencies"
+    groups:
+      python-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions used in .github/workflows. Near-zero noise; keeps the
+  # CI action versions current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+
+  # pre-commit hooks (.pre-commit-config.yaml). Only the hooks that bring their
+  # own tool are listed there; ruff and bandit run out of the poetry env, so
+  # they are pinned once in pyproject.toml and never appear here. Bumping a
+  # tool in both places at once is not possible: Dependabot treats pip and
+  # pre-commit as unrelated ecosystems and opens a separate PR for each, so a
+  # two-sided pin arrives as two PRs that each break the other's half.
+  - package-ecosystem: "pre-commit"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"

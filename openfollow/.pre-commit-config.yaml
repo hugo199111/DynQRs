@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+# Pre-commit hook config: ruff lint/format, bandit, whitespace/EOF fixers.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-toml
+
+  # ruff and bandit run the versions poetry installed, so the hook and
+  # `make lint` / `make security` cannot disagree about a clean tree. A `rev:`
+  # here would be a second pin of a tool pyproject already pins, and Dependabot
+  # bumps the two as unrelated ecosystems, one PR each.
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: poetry run ruff check --no-fix
+        language: system
+        types_or: [python, pyi]
+        files: ^(openfollow|tests)/
+
+      - id: ruff-format
+        name: ruff format
+        entry: poetry run ruff format --check
+        language: system
+        types_or: [python, pyi]
+        files: ^(openfollow|tests)/
+
+      # Config in [tool.bandit] in pyproject.toml.
+      - id: bandit
+        name: bandit
+        entry: poetry run bandit -c pyproject.toml
+        language: system
+        types: [python]
+        files: ^openfollow/.*\.py$

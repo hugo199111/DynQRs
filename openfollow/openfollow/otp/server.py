@@ -1,0 +1,1117 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+"""ANSI E1.59-2021 OTP (Object Transform Protocol) output server over UDP multicast."""
+
+from __future__ import annotations
+
+import contextlib
+import errno
+import logging
+import math
+import socket
+import struct
+import threading
+import time
+from collections.abc import Callable, Sequence
+from typing import NamedTuple
+from uuid import uuid4
+
+import multicast_expert
+
+from openfollow.packet_chunking import MAX_DATAGRAM_BYTES, chunk_to_datagrams
+from openfollow.psn.marker import Marker, marker_age_s
+
+logger = logging.getLogger(__name__)
+
+# Transient errno values (same as PsnServer, kept local to avoid coupling).
+_TRANSIENT_SEND_ERRNOS: frozenset[int] = frozenset(
+    {
+        errno.EADDRNOTAVAIL,
+        errno.ENETUNREACH,
+        errno.ENETDOWN,
+        errno.EHOSTDOWN,
+        errno.EHOSTUNREACH,
+    }
+)
+
+# E1.59 protocol constants (ANSI standard).
+OTP_PACKET_IDENTIFIER = b"OTP-E1.59\x00\x00\x00"
+
+# Vector types for OTP messages (2 octets per Table A-28).
+VECTOR_OTP_TRANSFORM_MESSAGE = 0x0001
+VECTOR_OTP_ADVERTISEMENT_MESSAGE = 0x0002
+VECTOR_OTP_POINT = 0x0001
+VECTOR_OTP_MODULE = 0x0001
+VECTOR_OTP_ADVERTISEMENT_MODULE = 0x0001
+VECTOR_OTP_ADVERTISEMENT_NAME = 0x0002
+VECTOR_OTP_ADVERTISEMENT_SYSTEM = 0x0003
+VECTOR_OTP_ADVERTISEMENT_MODULE_LIST = 0x0001
+VECTOR_OTP_ADVERTISEMENT_NAME_LIST = 0x0001
+VECTOR_OTP_ADVERTISEMENT_SYSTEM_LIST = 0x0001
+
+# ESTA Manufacturer ID and position module constant.
+ESTA_MANUFACTURER_ID = 0x0000
+MODULE_NUMBER_POSITION = 0x0001
+
+# Standard port and message limits.
+OTP_PORT = 5568
+COMPONENT_NAME_OCTETS = 32
+POINT_NAME_OCTETS = 32
+# Section 6.3.1. Equal to ``packet_chunking.MAX_DATAGRAM_BYTES`` because it is
+# the same rule reached from the other side: the standard caps a message at the
+# UDP payload an Ethernet MTU carries, so a legal message never fragments.
+MAX_OTP_MESSAGE_OCTETS = 1472
+
+# Page and Last Page are uint16 (Sections 6.8, 6.9).
+_MAX_FOLIO_LAST_PAGE = 0xFFFF
+
+# Timing: advertisements every 10s; transforms governed by fps (20-1000 Hz).
+ADVERTISEMENT_INTERVAL_S = 10.0
+
+# Meters to micrometers (Position Module transmission).
+_M_TO_UM = 1_000_000
+
+ADVERTISEMENT_MCAST_IP = "239.159.2.1"
+
+
+def transform_mcast_ip(system_number: int) -> str:
+    """Spec-mandated transform multicast address for a given System Number.
+
+    Table 15-19: ``239.159.1.<System Number>``. The System Number itself
+    must be 1–200 inclusive (Section 8.3); the caller (config layer)
+    enforces that – we just substitute.
+    """
+    return f"239.159.1.{system_number}"
+
+
+# Defaults preserved for backwards compatibility with code that imported
+# them. The "right" transform address is derived from system_number; this
+# default exists only so the OtpOutputConfig dataclass can field a value
+# during migration of existing config.toml files that still carry
+# ``mcast_ip = "239.159.1.0"``.
+DEFAULT_MCAST_IP = "239.159.1.1"
+DEFAULT_PORT = OTP_PORT
+
+_MAX_SOCKET_RETRIES = 3
+_SOCKET_RETRY_DELAY = 2.0  # seconds
+
+
+# ---------------------------------------------------------------------------
+# Encoding primitives
+# ---------------------------------------------------------------------------
+
+
+def _encode_fixed_name(name: str, octets: int) -> bytes:
+    """Encode ``name`` as exactly ``octets`` bytes of UTF-8.
+
+    Per Section 6.12 / 13.5.1: shorter names are null-padded; longer names
+    are truncated on a UTF-8 rune boundary, then null-padded back up to the
+    fixed width. The rune-boundary requirement matters because a naive
+    ``encoded[:octets]`` could split a multi-byte sequence and produce
+    invalid UTF-8 that a strict consumer would reject.
+    """
+    raw = name.encode("utf-8")
+    if len(raw) <= octets:
+        return raw + b"\x00" * (octets - len(raw))
+    # Walk back from the cut until we land on a non-continuation byte
+    # (continuation bytes are 0x80..0xBF in UTF-8).
+    cut = octets
+    while cut > 0 and (raw[cut] & 0xC0) == 0x80:
+        cut -= 1
+    return raw[:cut] + b"\x00" * (octets - cut)
+
+
+def _build_otp_layer(
+    *,
+    vector: int,
+    cid: bytes,
+    folio: int,
+    page: int,
+    last_page: int,
+    component_name: str,
+    inner_pdu: bytes,
+) -> bytes:
+    """Encode the OTP Layer (Table 6-3) wrapping ``inner_pdu``.
+
+    The Length field per Section 6.3 covers everything from octet 16
+    (Footer Options) through the end of the inner PDU – i.e. the whole
+    body excluding the Packet Identifier(12) + Vector(2) + Length(2) prefix.
+    """
+    if len(cid) != 16:
+        raise ValueError(f"CID must be 16 octets, got {len(cid)}")
+    body = (
+        b"\x00"  # Footer Options (Section 6.4)
+        b"\x00"  # Footer Length (Section 6.5) – no footer
+        + cid  # CID (Section 6.6)
+        + struct.pack("!I", folio & 0xFFFFFFFF)  # Folio Number (Section 6.7)
+        + struct.pack("!HH", page, last_page)  # Page / Last Page (Sections 6.8, 6.9)
+        + b"\x00"  # Options (Section 6.10) – reserved
+        + b"\x00\x00\x00\x00"  # Reserved (Section 6.11)
+        + _encode_fixed_name(component_name, COMPONENT_NAME_OCTETS)
+        + inner_pdu
+    )
+    return OTP_PACKET_IDENTIFIER + struct.pack("!HH", vector, len(body)) + body
+
+
+_INT32_MIN = -(2**31)
+_INT32_MAX = 2**31 - 1
+
+
+def _metres_to_um_i32(value: float) -> int:
+    """Metres → micrometres clamped to signed int32 (the OTP position field).
+
+    A non-finite (NaN/inf) or out-of-range position – bad calibration, a large
+    ``max_height``, or a tracking glitch – would otherwise raise
+    ``OverflowError`` / ``struct.error`` from ``int()`` / ``struct.pack`` and
+    silently kill the transform thread. Clamp instead so one bad value can't
+    take OTP output down."""
+    if not math.isfinite(value):
+        return 0
+    return max(_INT32_MIN, min(_INT32_MAX, int(value * _M_TO_UM)))
+
+
+def _build_position_module(x_um: int, y_um: int, z_um: int) -> bytes:
+    """Encode a Position Module PDU (Table 16-22).
+
+    Module Layer header (Table 10-13): Manufacturer ID(2) + Length(2) +
+    Module Number(2) + module-specific data. The Length field per Section
+    10.2 covers Module Number + data, i.e. everything after the Length
+    field itself.
+
+    Position Module data (Table 16-22): Options(1, bit 7 = mm scaling) +
+    X(int32) + Y(int32) + Z(int32). We always transmit µm (Options = 0).
+    """
+    options = 0x00  # bit 7 = 0 → values are µm; bit 7 = 1 would mean mm
+    data = struct.pack("!Bi i i", options, x_um, y_um, z_um)
+    after_length = struct.pack("!H", MODULE_NUMBER_POSITION) + data
+    return struct.pack("!HH", ESTA_MANUFACTURER_ID, len(after_length)) + after_length
+
+
+def _build_point_layer(
+    *,
+    priority: int,
+    group: int,
+    point: int,
+    sampled_timestamp_us: int,
+    module_pdus: bytes,
+) -> bytes:
+    """Encode a Point Layer (Table 9-12) wrapping one or more module PDUs.
+
+    Length per Section 9.2 excludes the Vector and Length fields themselves.
+    """
+    body = (
+        struct.pack("!B", priority & 0xFF)  # Priority (Section 9.3) – 0–200
+        + struct.pack("!H", group & 0xFFFF)  # Group Number (Section 9.4) – 1–60_000
+        + struct.pack("!I", point & 0xFFFFFFFF)  # Point Number (Section 9.5) – 1–4_000_000_000
+        + struct.pack("!Q", sampled_timestamp_us & 0xFFFFFFFFFFFFFFFF)
+        + b"\x00"  # Options (Section 9.7) – reserved
+        + b"\x00\x00\x00\x00"  # Reserved (Section 9.8)
+        + module_pdus
+    )
+    # Point Layer's own Vector identifies the contained Module PDUs
+    # (Table 9-12). VECTOR_OTP_POINT and VECTOR_OTP_MODULE share the
+    # value 0x0001 but mean different things at different layers.
+    return struct.pack("!HH", VECTOR_OTP_MODULE, len(body)) + body
+
+
+def _build_transform_pdu(
+    *,
+    system_number: int,
+    timestamp_us: int,
+    full_point_set: bool,
+    point_pdus: bytes,
+) -> bytes:
+    """Transform Layer (Table 8-11) wrapping point PDUs.
+
+    Section 8.5 – bit 7 of Options is the Full Point Set flag. Each Point
+    PDU in ``point_pdus`` is itself prefixed with its own Vector
+    (``VECTOR_OTP_POINT``) by ``_build_point_layer``; the Transform
+    Layer's own Vector is set by the OTP Layer above (which uses
+    ``VECTOR_OTP_TRANSFORM_MESSAGE`` to identify the Transform PDU it
+    carries).
+    """
+    options = 0x80 if full_point_set else 0x00
+    body = (
+        struct.pack("!B", system_number & 0xFF)
+        + struct.pack("!Q", timestamp_us & 0xFFFFFFFFFFFFFFFF)
+        + struct.pack("!B", options)
+        + b"\x00\x00\x00\x00"  # Reserved (Section 8.6)
+        + point_pdus
+    )
+    return struct.pack("!HH", VECTOR_OTP_POINT, len(body)) + body
+
+
+def _build_advertisement_pdu(
+    *,
+    advertisement_vector: int,
+    inner_pdu: bytes,
+) -> bytes:
+    """OTP Advertisement Layer (Table 11-14).
+
+    Carries one of: Module / Name / System Advertisement Layer, identified
+    by ``advertisement_vector`` (one of VECTOR_OTP_ADVERTISEMENT_*).
+    Reserved is 4 octets per Section 11.3.
+    """
+    body = b"\x00\x00\x00\x00" + inner_pdu  # Reserved(4) + inner
+    return struct.pack("!HH", advertisement_vector, len(body)) + body
+
+
+def _build_module_advertisement_layer(module_identifiers: list[tuple[int, int]]) -> bytes:
+    """OTP Module Advertisement Layer (Table 12-15).
+
+    Vector + Length + Reserved(4) + List<{ManufId(2), ModuleNumber(2)}>.
+
+    Section 12.4 specifies a flat, sorted list – there's no per-point
+    nesting and no timestamps. The list is sorted by ``(ManufId,
+    ModuleNumber)`` ascending.
+    """
+    sorted_ids = sorted(module_identifiers)
+    list_bytes = b"".join(struct.pack("!HH", m, n) for m, n in sorted_ids)
+    body = b"\x00\x00\x00\x00" + list_bytes
+    return struct.pack("!HH", VECTOR_OTP_ADVERTISEMENT_MODULE_LIST, len(body)) + body
+
+
+def _build_name_advertisement_layer(
+    *,
+    response: bool,
+    address_point_descriptions: list[tuple[int, int, int, str]],
+) -> bytes:
+    """OTP Name Advertisement Layer (Table 13-16, Figure 13-14).
+
+    Vector + Length + Options(1) + Reserved(4) + List<APD>.
+
+    Address Point Description (Figure 13-14): System(1) + Group(2) +
+    Point(4) + Name(32 octets UTF-8). The list is sorted by
+    ``(System, Group, Point)`` ascending per Section 13.5.
+
+    Section 13.3 – Options bit 7: 0 = request from a Consumer, 1 =
+    response from a Producer. We always send as ``response = True``
+    because we don't implement the request side.
+    """
+    sorted_apds = sorted(address_point_descriptions, key=lambda t: (t[0], t[1], t[2]))
+    list_bytes = b"".join(
+        struct.pack("!BHI", sys_n & 0xFF, grp & 0xFFFF, pt & 0xFFFFFFFF) + _encode_fixed_name(name, POINT_NAME_OCTETS)
+        for sys_n, grp, pt, name in sorted_apds
+    )
+    options = 0x80 if response else 0x00
+    body = struct.pack("!B", options) + b"\x00\x00\x00\x00" + list_bytes
+    return struct.pack("!HH", VECTOR_OTP_ADVERTISEMENT_NAME_LIST, len(body)) + body
+
+
+def _build_system_advertisement_layer(
+    *,
+    response: bool,
+    system_numbers: list[int],
+) -> bytes:
+    """OTP System Advertisement Layer (Table 14-17).
+
+    Vector + Length + Options(1) + Reserved(4) + List<System Number(1)>.
+
+    The list is sorted ascending per Section 14.5. Same Options
+    request/response convention as the Name layer.
+    """
+    sorted_systems = sorted(system_numbers)
+    list_bytes = bytes(s & 0xFF for s in sorted_systems)
+    options = 0x80 if response else 0x00
+    body = struct.pack("!B", options) + b"\x00\x00\x00\x00" + list_bytes
+    return struct.pack("!HH", VECTOR_OTP_ADVERTISEMENT_SYSTEM_LIST, len(body)) + body
+
+
+# ---------------------------------------------------------------------------
+# Top-level packet builders
+# ---------------------------------------------------------------------------
+
+
+def _check_message_length(packet: bytes, what: str) -> None:
+    """Enforce the Section 6.3.1 message cap on one page.
+
+    Callers that can span a folio split their points across pages so this never
+    fires; it stays as the backstop for a single page that cannot be divided
+    further, which no realistic point or name reaches.
+    """
+    if len(packet) > MAX_OTP_MESSAGE_OCTETS:
+        raise ValueError(
+            f"OTP {what} packet of {len(packet)} octets exceeds spec maximum "
+            f"of {MAX_OTP_MESSAGE_OCTETS} for a single page.",
+        )
+
+
+def encode_otp_transform_packet(
+    *,
+    cid: bytes,
+    component_name: str,
+    folio: int,
+    system_number: int,
+    timestamp_us: int,
+    markers: list[Marker],
+    priority: int,
+    group: int = 1,
+    page: int = 0,
+    last_page: int = 0,
+    now_us: int | None = None,
+    sampled_timestamp_us: int | None = None,
+    full_point_set: bool = True,
+) -> bytes:
+    """Build one page of an OTP Transform Message UDP payload.
+
+    Section 9.6 defines a Point's sampled timestamp as the moment the
+    Producer read that Point's transform, so each point carries its own:
+    ``timestamp_us`` less however long ago the marker was last written.
+    A marker the frame loop has stopped writing therefore stops ageing on
+    the wire while the Transform Layer's timestamp keeps advancing, which
+    is what lets a Consumer tell a live stream from a frozen one - this
+    thread transmits at full rate either way.
+
+    ``sampled_timestamp_us`` overrides that per-point derivation for every
+    point, for callers that have already sampled at a known instant.
+    """
+    # Collect into a list and ``b"".join(...)`` instead of ``+=`` on
+    # immutable bytes – at 60 Hz with N markers, repeated ``+=``
+    # allocates and copies in O(N²); join is O(N). Same pattern as
+    # ``openfollow/rttrpm/server.py``.
+    # One instant for every point, so they age against the same reference. A
+    # caller spanning several pages passes the folio's, since the pages share a
+    # Transform Layer timestamp.
+    if now_us is None:
+        now_us = markers[0].clock_now_us if markers else 0
+    point_pdu_parts: list[bytes] = []
+    for marker in markers:
+        x, y, z = marker.pos
+        x_um = _metres_to_um_i32(x)
+        y_um = _metres_to_um_i32(y)
+        z_um = _metres_to_um_i32(z)
+        if sampled_timestamp_us is not None:
+            sampled = sampled_timestamp_us
+        else:
+            # Clamped both ways: a Consumer reads ``transform - sampled`` on an
+            # unsigned field, so an age past the packet timestamp (or a negative
+            # one, from a write landing mid-build) would underflow it. An
+            # unknowable age is infinite, which ``int()`` refuses outright.
+            age_us = marker_age_s(marker, now_us=now_us) * 1_000_000.0
+            if not math.isfinite(age_us):
+                sampled = 0
+            else:
+                sampled = min(timestamp_us, max(0, timestamp_us - int(age_us)))
+        # OTP point numbers start at 1 (Section 9.5). Project convention
+        # reserves marker_id 0 as "ignored", so marker_id 1 maps directly
+        # to point 1 – no +1 offset needed any more.
+        point_pdu_parts.append(
+            _build_point_layer(
+                priority=priority,
+                group=group,
+                point=marker.marker_id,
+                sampled_timestamp_us=sampled,
+                module_pdus=_build_position_module(x_um, y_um, z_um),
+            )
+        )
+    transform = _build_transform_pdu(
+        system_number=system_number,
+        timestamp_us=timestamp_us,
+        full_point_set=full_point_set,
+        point_pdus=b"".join(point_pdu_parts),
+    )
+    packet = _build_otp_layer(
+        vector=VECTOR_OTP_TRANSFORM_MESSAGE,
+        cid=cid,
+        folio=folio,
+        page=page,
+        last_page=last_page,
+        component_name=component_name,
+        inner_pdu=transform,
+    )
+    _check_message_length(packet, "transform")
+    return packet
+
+
+def encode_otp_module_advertisement_packet(
+    *,
+    cid: bytes,
+    component_name: str,
+    folio: int,
+) -> bytes:
+    """Build a complete OTP Module Advertisement Message UDP payload.
+
+    Per Section 7.4.2 this layer is normally sent by *Consumers* declaring
+    which modules they want to receive. We emit it as a producer for
+    interoperability and discoverability – compliant consumers tolerate it
+    and use it for status/diagnostics. We advertise the single module we
+    populate (Standard Position).
+    """
+    module_layer = _build_module_advertisement_layer(
+        module_identifiers=[(ESTA_MANUFACTURER_ID, MODULE_NUMBER_POSITION)],
+    )
+    advertisement = _build_advertisement_pdu(
+        advertisement_vector=VECTOR_OTP_ADVERTISEMENT_MODULE,
+        inner_pdu=module_layer,
+    )
+    return _build_otp_layer(
+        vector=VECTOR_OTP_ADVERTISEMENT_MESSAGE,
+        cid=cid,
+        folio=folio,
+        page=0,
+        last_page=0,
+        component_name=component_name,
+        inner_pdu=advertisement,
+    )
+
+
+def encode_otp_name_advertisement_packet(
+    *,
+    cid: bytes,
+    component_name: str,
+    folio: int,
+    system_number: int,
+    markers: list[Marker],
+    group: int = 1,
+    page: int = 0,
+    last_page: int = 0,
+) -> bytes:
+    """Build one page of an OTP Name Advertisement Message UDP payload."""
+    apds = [(system_number, group, marker.marker_id, marker.name) for marker in markers]
+    name_layer = _build_name_advertisement_layer(
+        response=True,
+        address_point_descriptions=apds,
+    )
+    advertisement = _build_advertisement_pdu(
+        advertisement_vector=VECTOR_OTP_ADVERTISEMENT_NAME,
+        inner_pdu=name_layer,
+    )
+    packet = _build_otp_layer(
+        vector=VECTOR_OTP_ADVERTISEMENT_MESSAGE,
+        cid=cid,
+        folio=folio,
+        page=page,
+        last_page=last_page,
+        component_name=component_name,
+        inner_pdu=advertisement,
+    )
+    _check_message_length(packet, "name advertisement")
+    return packet
+
+
+def encode_otp_system_advertisement_packet(
+    *,
+    cid: bytes,
+    component_name: str,
+    folio: int,
+    system_number: int,
+) -> bytes:
+    """Build a complete OTP System Advertisement Message UDP payload."""
+    system_layer = _build_system_advertisement_layer(
+        response=True,
+        system_numbers=[system_number],
+    )
+    advertisement = _build_advertisement_pdu(
+        advertisement_vector=VECTOR_OTP_ADVERTISEMENT_SYSTEM,
+        inner_pdu=system_layer,
+    )
+    return _build_otp_layer(
+        vector=VECTOR_OTP_ADVERTISEMENT_MESSAGE,
+        cid=cid,
+        folio=folio,
+        page=0,
+        last_page=0,
+        component_name=component_name,
+        inner_pdu=advertisement,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OtpServer
+# ---------------------------------------------------------------------------
+
+
+class _ComponentIdentity(NamedTuple):
+    """Who a folio says it came from – constant across its pages."""
+
+    name: str
+    system_number: int
+    priority: int
+
+
+class OtpServer:
+    """Sends ANSI E1.59 OTP marker position data via multicast UDP.
+
+    Multicast destinations are derived from the configured System Number
+    per Table 15-19:
+        Transform packets:     ``239.159.1.<system_number>``
+        Advertisement packets: ``239.159.2.1``
+
+    Accepts references to existing ``Marker`` objects (from
+    ``openfollow.psn.marker``) so PSN and OTP share position state
+    without duplication.
+
+    Two background threads:
+    - Transform thread (``fps`` Hz, default 60): position data.
+    - Advertisement thread (every ``ADVERTISEMENT_INTERVAL_S`` = 10s):
+      Module + Name + System advertisement PDUs.
+
+    The ``mcast_ip`` constructor argument is **test-only**. Production
+    callers should never pass it – when it's left as the default
+    ``None``, addresses are derived per spec from ``system_number``. An
+    empty string selects the unicast/loopback debug branch (used by
+    ``tests/test_otp.py::TestOtpUnicastStart``); any other string forces
+    every packet (transform and advertisement) to that address, which is
+    only useful when capturing into a single recv-buffer for a test.
+    """
+
+    def __init__(
+        self,
+        system_name: str = "OpenFollow",
+        system_number: int = 1,
+        port: int = OTP_PORT,
+        source_ip: str = "",
+        fps: float = 60.0,
+        priority: int = 100,
+        *,
+        mcast_ip: str | None = None,
+        source_iface: str = "",
+    ) -> None:
+        self._system_name = system_name
+        self._system_number = system_number
+        self._port = port
+        self._source_ip = source_ip.strip()
+        self._source_iface = source_iface.strip()
+        self._fps = fps
+        self._priority = priority
+
+        self._mcast_ip_override = mcast_ip
+        self._transform_dest, self._advertisement_dest = self._resolve_destinations()
+        # Kept for backwards-compat with services.py snapshot/rollback path
+        # and existing tests that read `_mcast_ip`. None is the spec-derived
+        # mode; "" is unicast; otherwise it's an explicit override.
+        self._mcast_ip: str = "" if mcast_ip == "" else self._transform_dest
+
+        # Unique component identifier per Section 6.6 (UUID, RFC 4122).
+        self._cid: bytes = uuid4().bytes
+
+        # Shared marker references (keyed by marker_id)
+        self._markers: dict[int, Marker] = {}
+        self._lock = threading.Lock()
+
+        # Section 6.7 – separate Folio counters per advertisement type and
+        # per system for transforms. We only emit one system, so a single
+        # transform counter suffices.
+        self._transform_folio: int = 0
+        self._module_adv_folio: int = 0
+        self._name_adv_folio: int = 0
+        self._system_adv_folio: int = 0
+
+        # Relative timestamp origin (µs, from time.monotonic).
+        self._start_time_us: int = int(time.monotonic() * 1_000_000)
+
+        self._stop_event = threading.Event()
+        self._socket: multicast_expert.McastTxSocket | socket.socket | None = None
+        self._exit_stack: contextlib.ExitStack = contextlib.ExitStack()
+        self._transform_thread: threading.Thread | None = None
+        self._adv_thread: threading.Thread | None = None
+        self._socket_thread: threading.Thread | None = None
+        self._send_errors: int = 0
+        self._send_total: int = 0
+        # Counter for dropped folios: one needing more pages than Last Page
+        # can number, or one whose pages will not encode. Neither is reachable
+        # by configuration, but without throttling either would flood the log
+        # at the transform fps. Same first-5-then-every-100 pattern ``_send``
+        # uses for OSError logging.
+        self._oversize_drops: int = 0
+
+    def _resolve_destinations(self) -> tuple[str, str]:
+        """Compute (transform_dest, advertisement_dest) for current config."""
+        override = self._mcast_ip_override
+        if override is None:
+            return transform_mcast_ip(self._system_number), ADVERTISEMENT_MCAST_IP
+        if override == "":
+            # Unicast/loopback mode – both streams go to localhost. Tests
+            # that exercise the non-multicast socket path rely on this.
+            return "127.0.0.1", "127.0.0.1"
+        return override, override
+
+    # -- Marker management ---------------------------------------------------
+
+    def register_marker(self, marker: Marker) -> None:
+        """Register an existing Marker reference for OTP output."""
+        with self._lock:
+            self._markers[marker.marker_id] = marker
+
+    def unregister_marker(self, marker_id: int) -> None:
+        """Remove a marker from OTP output (no-op if absent)."""
+        with self._lock:
+            self._markers.pop(marker_id, None)
+
+    def get_marker(self, marker_id: int) -> Marker | None:
+        """Return a registered marker by ID, or ``None``."""
+        with self._lock:
+            return self._markers.get(marker_id)
+
+    # -- Lifecycle ------------------------------------------------------------
+
+    def start(self) -> None:
+        """Open the network socket and start transform + advertisement threads."""
+        # One stop signal per generation – see ``PsnServer.start()``.
+        stop_event = threading.Event()
+        self._stop_event = stop_event
+        self._exit_stack = contextlib.ExitStack()
+        if self._is_multicast_mode():
+            if not self._try_open_multicast_socket_once(attempt=1):
+                self._socket_thread = threading.Thread(
+                    target=self._retry_multicast_socket_background,
+                    args=(stop_event,),
+                    daemon=True,
+                    name="OTP-SocketRetry",
+                )
+                self._socket_thread.start()
+        else:
+            self._socket = self._exit_stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+        self._adv_thread = threading.Thread(
+            target=self._advertisement_loop, args=(stop_event,), daemon=True, name="OTP-Advertisement"
+        )
+        self._transform_thread = threading.Thread(
+            target=self._transform_loop, args=(stop_event,), daemon=True, name="OTP-Transform"
+        )
+        # Start advertisement first so receivers see module info before data.
+        self._adv_thread.start()
+        self._transform_thread.start()
+
+    def _resolve_stop(self, stop_event: threading.Event | None) -> threading.Event:
+        """The caller's generation event; the live one for direct calls."""
+        return self._stop_event if stop_event is None else stop_event
+
+    def _is_multicast_mode(self) -> bool:
+        """True unless the test-only unicast/loopback branch is active."""
+        return self._mcast_ip_override != ""
+
+    def bound_source_ip(self) -> str | None:
+        """Address this server is sending from, or ``None`` when stopped."""
+        if self._stop_event.is_set() or self._transform_thread is None:
+            return None
+        return self._source_ip
+
+    def stop(self) -> None:
+        """Signal threads to stop, wait for them, then close the socket."""
+        self._stop_event.set()
+        if self._socket_thread is not None:
+            self._socket_thread.join(timeout=_SOCKET_RETRY_DELAY + 1.0)
+            if self._socket_thread.is_alive():
+                logger.warning("OTP socket-retry thread did not stop within timeout")
+            self._socket_thread = None
+        if self._transform_thread is not None:
+            self._transform_thread.join(timeout=1.0)
+            if self._transform_thread.is_alive():
+                logger.warning("OTP transform thread did not stop within timeout")
+            self._transform_thread = None
+        if self._adv_thread is not None:
+            self._adv_thread.join(timeout=2.0)
+            if self._adv_thread.is_alive():
+                logger.warning("OTP advertisement thread did not stop within timeout")
+            self._adv_thread = None
+        # Null the socket and take the stack under the lock so a socket thread
+        # can't adopt a socket into a stack that teardown is closing. Close it
+        # outside the lock to avoid stalling a send loop on the FD close.
+        with self._lock:
+            self._socket = None
+            stack = self._exit_stack
+        stack.close()
+
+    def restart(
+        self,
+        *,
+        system_name: str,
+        system_number: int,
+        port: int,
+        source_ip: str,
+        priority: int,
+        source_iface: str = "",
+    ) -> None:
+        """Stop, reconfigure, and restart in place.
+
+        Marker registrations survive – only the UDP socket and worker
+        threads recycle. Used by ``apply_otp_output_change`` to apply ``otp_output.*`` edits without a process restart.
+
+        Raises ``OSError`` when the multicast socket can't be opened
+        synchronously on the new interface – ``start()`` itself spawns a
+        daemon retry thread instead, which is the right behaviour at boot
+        but the wrong one for live-apply, where the dispatcher needs a
+        hard signal to revert ``app._config.otp_output``. We tear back
+        down before raising so the retry thread doesn't keep poking at a
+        stale config.
+        """
+        self.stop()
+        # Locked because stop() logs and continues past a send thread that
+        # outlived its join, and that survivor reads the identity under it.
+        with self._lock:
+            self._system_name = system_name
+            self._system_number = system_number
+            self._port = port
+            self._source_ip = source_ip.strip()
+            self._source_iface = source_iface.strip()
+            self._priority = priority
+            # Recompute destinations for the new system_number.
+            self._transform_dest, self._advertisement_dest = self._resolve_destinations()
+            if self._mcast_ip_override is None:
+                self._mcast_ip = self._transform_dest
+        self.start()
+        if self._is_multicast_mode() and self._socket is None:
+            self.stop()
+            raise OSError(
+                f"OTP failed to open multicast socket for system_number="
+                f"{self._system_number} (transform={self._transform_dest!r}, "
+                f"advertisement={self._advertisement_dest!r}, "
+                f"source_ip={self._source_ip!r})",
+            )
+
+    def update_system_name(self, name: str) -> None:
+        """Update the human-readable system name carried in OTP Layer's
+        Component Name field (Section 6.12).
+
+        Live-applied without a socket restart, mirroring ``PsnServer``.
+        """
+        with self._lock:
+            self._system_name = name
+
+    def __enter__(self) -> OtpServer:
+        self.start()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.stop()
+
+    # -- Socket helpers -------------------------------------------------------
+
+    def _multicast_groups(self) -> list[str]:
+        """Multicast groups this socket needs to send to.
+
+        Production: transform group + advertisement group. Test override:
+        a single forced address. ``McastTxSocket`` sets the right outgoing
+        interface for each group on each ``sendto``.
+        """
+        override = self._mcast_ip_override
+        # Mypy can't narrow ``str | None not in (None, "")`` automatically,
+        # so check both predicates explicitly to keep the str-only branch.
+        if override is not None and override != "":
+            return [override]
+        return [self._transform_dest, self._advertisement_dest]
+
+    def _try_open_multicast_socket_once(self, attempt: int, stop_event: threading.Event | None = None) -> bool:
+        """Attempt to create the multicast TX socket once. Returns True on success."""
+        staging = contextlib.ExitStack()
+        try:
+            groups = self._multicast_groups()
+            if self._source_iface:
+                # By name: selected by index, as PsnServer does.
+                sock = multicast_expert.McastTxSocket(
+                    socket.AF_INET,
+                    mcast_ips=groups,
+                    iface=self._source_iface,
+                    enable_external_loopback=True,
+                )
+            elif self._source_ip:
+                sock = multicast_expert.McastTxSocket(
+                    socket.AF_INET,
+                    mcast_ips=groups,
+                    iface_ip=self._source_ip,
+                    enable_external_loopback=True,
+                )
+            else:
+                sock = multicast_expert.McastTxSocket(
+                    socket.AF_INET,
+                    mcast_ips=groups,
+                    enable_external_loopback=True,
+                )
+            opened = staging.enter_context(sock)
+        except Exception as exc:
+            logger.warning(
+                "OTP multicast socket failed (attempt %d/%d): %s",
+                attempt,
+                _MAX_SOCKET_RETRIES,
+                exc,
+            )
+            return False
+        # Locked hand-over only, off-lock open. See PsnServer for the rationale.
+        with self._lock:
+            if not self._resolve_stop(stop_event).is_set():
+                self._socket = opened
+                self._exit_stack.push(staging.pop_all())
+                return True
+            stale = staging.pop_all()
+        stale.close()
+        return False
+
+    def _retry_multicast_socket_background(self, stop_event: threading.Event | None = None) -> None:
+        """Retry multicast socket creation in the background (bounded)."""
+        stop = self._resolve_stop(stop_event)
+        for attempt in range(2, _MAX_SOCKET_RETRIES + 1):
+            stop.wait(_SOCKET_RETRY_DELAY)
+            if stop.is_set():
+                return
+            if self._try_open_multicast_socket_once(attempt=attempt, stop_event=stop):
+                logger.info(
+                    "OTP multicast socket connected on retry %d/%d.",
+                    attempt,
+                    _MAX_SOCKET_RETRIES,
+                )
+                return
+        logger.error(
+            "OTP multicast socket failed after %d attempts. OTP output disabled – check your network interface IP.",
+            _MAX_SOCKET_RETRIES,
+        )
+
+    def _recover_multicast_socket_background(self, stop_event: threading.Event | None = None) -> None:
+        """Re-open the multicast socket indefinitely after a transient
+        send failure. See ``PsnServer._recover_multicast_socket_background``
+        for the same rationale.
+        """
+        stop = self._resolve_stop(stop_event)
+        attempt = 0
+        while not stop.is_set():
+            attempt += 1
+            stop.wait(_SOCKET_RETRY_DELAY)
+            if stop.is_set():
+                return
+            if self._try_open_multicast_socket_once(attempt=attempt, stop_event=stop):
+                logger.info("OTP multicast socket recovered on attempt %d.", attempt)
+                return
+
+    def _handle_send_error(self, exc: OSError, stop_event: threading.Event | None = None) -> None:
+        """On a transient interface-change error, rebuild the socket in the background."""
+        # Once stopping, teardown owns the socket/exit-stack lifecycle: a recovery
+        # thread spawned here is orphaned (stop() may already have passed the
+        # socket-thread join) and could open a SECOND multicast socket racing the
+        # fresh server – clobbering self._socket and leaking the FD. The caller's
+        # own generation decides, so a send failing on a superseded one can't tear
+        # down the live socket. Mirrors PsnServer.
+        stop = self._resolve_stop(stop_event)
+        if stop.is_set():
+            return
+        if exc.errno not in _TRANSIENT_SEND_ERRNOS:
+            return
+        # Unicast mode has no multicast socket to rebuild – the recovery
+        # helper would call _try_open_multicast_socket_once with no
+        # multicast groups and permanently disable output. Unicast UDP is
+        # connectionless, so the next send will simply try again.
+        if not self._is_multicast_mode():
+            return
+        with self._lock:
+            # Re-check under the lock: stop() sets the event before tearing the
+            # socket/exit-stack down, so spawn and teardown observe one consistent
+            # stop state rather than a stale pre-lock read.
+            if stop.is_set():
+                return
+            if self._socket_thread is not None and self._socket_thread.is_alive():
+                return
+            old_stack = self._exit_stack
+            self._socket = None
+            self._exit_stack = contextlib.ExitStack()
+            self._socket_thread = threading.Thread(
+                target=self._recover_multicast_socket_background,
+                args=(stop,),
+                daemon=True,
+                name="OTP-SocketRecover",
+            )
+            self._socket_thread.start()
+        try:
+            old_stack.close()
+        except Exception:
+            logger.exception("OTP: closing stale socket stack failed")
+
+    # -- Send loops -----------------------------------------------------------
+
+    def _transform_loop(self, stop_event: threading.Event | None = None) -> None:
+        stop = self._resolve_stop(stop_event)
+        interval = 1.0 / self._fps
+        while not stop.is_set():
+            self._send_transform_packet(stop)
+            stop.wait(interval)
+
+    def _advertisement_loop(self, stop_event: threading.Event | None = None) -> None:
+        stop = self._resolve_stop(stop_event)
+        while not stop.is_set():
+            self._send_advertisement_packets(stop)
+            stop.wait(ADVERTISEMENT_INTERVAL_S)
+
+    def _snapshot_identity(self) -> tuple[_ComponentIdentity, list[Marker]]:
+        """Return the Component identity and the marker list from one lock hold.
+
+        Every identity field sits outside the split point list, so Sections
+        6.7-6.9 have it repeat verbatim on every page. Callers must bind the
+        result to locals and encode from those: reading an attribute inside a
+        per-page closure is what lets ``restart`` split one folio across two
+        identities.
+        """
+        with self._lock:
+            identity = _ComponentIdentity(self._system_name, self._system_number, self._priority)
+            return identity, list(self._markers.values())
+
+    def _next_folio(self, name: str) -> int:
+        attr = f"_{name}_folio"
+        # ``getattr`` returns Any for dynamic lookup; cast through ``int()``
+        # so mypy can keep the declared return type. All four counters
+        # are typed ``int`` at __init__ time.
+        value = int(getattr(self, attr))
+        setattr(self, attr, (value + 1) & 0xFFFFFFFF)
+        return value
+
+    def _current_timestamp(self) -> int:
+        return int(time.monotonic() * 1_000_000) - self._start_time_us
+
+    def _send_folio(
+        self,
+        markers: list[Marker],
+        encode: Callable[[Sequence[Marker], int, int], bytes],
+        dest_ip: str,
+        what: str,
+        stop_event: threading.Event | None,
+    ) -> None:
+        """Send one folio, spread over Pages when it exceeds the MTU.
+
+        Sections 6.7-6.9: pages of one folio share its Folio Number and each
+        names the folio's last page, which is what a Consumer collects them on.
+        Everything outside the split list is repeated verbatim on every page,
+        the Transform Layer's Full Point Set flag included – it describes the
+        folio, so a page that contradicted its siblings would describe no
+        coherent point set at all.
+
+        Every page is encoded before any is sent: a folio that half-arrives
+        leaves a Consumer waiting on pages that will never come, which is worse
+        than the frame simply not being there.
+        """
+        try:
+            payloads = self._encode_folio(markers, encode, what)
+        except ValueError:
+            # Section 6.3.1 rejects a page that cannot be made legal. Unhandled,
+            # that propagates out of the send thread and ends this output for
+            # the life of the process; drop the folio and keep transmitting.
+            drops = self._note_folio_drop()
+            if drops <= 5 or drops % 100 == 0:
+                logger.exception("OTP %s folio dropped (%d drops): page could not be encoded", what, drops)
+            return
+        for payload in payloads:
+            self._send(payload, dest_ip, stop_event)
+
+    def _encode_folio(
+        self,
+        markers: list[Marker],
+        encode: Callable[[Sequence[Marker], int, int], bytes],
+        what: str,
+    ) -> list[bytes]:
+        """Encode a folio as one page, or as the pages it needs."""
+        try:
+            return [encode(markers, 0, 0)]
+        except ValueError:
+            pass  # Over the Section 6.3.1 page cap – it needs paging.
+        pages = chunk_to_datagrams(markers, lambda subset: len(encode(subset, 0, 0)), MAX_DATAGRAM_BYTES)
+        if len(pages) - 1 > _MAX_FOLIO_LAST_PAGE:
+            drops = self._note_folio_drop()
+            if drops <= 5 or drops % 100 == 0:
+                logger.warning(
+                    "OTP %s folio needs %d pages, capped at %d (%d drops) – markers beyond the cap are not sent",
+                    what,
+                    len(pages),
+                    _MAX_FOLIO_LAST_PAGE + 1,
+                    drops,
+                )
+            pages = pages[: _MAX_FOLIO_LAST_PAGE + 1]
+        last_page = len(pages) - 1
+        return [encode(page_markers, page, last_page) for page, page_markers in enumerate(pages)]
+
+    def _note_folio_drop(self) -> int:
+        """Count a dropped folio and return the running total."""
+        with self._lock:
+            self._oversize_drops += 1
+            return self._oversize_drops
+
+    def _send_transform_packet(self, stop_event: threading.Event | None = None) -> None:
+        # Bound to locals, never re-read per page: the identity describes the
+        # folio, so a page contradicting its siblings describes no point set.
+        identity, markers = self._snapshot_identity()
+        if not markers:
+            return
+        folio = self._next_folio("transform")
+        timestamp_us = self._current_timestamp()
+        # Read once for the folio, not once per page: the pages share a
+        # Transform Layer timestamp, so ageing them against different instants
+        # would report identically-fresh points as different ages.
+        now_us = markers[0].clock_now_us
+
+        def encode(page_markers: Sequence[Marker], page: int, last_page: int) -> bytes:
+            return encode_otp_transform_packet(
+                cid=self._cid,
+                component_name=identity.name,
+                folio=folio,
+                system_number=identity.system_number,
+                timestamp_us=timestamp_us,
+                markers=list(page_markers),
+                priority=identity.priority,
+                page=page,
+                last_page=last_page,
+                now_us=now_us,
+            )
+
+        self._send_folio(markers, encode, self._transform_dest, "transform", stop_event)
+
+    def _send_advertisement_packets(self, stop_event: threading.Event | None = None) -> None:
+        """Send Module, Name, and System advertisement packets in sequence."""
+        identity, markers = self._snapshot_identity()
+
+        if markers:
+            self._send(
+                encode_otp_module_advertisement_packet(
+                    cid=self._cid,
+                    component_name=identity.name,
+                    folio=self._next_folio("module_adv"),
+                ),
+                self._advertisement_dest,
+                stop_event,
+            )
+            name_folio = self._next_folio("name_adv")
+            # Section 13.5 wants one ascending list across the folio. Each page
+            # sorts what it is given, so the split has to cut an already-sorted
+            # list - registration order is the operator's, not ascending.
+            by_point = sorted(markers, key=lambda marker: marker.marker_id)
+
+            def encode_names(page_markers: Sequence[Marker], page: int, last_page: int) -> bytes:
+                return encode_otp_name_advertisement_packet(
+                    cid=self._cid,
+                    component_name=identity.name,
+                    folio=name_folio,
+                    system_number=identity.system_number,
+                    markers=list(page_markers),
+                    page=page,
+                    last_page=last_page,
+                )
+
+            self._send_folio(by_point, encode_names, self._advertisement_dest, "name advertisement", stop_event)
+
+        self._send(
+            encode_otp_system_advertisement_packet(
+                cid=self._cid,
+                component_name=identity.name,
+                folio=self._next_folio("system_adv"),
+                system_number=identity.system_number,
+            ),
+            self._advertisement_dest,
+            stop_event,
+        )
+
+    def _send(self, data: bytes, dest_ip: str, stop_event: threading.Event | None = None) -> None:
+        # Deliberately unlocked: locking would serialise every datagram behind
+        # the socket hand-over. A send racing teardown sends, returns, or fails.
+        sock = self._socket
+        if sock is None:
+            return
+        with self._lock:
+            self._send_total += 1
+        try:
+            sock.sendto(data, (dest_ip, self._port))
+        except OSError as exc:
+            with self._lock:
+                self._send_errors += 1
+                errors = self._send_errors
+                total = self._send_total
+            if errors <= 5 or errors % 100 == 0:
+                logger.warning(
+                    "OTP send failed (%d/%d errors): %s",
+                    errors,
+                    total,
+                    exc,
+                )
+            self._handle_send_error(exc, stop_event)

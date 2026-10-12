@@ -1,0 +1,797 @@
+% from openfollow.units import UnitSystem, format_length, metric_echo, unit_suffix_length
+% _us = UnitSystem(config.ui.unit_system)
+% _imp = _us is UnitSystem.IMPERIAL
+% _len = unit_suffix_length(_us)
+%# Two independent top-level sections – same sibling-forms pattern as
+%# general.tpl and the surrounding movement.tpl / trigger_zones.tpl on
+%# the Markers & Zones tab. Each section is its own box; folding is
+%# per-section.
+%#
+%#   1. Marker Control & Visibility – standalone <section> (NOT a form).
+%#      Catalog + per-station selection write out-of-band via JS API
+%#      calls (/api/markers/catalog/<id>, /api/markers/selection), so
+%#      there's nothing to submit and no Save button. The wrapping
+%#      <section> intentionally has no ancestor form, which is also
+%#      why the polling div no longer inherits ``hx-target`` – but
+%#      ``hx-target="this"`` stays as defence in depth in case the
+%#      structure shifts again.
+%#
+%#   2. Marker Visuals – <form id="marker-section"> with the Style /
+%#      Cone / Body / Crosshair / Z Line / Ground Circle / Z Display
+%#      groups. Z Display is last because it shows in both styles: the
+%#      last visible group is what drops its bottom divider. Saves through /section/marker like every
+%#      other dataclass-driven section.
+
+%# ------------------------------------------------------------------
+%# Section 1: Marker Control & Visibility
+%# ------------------------------------------------------------------
+<section id="marker-control-visibility-section" class="section" data-fold-key="marker-control-visibility" data-help="marker-control-visibility" data-fold-default="expanded">
+    <div class="section-head">
+        <h2>Marker Control & Visibility</h2>
+        <span class="section-note">Shared catalog + this station's selection</span>
+    </div>
+    <div id="marker-catalog-root"
+         hx-get="/api/markers/catalog"
+         hx-trigger="load, every 1500ms"
+         hx-target="this"
+         hx-swap="none">
+        Loading…
+    </div>
+</section>
+
+%# ------------------------------------------------------------------
+%# Section 2: Marker Visuals
+%# ------------------------------------------------------------------
+% _style = config.marker.marker_style
+<form id="marker-section" class="section {{'saved' if defined('saved') and saved else ''}}" data-fold-key="marker-visuals" data-help="marker-visuals" data-fold-default="expanded"
+      hx-post="/section/marker" hx-target="#marker-section" hx-swap="outerHTML" hx-trigger="submit">
+    <div class="section-head">
+        <h2>Marker Visuals</h2>
+        <span class="section-note">On-screen appearance of each marker</span>
+    </div>
+
+    <div class="group">
+        <h3 class="group-title">Style</h3>
+        <div class="fields-grid">
+            <div class="field">
+                <label>Marker Style</label>
+                <div class="seg-toggle" role="radiogroup" aria-label="Marker style">
+                    <label class="seg-option">
+                        <input type="radio" name="marker_style" value="crosshair" {{'checked' if config.marker.marker_style == 'crosshair' else ''}}>
+                        <span><strong>Crosshair</strong></span>
+                    </label>
+                    <label class="seg-option">
+                        <input type="radio" name="marker_style" value="cone" {{'checked' if config.marker.marker_style == 'cone' else ''}}>
+                        <span><strong>Cone</strong></span>
+                    </label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="group" data-style-only="cone" {{'' if _style == 'cone' else 'hidden'}}>
+        <h3 class="group-title">Cone</h3>
+        <div class="fields-grid">
+            <div class="field">
+                <label>Base Diameter ({{_len}})</label>
+                <input id="marker-cone-radius" type="{{'text' if _imp else 'number'}}" name="cone_base_diameter" value="{{format_length(config.marker.cone_base_diameter, _us) if _imp else config.marker.cone_base_diameter}}" min="0" step="any"
+                       hx-get="/api/validate/marker/cone_base_diameter" hx-trigger="blur changed delay:200ms"
+                       hx-target="#marker-cone-radius-error" hx-swap="innerHTML" hx-include="closest form"
+                       aria-describedby="marker-cone-radius-error" aria-invalid="false">
+                <span id="marker-cone-radius-error" class="field-error"></span>
+                % if _imp:
+                <small class="metric-echo">Stored: {{metric_echo(config.marker.cone_base_diameter)}}</small>
+                % end
+            </div>
+            <div class="field">
+                <label>Top Diameter ({{_len}})</label>
+                <input id="marker-cone-top-diameter" type="{{'text' if _imp else 'number'}}" name="cone_top_diameter" value="{{format_length(config.marker.cone_top_diameter, _us) if _imp else config.marker.cone_top_diameter}}" min="0" step="any"
+                       hx-get="/api/validate/marker/cone_top_diameter" hx-trigger="blur changed delay:200ms"
+                       hx-target="#marker-cone-top-diameter-error" hx-swap="innerHTML" hx-include="closest form"
+                       aria-describedby="marker-cone-top-diameter-error" aria-invalid="false">
+                <span id="marker-cone-top-diameter-error" class="field-error"></span>
+                % if _imp:
+                <small class="metric-echo">Stored: {{metric_echo(config.marker.cone_top_diameter)}}</small>
+                % end
+            </div>
+            <div class="field">
+                <label>Line Thickness (px)</label>
+                <input id="marker-cone-thickness" type="number" name="cone_thickness" value="{{config.marker.cone_thickness}}" min="1" max="10"
+                       hx-get="/api/validate/marker/cone_thickness" hx-trigger="blur changed delay:200ms"
+                       hx-target="#marker-cone-thickness-error" hx-swap="innerHTML" hx-include="closest form"
+                       aria-describedby="marker-cone-thickness-error" aria-invalid="false">
+                <span id="marker-cone-thickness-error" class="field-error"></span>
+            </div>
+            <div class="field checkbox-field">
+                <label for="marker-cone-filled">Cone fill</label>
+                <div class="checkbox-wrap checkbox-field inline">
+                    <input type="checkbox" id="marker-cone-filled" name="cone_filled" {{'checked' if config.marker.cone_filled else ''}}>
+                    <label for="marker-cone-filled">Fill the cone</label>
+                </div>
+            </div>
+            <div class="field">
+                <label>Fill Opacity (0–1)</label>
+                <input id="marker-cone-opacity" type="number" name="cone_opacity" value="{{config.marker.cone_opacity}}" min="0" max="1" step="any"
+                       hx-get="/api/validate/marker/cone_opacity" hx-trigger="blur changed delay:200ms"
+                       hx-target="#marker-cone-opacity-error" hx-swap="innerHTML" hx-include="closest form"
+                       aria-describedby="marker-cone-opacity-error" aria-invalid="false">
+                <span id="marker-cone-opacity-error" class="field-error"></span>
+            </div>
+            <div class="field checkbox-field">
+                <label for="marker-cone-shaded">Shading</label>
+                <div class="checkbox-wrap checkbox-field inline">
+                    <input type="checkbox" id="marker-cone-shaded" name="cone_shaded" {{'checked' if config.marker.cone_shaded else ''}}>
+                    <label for="marker-cone-shaded">Shade the cone</label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="group" data-style-only="crosshair" {{'' if _style == 'crosshair' else 'hidden'}}>
+        <h3 class="group-title">Body</h3>
+        <div class="fields-grid">
+            <div class="field checkbox-field">
+                <label for="marker-ball-visible">Ball</label>
+                <div class="checkbox-wrap checkbox-field inline">
+                    <input type="checkbox" id="marker-ball-visible" name="ball_visible" {{'checked' if config.marker.ball_visible else ''}}>
+                    <label for="marker-ball-visible">Show the ball</label>
+                </div>
+            </div>
+            <div class="field">
+                <label>Ball Size ({{_len}})</label>
+                <input id="marker-ball-size" type="{{'text' if _imp else 'number'}}" name="ball_size" value="{{format_length(config.marker.ball_size, _us) if _imp else config.marker.ball_size}}" min="0" step="any"
+                       hx-get="/api/validate/marker/ball_size" hx-trigger="blur changed delay:200ms"
+                       hx-target="#marker-ball-size-error" hx-swap="innerHTML" hx-include="closest form"
+                       aria-describedby="marker-ball-size-error" aria-invalid="false">
+                <span id="marker-ball-size-error" class="field-error"></span>
+                % if _imp:
+                <small class="metric-echo">Stored: {{metric_echo(config.marker.ball_size)}}</small>
+                % end
+            </div>
+            <div class="field">
+                <label>Opacity (0–1)</label>
+                <input id="marker-transparency" type="number" name="transparency" value="{{config.marker.transparency}}" min="0" max="1" step="any"
+                       hx-get="/api/validate/marker/transparency" hx-trigger="blur changed delay:200ms"
+                       hx-target="#marker-transparency-error" hx-swap="innerHTML" hx-include="closest form"
+                       aria-describedby="marker-transparency-error" aria-invalid="false">
+                <span id="marker-transparency-error" class="field-error"></span>
+            </div>
+        </div>
+    </div>
+
+    <div class="group" data-style-only="crosshair" {{'' if _style == 'crosshair' else 'hidden'}}>
+        <h3 class="group-title">Crosshair</h3>
+        <div class="fields-grid">
+            <div class="field checkbox-field">
+                <label for="marker-crosshair-visible">Crosshair</label>
+                <div class="checkbox-wrap checkbox-field inline">
+                    <input type="checkbox" id="marker-crosshair-visible" name="crosshair_visible" {{'checked' if config.marker.crosshair_visible else ''}}>
+                    <label for="marker-crosshair-visible">Show the crosshair</label>
+                </div>
+            </div>
+            <div class="field">
+                <label>Crosshair Size ({{_len}})</label>
+                <input id="marker-crosshair-size" type="{{'text' if _imp else 'number'}}" name="crosshair_size" value="{{format_length(config.marker.crosshair_size, _us) if _imp else config.marker.crosshair_size}}" min="0" step="any"
+                       hx-get="/api/validate/marker/crosshair_size" hx-trigger="blur changed delay:200ms"
+                       hx-target="#marker-crosshair-size-error" hx-swap="innerHTML" hx-include="closest form"
+                       aria-describedby="marker-crosshair-size-error" aria-invalid="false">
+                <span id="marker-crosshair-size-error" class="field-error"></span>
+                % if _imp:
+                <small class="metric-echo">Stored: {{metric_echo(config.marker.crosshair_size)}}</small>
+                % end
+            </div>
+            <div class="field">
+                <label>Crosshair Thickness (px)</label>
+                <input id="marker-crosshair-thickness" type="number" name="crosshair_thickness" value="{{config.marker.crosshair_thickness}}" min="1" max="10"
+                       hx-get="/api/validate/marker/crosshair_thickness" hx-trigger="blur changed delay:200ms"
+                       hx-target="#marker-crosshair-thickness-error" hx-swap="innerHTML" hx-include="closest form"
+                       aria-describedby="marker-crosshair-thickness-error" aria-invalid="false">
+                <span id="marker-crosshair-thickness-error" class="field-error"></span>
+            </div>
+            <div class="field">
+                <label>Crosshair Color</label>
+                %# Native picker replaced by circle-swatch greys-variant.
+                %# Hidden input carries form value; color-picker.js auto-attaches
+                %# via data-color-picker. Inline validator dropped (picker's hex
+                %# input enforces ^#?[0-9A-Fa-f]{6}$ client-side; form handler
+                %# validates server-side).
+                <button id="marker-crosshair-color" type="button" class="color-swatch-trigger"
+                        data-color-picker="greys" data-value="{{config.marker.crosshair_color}}"
+                        aria-label="Crosshair colour"></button>
+                <input type="hidden" name="crosshair_color" value="{{config.marker.crosshair_color}}">
+            </div>
+        </div>
+    </div>
+
+    <div class="group" data-style-only="crosshair" {{'' if _style == 'crosshair' else 'hidden'}}>
+        <h3 class="group-title">Z Line</h3>
+        <div class="fields-grid">
+            <div class="field checkbox-field">
+                <label for="marker-z-line-visible">Z Line</label>
+                <div class="checkbox-wrap checkbox-field inline">
+                    <input type="checkbox" id="marker-z-line-visible" name="z_line" {{'checked' if config.marker.z_line else ''}}>
+                    <label for="marker-z-line-visible">Show the Z Line</label>
+                </div>
+            </div>
+            <div class="field">
+                <label>Z Line Thickness (px)</label>
+                <input id="marker-z-line-thickness" type="number" name="z_line_thickness" value="{{config.marker.z_line_thickness}}" min="1" max="20"
+                       hx-get="/api/validate/marker/z_line_thickness" hx-trigger="blur changed delay:200ms"
+                       hx-target="#marker-z-line-thickness-error" hx-swap="innerHTML" hx-include="closest form"
+                       aria-describedby="marker-z-line-thickness-error" aria-invalid="false">
+                <span id="marker-z-line-thickness-error" class="field-error"></span>
+            </div>
+        </div>
+    </div>
+
+    <div class="group" data-style-only="crosshair" {{'' if _style == 'crosshair' else 'hidden'}}>
+        <h3 class="group-title">Ground Circle</h3>
+        <div class="fields-grid">
+            <div class="field checkbox-field">
+                <label for="marker-ground-circle-visible">Ground circle</label>
+                <div class="checkbox-wrap checkbox-field inline">
+                    <input type="checkbox" id="marker-ground-circle-visible" name="ground_circle" {{'checked' if config.marker.ground_circle else ''}}>
+                    <label for="marker-ground-circle-visible">Show the ground circle</label>
+                </div>
+            </div>
+            <div class="field">
+                <label>Circle Size ({{_len}})</label>
+                <input id="marker-ground-circle-size" type="{{'text' if _imp else 'number'}}" name="ground_circle_size" value="{{format_length(config.marker.ground_circle_size, _us) if _imp else config.marker.ground_circle_size}}" min="0" step="any"
+                       hx-get="/api/validate/marker/ground_circle_size" hx-trigger="blur changed delay:200ms"
+                       hx-target="#marker-ground-circle-size-error" hx-swap="innerHTML" hx-include="closest form"
+                       aria-describedby="marker-ground-circle-size-error" aria-invalid="false">
+                <span id="marker-ground-circle-size-error" class="field-error"></span>
+                % if _imp:
+                <small class="metric-echo">Stored: {{metric_echo(config.marker.ground_circle_size)}}</small>
+                % end
+            </div>
+            <div class="field checkbox-field">
+                <label for="marker-ground-circle-filled">Circle fill</label>
+                <div class="checkbox-wrap checkbox-field inline">
+                    <input type="checkbox" id="marker-ground-circle-filled" name="ground_circle_filled" {{'checked' if config.marker.ground_circle_filled else ''}}>
+                    <label for="marker-ground-circle-filled">Fill the ground circle</label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="group">
+        <h3 class="group-title">Z Display</h3>
+        <div class="fields-grid">
+            <div class="field span-2">
+                <label for="marker-z-display-from-stage">Z readout</label>
+                <select id="marker-z-display-from-stage" name="z_display_from_stage">
+                    <option value="false" {{'' if config.marker.z_display_from_stage else 'selected'}}>Show Z relative to the Reference Point</option>
+                    <option value="true" {{'selected' if config.marker.z_display_from_stage else ''}}>Show Z relative to the grid</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <div class="actions">
+        <button type="submit" class="save-btn">Save</button>
+    </div>
+</form>
+
+<script>
+// Catalog rendering – runs once per page lifetime. The marker partial
+// can be re-swapped via the form's hx-post response; we install the
+// htmx:afterRequest listener on ``document.body`` ONCE (guarded by
+// ``window.__markerCatalogInit``) so each form re-render doesn't add
+// a duplicate listener that would double-render the catalog every
+// 1.5 s. The listener re-resolves ``#marker-catalog-root`` dynamically
+// on each fire so a fresh root from the latest swap still receives
+// updates.
+//
+// Rendering is diff-based. Skeleton (group wrappers, headers, add-row,
+// selection-flash) built ONCE via ensureSkeleton; subsequent polls walk
+// entries by id and create/update/remove only changed rows. Per-row
+// event listeners attached at row-creation, outlive next 1.5s tick.
+// Delete / selection checkboxes no longer churn 40× per minute.
+// The earlier ``isEditingTextInput`` blanket guard is replaced by a
+// per-cell focus check inside ``setIfChanged`` so a peer's rename
+// can land on row N while the operator is typing in row M.
+(function() {
+    if (window.__markerCatalogInit) return;
+    window.__markerCatalogInit = true;
+
+    // Default-pick for the add-row colour: walk the canonical palette
+    // (window.OPENFOLLOW_PALETTE.auto_pick_order, seeded by base.tpl
+    // from openfollow.palette) and return first unused hex. Shared
+    // constant (was duplicated ``MARKER_COLOR_PALETTE``) with Python
+    // seeders and zone editor via ``window.OpenFollow.nextUnusedColor``.
+    function pickMarkerColor(entries) {
+        return window.OpenFollow.nextUnusedColor(
+            entries.map(function(e) { return e.color; })
+        );
+    }
+
+    // ---- Colour swatch helper
+    // Swatch trigger is <button> (not <input>) with value in dataset.value
+    // and colour in style.background. Skip refresh when picker is open or
+    // trigger is focused. Compare case-insensitively (palette uppercase vs
+    // catalog lowercase).
+    function setSwatchIfChanged(el, value) {
+        if (!el) return;
+        if (document.activeElement === el) return;
+        if (document.querySelector('.color-picker-popover')) return;
+        const v = value || '#000000';
+        if ((el.dataset.value || '').toLowerCase() === v.toLowerCase()) return;
+        el.dataset.value = v;
+        el.style.background = v;
+    }
+
+    function escapeHTML(s) {
+        return String(s).replace(/[&<>"']/g, function(c) {
+            return ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[c];
+        });
+    }
+
+    function controlledByLabel(entry, thisStation, peers) {
+        const owners = [];
+        if (thisStation.controlled_ids.indexOf(entry.id) !== -1) {
+            owners.push({name: 'this station (' + escapeHTML(thisStation.station_name) + ')', self: true});
+        }
+        for (const p of peers) {
+            if (p.controlled_ids.indexOf(entry.id) !== -1) {
+                owners.push({name: escapeHTML(p.station_name || p.station_id), self: false});
+            }
+        }
+        if (owners.length === 0) return '<span class="stat-chip warn not-controlled">Not controlled</span>';
+        return owners.map(o => o.self ? '<strong>' + o.name + '</strong>' : o.name).join('<br>+ ');
+    }
+
+    function controlConflict(entry, thisStation, peers) {
+        let count = thisStation.controlled_ids.indexOf(entry.id) !== -1 ? 1 : 0;
+        for (const p of peers) {
+            if (p.controlled_ids.indexOf(entry.id) !== -1) count++;
+        }
+        return count > 1;
+    }
+
+    // ---- DOM helpers: write only when value differs AND not focused.
+    // Skipping the write when ``document.activeElement === el`` keeps
+    // mid-edit text inputs from being clobbered by the poll; the
+    // operator's typing wins until they blur. (Colour fields are no
+    // longer native inputs – see ``setSwatchIfChanged`` below.)
+    function setInputIfChanged(el, value) {
+        if (document.activeElement === el) return;
+        if (el.value !== value) el.value = value;
+    }
+
+    function setTextIfChanged(el, text) {
+        if (el.textContent !== text) el.textContent = text;
+    }
+
+    // Cache the last-set HTML string on the element so we don't pay
+    // the cost of reading ``el.innerHTML`` (which the browser
+    // re-serializes and may renormalize attribute quoting / ordering /
+    // entity encoding, producing a string that's semantically equal
+    // but byte-different from what we set). A mismatched compare here
+    // would rewrite every poll, destroying the cell's child nodes
+    // (visible as flicker on adjacent inputs).
+    function setHTMLIfChanged(el, html) {
+        if (el._lastHTML === html) return;
+        el.innerHTML = html;
+        el._lastHTML = html;
+    }
+
+    function setCheckedIfChanged(el, checked) {
+        if (document.activeElement === el) return;
+        if (el.checked !== checked) el.checked = checked;
+    }
+
+    // A catalog or selection write that failed: its red line goes under the
+    // table it was made in.
+    function writeFailed(el, info) {
+        const saveError = window.OpenFollow.saveError;
+        saveError.show(saveError.boxFor(el), info, 'Not saved.', el.closest('table'));
+    }
+
+    function writeResult(el) {
+        return async function(resp) {
+            const saveError = window.OpenFollow.saveError;
+            if (resp.ok) {
+                saveError.clear(saveError.boxFor(el));
+                return true;
+            }
+            writeFailed(el, await saveError.fromResponse(resp));
+            return false;
+        };
+    }
+
+    function writeUnreachable(el) {
+        return function() { writeFailed(el, window.OpenFollow.saveError.UNREACHABLE); };
+    }
+
+    // ---- This Station: whether this station views a marker, and whether it
+    // controls it too (a controlled marker is always viewed).
+    const THIS_STATION_STATES = [['control', 'View &amp; Control'], ['view', 'View'], ['hide', 'Hide']];
+    // Saves queued or in flight, and until when a poll may still carry the state from before the last one.
+    let selectionPending = 0;
+    let selectionSettleUntil = 0;
+    // Saves run one at a time: each posts the whole selection, and two in flight
+    // could commit out of order and put back the older one.
+    let selectionQueue = Promise.resolve();
+
+    function thisStationToggle(name, markerId) {
+        return '<div class="seg-toggle seg-toggle--3 seg-toggle--compact" role="radiogroup" aria-label="This station">' +
+            THIS_STATION_STATES.map(function(state) {
+                return '<label class="seg-option"><input type="radio" name="' + name + '" value="' + state[0] + '"' +
+                    (markerId === null ? '' : ' data-marker-id="' + markerId + '"') + ' data-this-station' +
+                    (state[0] === 'hide' ? ' checked' : '') + '><span>' + state[1] + '</span></label>';
+            }).join('') +
+            '</div>';
+    }
+
+    function thisStationState(id, thisStation) {
+        if (thisStation.controlled_ids.indexOf(id) !== -1) return 'control';
+        return thisStation.viewer_ids.indexOf(id) !== -1 ? 'view' : 'hide';
+    }
+
+    // A save's outcome on its row: the background flashes green or red.
+    function flashRow(tr, ok) {
+        if (!tr) return;
+        tr.classList.remove('row-saved', 'row-failed');
+        void tr.offsetWidth;
+        tr.classList.add(ok ? 'row-saved' : 'row-failed');
+        setTimeout(function() { tr.classList.remove('row-saved', 'row-failed'); }, 850);
+    }
+
+    // ---- Selection POST (out-of-band write, same wire as before). ``extra``
+    // adds a marker that has no catalog row yet: the add-row's choice.
+    function postSelection(root, row, extra) {
+        selectionPending++;
+        selectionQueue = selectionQueue
+            .then(function() { return saveSelection(root, row, extra); })
+            .catch(function() {})
+            .then(function() {
+                selectionPending--;
+                selectionSettleUntil = Date.now() + 1600;
+            });
+    }
+
+    // Reads the toggles when it is sent, so a queued save carries the latest selection.
+    function saveSelection(root, row, extra) {
+        const controlled = [];
+        const viewer = [];
+        function add(id, state) {
+            if (state === 'control') controlled.push(id);
+            if (state !== 'hide') viewer.push(id);
+        }
+        root.querySelectorAll('tr[data-marker-id] input[data-this-station]:checked').forEach(function(radio) {
+            add(parseInt(radio.getAttribute('data-marker-id'), 10), radio.value);
+        });
+        if (extra) add(extra.id, extra.state);
+        const table = root.querySelector('.marker-catalog-table');
+        return fetch('/api/markers/selection', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({controlled_ids: controlled, viewer_ids: viewer})
+        }).then(writeResult(table)).then(function(ok) {
+            flashRow(row, ok);
+            const flash = root.querySelector('#selection-saved-flash');
+            if (!ok || !flash) return;
+            flash.textContent = 'Saved';
+            flash.classList.add('show');
+            setTimeout(function() { flash.classList.remove('show'); }, 1200);
+        }).catch(function() {
+            flashRow(row, false);
+            writeUnreachable(table)();
+        });
+    }
+
+    // ---- Row factories: build the row once, attach listeners once.
+    function createCatalogRow(id, root) {
+        const tr = document.createElement('tr');
+        tr.setAttribute('data-marker-id', String(id));
+        // Colour cell is swatch <button>, not native picker. Save handler
+        // reads dataset.value; picker wired once here (persists across
+        // polls as diff renderer reuses row node).
+        tr.innerHTML =
+            '<td data-cell="id"></td>' +
+            '<td><input type="text" data-field="name" maxlength="64"></td>' +
+            '<td><button type="button" class="color-swatch-trigger" data-field="color" ' +
+                'data-color-picker="full" aria-label="Marker colour"></button></td>' +
+            '<td class="cell-soft" data-cell="controlled-by"></td>' +
+            '<td data-cell="this-station">' + thisStationToggle('this-station-' + id, id) + '</td>' +
+            '<td class="row-actions">' +
+                '<button type="button" class="save-btn small" data-action="save">Save</button>' +
+                '<button type="button" class="danger small" data-action="delete">Delete</button>' +
+            '</td>';
+        window.OpenFollow.attachColorPicker(tr.querySelector('[data-field="color"]'), {
+            mode: 'full',
+        });
+        tr.querySelectorAll('input[data-this-station]').forEach(function(radio) {
+            radio.addEventListener('change', function() { postSelection(root, tr); });
+        });
+        tr.querySelector('[data-action="save"]').addEventListener('click', function() {
+            const name = tr.querySelector('[data-field="name"]').value;
+            const color = tr.querySelector('[data-field="color"]').dataset.value;
+            fetch('/api/markers/catalog/' + id, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name: name, color: color})
+            }).then(writeResult(tr)).catch(writeUnreachable(tr));
+        });
+        tr.querySelector('[data-action="delete"]').addEventListener('click', async function() {
+            const ok = await modalConfirm({
+                title: 'Delete marker?',
+                message: 'Delete marker ' + id + '?',
+                confirmLabel: 'Delete',
+                danger: true,
+            });
+            if (!ok) return;
+            fetch('/api/markers/catalog/' + id, {method: 'DELETE'})
+                .then(writeResult(tr)).catch(writeUnreachable(tr));
+        });
+        return tr;
+    }
+
+    function updateCatalogRow(tr, entry, thisStation, peers) {
+        const conflict = controlConflict(entry, thisStation, peers);
+        tr.classList.toggle('conflict', conflict);
+        setTextIfChanged(tr.querySelector('[data-cell="id"]'), String(entry.id));
+        setInputIfChanged(tr.querySelector('[data-field="name"]'), entry.name || '');
+        setSwatchIfChanged(tr.querySelector('[data-field="color"]'), entry.color || '');
+        const ctrlHTML = controlledByLabel(entry, thisStation, peers) +
+            (conflict ? ' <span class="stat-chip off conflict-flag">Conflict</span>' : '');
+        setHTMLIfChanged(tr.querySelector('[data-cell="controlled-by"]'), ctrlHTML);
+        // The poll never moves a toggle the operator is on, nor one a save hasn't settled; a new row syncs at once.
+        const toggle = tr.querySelector('[data-cell="this-station"] .seg-toggle');
+        const settled = selectionPending === 0 && Date.now() >= selectionSettleUntil;
+        if (!tr.dataset.synced || (settled && !toggle.contains(document.activeElement))) {
+            const state = thisStationState(entry.id, thisStation);
+            toggle.querySelectorAll('input[data-this-station]').forEach(function(radio) {
+                if (radio.checked !== (radio.value === state)) radio.checked = radio.value === state;
+            });
+            tr.dataset.synced = 'true';
+        }
+        const label = 'This station: ' + (entry.name || ('Marker ' + entry.id));
+        if (toggle.getAttribute('aria-label') !== label) toggle.setAttribute('aria-label', label);
+    }
+
+    function createAddRow() {
+        const tr = document.createElement('tr');
+        tr.className = 'add-row';
+        // Colour cell is swatch <button>. Add handler reads
+        // dataset.value; picker wired once here.
+        // Add-row status span reports duplicate / success / error.
+        tr.innerHTML =
+            '<td><input type="number" min="1" id="new-marker-id" style="width: 4rem;"></td>' +
+            '<td><input type="text" id="new-marker-name" maxlength="64"></td>' +
+            '<td><button type="button" class="color-swatch-trigger" id="new-marker-color" ' +
+                'data-color-picker="full" aria-label="New marker colour"></button></td>' +
+            '<td><span id="add-marker-feedback" class="add-feedback" aria-live="polite"></span></td>' +
+            '<td data-cell="this-station">' + thisStationToggle('this-station-new', null) + '</td>' +
+            '<td class="row-actions"><button type="button" class="save-btn small" id="add-marker-btn">Add</button></td>';
+        const idIn = tr.querySelector('#new-marker-id');
+        const nameIn = tr.querySelector('#new-marker-name');
+        const colorTrigger = tr.querySelector('#new-marker-color');
+        const feedback = tr.querySelector('#add-marker-feedback');
+        window.OpenFollow.attachColorPicker(colorTrigger, { mode: 'full' });
+
+        // state: 'ok' | 'error' | null
+        function flash(msg, state) {
+            feedback.textContent = msg;
+            feedback.classList.toggle('ok', state === 'ok');
+            feedback.classList.toggle('error', state === 'error');
+        }
+
+        function submit() {
+            const id = parseInt(idIn.value, 10);
+            if (!id || id < 1) {
+                flash('Enter an id ≥ 1', 'error');
+                idIn.focus();
+                return;
+            }
+            // A live id has a catalog row -> block as duplicate. A tombstoned
+            // id has no row -> falls through to the PUT, which upsert resurrects.
+            const dup = tr.parentNode &&
+                tr.parentNode.querySelector('[data-marker-id="' + id + '"]');
+            if (dup) {
+                flash('Marker ' + id + ' already exists – edit it above', 'error');
+                return;
+            }
+            const name = nameIn.value || ('Marker ' + id);
+            const color = colorTrigger.dataset.value;
+            flash('Adding…', null);
+            fetch('/api/markers/catalog/' + id, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name: name, color: color})
+            }).then(writeResult(tr)).then(function(ok) {
+                if (!ok) {
+                    flash('', null);
+                    return;
+                }
+                flash('Added marker ' + id, 'ok');
+                // Clear name and id so updateAddRow re-suggests the next-free id.
+                nameIn.value = '';
+                idIn.value = '';
+                const root = document.getElementById('marker-catalog-root');
+                const chosen = tr.querySelector('input[data-this-station]:checked');
+                // Hide is saved too: a re-added id may still be selected from before its delete.
+                if (root && chosen) postSelection(root, null, {id: id, state: chosen.value});
+                tr.querySelector('input[data-this-station][value="hide"]').checked = true;
+                if (root) {
+                    fetch('/api/markers/catalog')
+                        .then(function(r) { return r.json(); })
+                        .then(function(d) { applyData(root, d); })
+                        .catch(function() {});
+                }
+            }).catch(function() {
+                flash('', null);
+                writeFailed(tr, window.OpenFollow.saveError.UNREACHABLE);
+            });
+        }
+
+        tr.querySelector('#add-marker-btn').addEventListener('click', submit);
+        // Enter in either text field submits.
+        [idIn, nameIn].forEach(function(el) {
+            el.addEventListener('keydown', function(evt) {
+                if (evt.key === 'Enter') { evt.preventDefault(); submit(); }
+            });
+        });
+        // Editing either field clears a stale status message.
+        [idIn, nameIn].forEach(function(el) {
+            el.addEventListener('input', function() { flash('', null); });
+        });
+        return tr;
+    }
+
+    function updateAddRow(addRow, entries, nextFreeId) {
+        const computedNextId = nextFreeId ||
+            (entries.length ? entries[entries.length - 1].id + 1 : 1);
+        const idIn = addRow.querySelector('#new-marker-id');
+        const nameIn = addRow.querySelector('#new-marker-name');
+        const colorTrigger = addRow.querySelector('#new-marker-color');
+        // Seed the id field with next_free_id only while blank and unfocused,
+        // so a typed value is not overwritten by the poll.
+        if (document.activeElement !== idIn && idIn.value.trim() === '') {
+            idIn.value = String(computedNextId);
+        }
+        if (document.activeElement !== nameIn) {
+            // Name placeholder follows the typed id, else next_free_id.
+            const typedId = parseInt(idIn.value, 10);
+            const placeholder = 'Marker ' + (typedId >= 1 ? typedId : computedNextId);
+            if (nameIn.placeholder !== placeholder) nameIn.placeholder = placeholder;
+        }
+        setSwatchIfChanged(colorTrigger, pickMarkerColor(entries));
+    }
+
+    // ---- Skeleton: built once per root. The wrapping group divs,
+    // table headers, the save-flash span and the
+    // sticky add-row at the bottom of the catalog body never change
+    // shape – only their inner data does, which is handled below.
+    function ensureSkeleton(root) {
+        if (root.dataset.skeletonReady === 'true') return;
+        root.innerHTML =
+            '<div class="group">' +
+                '<h3 class="group-title">Shared catalog</h3>' +
+                '<p class="cell-soft">Synced across all stations on the LAN.</p>' +
+                '<table class="marker-catalog-table data-table">' +
+                    '<thead><tr>' +
+                        '<th>ID</th><th>Name</th><th>Color</th>' +
+                        '<th>Controlled by</th>' +
+                        '<th>This Station <span id="selection-saved-flash" class="saved-flash" aria-live="polite"></span></th>' +
+                        '<th></th>' +
+                    '</tr></thead>' +
+                    '<tbody data-role="catalog-body"></tbody>' +
+                '</table>' +
+            '</div>';
+        const catalogBody = root.querySelector('[data-role="catalog-body"]');
+        catalogBody.appendChild(createAddRow());
+        root.dataset.skeletonReady = 'true';
+    }
+
+    // ---- Keyed list reconciliation. Walks ``entries`` in order,
+    // reuses existing rows (so handlers + focused inputs survive),
+    // creates rows for new ids, and removes rows for tombstoned ids.
+    // ``terminalRow`` (the add-row) stays anchored at the end.
+    function reconcileBody(tbody, entries, makeRow, updateRow, terminalRow) {
+        const existing = new Map();
+        for (const tr of Array.from(tbody.children)) {
+            if (tr === terminalRow) continue;
+            const id = tr.getAttribute('data-marker-id');
+            if (id !== null) existing.set(id, tr);
+        }
+        let cursor = tbody.firstChild;
+        for (const e of entries) {
+            const key = String(e.id);
+            let row = existing.get(key);
+            if (row) {
+                existing.delete(key);
+            } else {
+                row = makeRow(e.id);
+            }
+            updateRow(row, e);
+            if (cursor !== row) tbody.insertBefore(row, cursor);
+            cursor = row.nextSibling;
+        }
+        for (const stale of existing.values()) stale.remove();
+        if (terminalRow && tbody.lastChild !== terminalRow) {
+            tbody.appendChild(terminalRow);
+        }
+    }
+
+    function applyData(root, data) {
+        ensureSkeleton(root);
+        const entries = data.entries || [];
+        const thisStation = data.this_station ||
+            {station_name: '', controlled_ids: [], viewer_ids: []};
+        const peers = data.peer_selections || [];
+
+        const catalogBody = root.querySelector('[data-role="catalog-body"]');
+        const addRow = catalogBody.querySelector('.add-row');
+        reconcileBody(
+            catalogBody, entries,
+            function(id) { return createCatalogRow(id, root); },
+            function(tr, e) { updateCatalogRow(tr, e, thisStation, peers); },
+            addRow,
+        );
+        updateAddRow(addRow, entries, data.next_free_id);
+    }
+
+    document.body.addEventListener('htmx:afterRequest', function(evt) {
+        // Re-resolve root each fire – after a marker form save htmx
+        // swaps the outer form's outerHTML, replacing the catalog root
+        // with a fresh element that the original IIFE never saw. The
+        // ``data-skeleton-ready`` flag travels with the element, so a
+        // fresh root (without the flag) re-builds the skeleton on its
+        // first poll.
+        const root = document.getElementById('marker-catalog-root');
+        if (!root || evt.detail.elt !== root) return;
+        try {
+            const data = JSON.parse(evt.detail.xhr.responseText);
+            applyData(root, data);
+        } catch (e) { /* ignore */ }
+    });
+})();
+</script>
+
+<style>
+.marker-catalog-table { margin-top: 0.5rem; }
+.marker-catalog-table td[data-cell="this-station"] { white-space: nowrap; }
+/* A This Station save flashes its row's background, green or red, fading back to the row's own. */
+.marker-catalog-table tr.row-saved { animation: row-flash-green 0.8s ease-out; }
+.marker-catalog-table tr.row-failed { animation: row-flash-red 0.8s ease-out; }
+@keyframes row-flash-green { from { background-color: var(--success-chip); } }
+@keyframes row-flash-red { from { background-color: var(--error-chip); } }
+/* Two stations control one marker: the fault-row tint. The control state is a status chip, placed here. */
+.marker-catalog-table tr.conflict { background: var(--error-row); }
+.marker-catalog-table tr.conflict td[data-cell="controlled-by"] { white-space: nowrap; }
+.marker-catalog-table .conflict-flag { margin-left: 0.3rem; }
+.marker-catalog-table .conflict-flag, .marker-catalog-table .not-controlled { vertical-align: 1px; }
+.marker-catalog-table .cell-soft, .saved-flash {
+    color: rgba(255,255,255,0.75);
+}
+/* Add-row status line: neutral, green ok, red error. */
+.marker-catalog-table .add-feedback {
+    color: rgba(255,255,255,0.75);
+}
+.marker-catalog-table .add-feedback.ok { color: var(--success-text); font-weight: bold; }
+.marker-catalog-table .add-feedback.error { color: var(--error-text); font-weight: 600; }
+/* A confirmation leads with the green check sign. */
+.marker-catalog-table .add-feedback.ok::before, .saved-flash::before {
+    content: ""; display: inline-block; width: 1.1em; height: 1.1em; margin-right: 0.35em; vertical-align: -0.2em;
+    background: var(--success-sign-green) no-repeat center / contain;
+}
+.marker-catalog-table input[type="text"] {
+    width: 100%;
+    box-sizing: border-box;
+}
+.saved-flash {
+    color: var(--success-text);
+    font-weight: bold;
+    opacity: 0;
+    transition: opacity 0.25s ease-in;
+    margin-left: 0.5rem;
+}
+.saved-flash.show {
+    opacity: 1;
+    transition: opacity 0.1s ease-in;
+}
+</style>
