@@ -257,7 +257,7 @@ struct MarkersView: View {
         Task {
             defer { saving = false }
             do { try await model.saveSelection(controlled: controlled, viewed: viewed) }
-            catch { error = error.localizedDescription }
+            catch { self.error = error.localizedDescription }
         }
     }
 }

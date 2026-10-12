@@ -12,8 +12,9 @@ iPhone real. Se entrega sin firma: no se instala directamente al tocarlo.
 AltStore Classic y AltServer lo firman con tu cuenta gratuita de Apple.
 
 1. Descarga AltServer para Windows desde el sitio oficial de
-   [AltStore](https://altstore.io/) y sigue sus instrucciones para Windows,
-   incluidas las dependencias de Apple que indique la versión actual.
+   [AltStore](https://altstore.io/) y sigue sus
+   [instrucciones para Windows](https://faq.altstore.io/altstore-classic/how-to-install-altstore-windows).
+   Instala iTunes e iCloud desde Apple, como indica esa guía.
 2. Conecta el iPhone al PC por USB, acepta «Confiar en este ordenador» y usa
    AltServer para instalar AltStore Classic en el iPhone.
 3. Introduce tu cuenta de Apple en AltServer/AltStore cuando lo solicite.

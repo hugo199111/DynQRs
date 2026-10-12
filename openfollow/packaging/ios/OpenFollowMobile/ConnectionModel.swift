@@ -100,6 +100,7 @@ final class ConnectionModel: ObservableObject {
                 preview = frame
                 previewMessage = ""
             } catch ConnectionError.server(let code, _) where code == 503 {
+                guard activeID == connectionID, !Task.isCancelled else { return }
                 preview = nil
                 previewMessage = "OpenFollow todavía no tiene una imagen de vídeo disponible."
             } catch {
@@ -172,6 +173,9 @@ final class ConfigDocument: ObservableObject {
 
     func load(_ section: ConfigSection, model: ConnectionModel) async {
         let activeID = model.connectionID
+        loaded = false
+        saved = false
+        errorMessage = ""
         do {
             let data = try await model.client.json("api/config/" + section.id)
             guard model.connected, model.connectionID == activeID, !Task.isCancelled else { return }
