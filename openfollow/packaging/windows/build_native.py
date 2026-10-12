@@ -16,6 +16,7 @@ def main() -> None:
     if sys.platform != "win32":
         raise SystemExit("This native build requires Windows.")
     from gvsbuild.main import run
+    from gvsbuild.projects.ffmpeg import Ffmpeg, NvCodecHeaders
     from gvsbuild.projects.libvpx import Libvpx
     from gvsbuild.utils.base_builders import CmakeProject
     from gvsbuild.utils.base_expanders import Tarball
@@ -93,6 +94,9 @@ def main() -> None:
             raise RuntimeError(f"MSBuild did not produce the required libvpx library: {library}")
         shutil.copy2(library, Path(self.builder.gtk_dir) / "lib" / "vpx.lib")
 
+    # These projects also launch MSYS2 shell tools from the Visual Studio environment.
+    Ffmpeg.build = msys_tools_first(Ffmpeg.build)
+    NvCodecHeaders.build = msys_tools_first(NvCodecHeaders.build)
     Libvpx.build = build_vpx
     Libvpx.post_install = install_vpx
 
@@ -114,6 +118,7 @@ def main() -> None:
                 self,
                 use_ninja=True,
                 cmake_params=[
+                    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
                     "-DENABLE_APPS=OFF",
                     "-DENABLE_SHARED=ON",
                     "-DENABLE_STATIC=OFF",
