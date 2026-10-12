@@ -1,0 +1,28 @@
+// !$*UTF8*$!
+{ archiveVersion = 1; classes = {}; objectVersion = 56; objects = {
+BF50A18CCCF35069E1BA4D90 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ConnectionModel.swift"; sourceTree = "<group>"; };
+0ACE18B96CDDE85112D12C01 = { isa = PBXBuildFile; fileRef = BF50A18CCCF35069E1BA4D90; };
+7803BB56D29C528A96FA518D = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "JSONValue.swift"; sourceTree = "<group>"; };
+B85E02F30FA624AE565EC41C = { isa = PBXBuildFile; fileRef = 7803BB56D29C528A96FA518D; };
+96F95CFBDE9D86BC4D4BAFB5 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "OpenFollowApp.swift"; sourceTree = "<group>"; };
+0300EA75A3CED724F60EA77F = { isa = PBXBuildFile; fileRef = 96F95CFBDE9D86BC4D4BAFB5; };
+EF440B6E896CB5C127C96081 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "OpenFollowClient.swift"; sourceTree = "<group>"; };
+239B7CD84BDB836DA7491580 = { isa = PBXBuildFile; fileRef = EF440B6E896CB5C127C96081; };
+8BF729FFE074CAEE622C0292 = { isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+5522B3B3B2EACC1C8F9BEAAC = { isa = PBXBuildFile; fileRef = 8BF729FFE074CAEE622C0292; };
+A8792157CB4F27FB949C035F = { isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OpenFollow.app; sourceTree = BUILT_PRODUCTS_DIR; };
+FC233BDA2344D97687F5A251 = { isa = PBXGroup; children = (BF50A18CCCF35069E1BA4D90,7803BB56D29C528A96FA518D,96F95CFBDE9D86BC4D4BAFB5,EF440B6E896CB5C127C96081,8BF729FFE074CAEE622C0292); path = OpenFollowMobile; sourceTree = "<group>"; };
+0A3E27B8CA818264D75C8D81 = { isa = PBXGroup; children = (A8792157CB4F27FB949C035F); name = Products; sourceTree = "<group>"; };
+19F479106CE8C3BA8C106518 = { isa = PBXGroup; children = (FC233BDA2344D97687F5A251,0A3E27B8CA818264D75C8D81); sourceTree = "<group>"; };
+878A52FC5FF6A57D50B7B870 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (0ACE18B96CDDE85112D12C01,B85E02F30FA624AE565EC41C,0300EA75A3CED724F60EA77F,239B7CD84BDB836DA7491580); runOnlyForDeploymentPostprocessing = 0; };
+41D311A605520FC7B8B9A980 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (5522B3B3B2EACC1C8F9BEAAC); runOnlyForDeploymentPostprocessing = 0; };
+E2AA269EB967A8853A258BFA = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+488864B3D19480A82F7F1786 = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 17.0; }; name = Debug; };
+35B1014F135DE9B45529B733 = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 17.0; }; name = Release; };
+B4E10CAA9C5E22150B71559C = { isa = XCConfigurationList; buildConfigurations = (488864B3D19480A82F7F1786,35B1014F135DE9B45529B733); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+952548237D7F645F11D1E7B6 = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = OpenFollowMobile/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = app.openfollow.mobile; PRODUCT_NAME = OpenFollow; SWIFT_VERSION = 5.0; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = "1,2"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; MARKETING_VERSION = 1.0; CURRENT_PROJECT_VERSION = 1; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+E2D3A31BEAA1368FC62DA77A = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = OpenFollowMobile/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = app.openfollow.mobile; PRODUCT_NAME = OpenFollow; SWIFT_VERSION = 5.0; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = "1,2"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; MARKETING_VERSION = 1.0; CURRENT_PROJECT_VERSION = 1; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; SWIFT_OPTIMIZATION_LEVEL = "-O"; }; name = Release; };
+4A807E8A027297B0B93701FB = { isa = XCConfigurationList; buildConfigurations = (952548237D7F645F11D1E7B6,E2D3A31BEAA1368FC62DA77A); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+34A04005BCAF206EEC990BD9 = { isa = PBXNativeTarget; buildConfigurationList = 4A807E8A027297B0B93701FB; buildPhases = (878A52FC5FF6A57D50B7B870,E2AA269EB967A8853A258BFA,41D311A605520FC7B8B9A980); buildRules = (); dependencies = (); name = OpenFollow; productName = OpenFollow; productReference = A8792157CB4F27FB949C035F; productType = "com.apple.product-type.application"; };
+244210E48437B6556980A702 = { isa = PBXProject; attributes = { LastUpgradeCheck = 1600; }; buildConfigurationList = B4E10CAA9C5E22150B71559C; compatibilityVersion = "Xcode 14.0"; developmentRegion = es; hasScannedForEncodings = 0; knownRegions = (es,en,Base); mainGroup = 19F479106CE8C3BA8C106518; productRefGroup = 0A3E27B8CA818264D75C8D81; projectDirPath = ""; projectRoot = ""; targets = (34A04005BCAF206EEC990BD9); };
+}; rootObject = 244210E48437B6556980A702; }

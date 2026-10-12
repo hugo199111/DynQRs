@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+name: Build native iPhone app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [openfollow-windows]
+    paths:
+      - 'openfollow/packaging/ios/**'
+      - '.github/workflows/build-openfollow-ios.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Generate the Xcode project
+        run: python3 openfollow/packaging/ios/generate_project.py
+      - name: Compile the native device application without signing
+        run: |
+          xcodebuild -project openfollow/packaging/ios/OpenFollowMobile.xcodeproj -target OpenFollow -configuration Release -sdk iphoneos ARCHS=arm64 ONLY_ACTIVE_ARCH=NO SYMROOT="$GITHUB_WORKSPACE/build" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Package the IPA for local signing with AltStore
+        run: |
+          mkdir -p dist/Payload
+          cp -R build/Release-iphoneos/OpenFollow.app dist/Payload/OpenFollow.app
+          cp openfollow/packaging/ios/README.md dist/README-iPhone.md
+          cp openfollow/LICENSE dist/LICENSE
+          cd dist
+          zip -r OpenFollow-iPhone.ipa Payload
+          rm -r Payload
+      - name: Upload native iPhone application
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenFollow-iPhone-native
+          path: dist
+          if-no-files-found: error
+      - name: Upload corresponding application source
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenFollow-iPhone-native-source
+          path: |
+            openfollow/packaging/ios
+            openfollow/LICENSE
+          if-no-files-found: error
