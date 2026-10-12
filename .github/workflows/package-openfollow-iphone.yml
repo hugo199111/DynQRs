@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+name: Package Windows for iPhone
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_run_id:
+        description: Successful Build Windows run containing the native executable
+        required: true
+        default: '38312839055'
+  push:
+    branches: [openfollow-windows]
+    paths:
+      - 'openfollow/openfollow/web/static/**'
+      - 'openfollow/openfollow/web/templates/**'
+      - 'openfollow/packaging/iphone/**'
+      - 'openfollow/packaging/windows/README.md'
+      - '.github/workflows/package-openfollow-iphone.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Download the existing native Windows package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WINDOWS_RUN_ID: ${{ inputs.windows_run_id || '38312839055' }}
+        run: |
+          BASE_SHA=$(gh run view "$WINDOWS_RUN_ID" --repo "$GITHUB_REPOSITORY" --json headSha --jq .headSha)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          gh run download "$WINDOWS_RUN_ID" --repo "$GITHUB_REPOSITORY" --name OpenFollow-Windows-x64 --dir base
+      - name: Package the executable with the iPhone web resources
+        run: |
+          python openfollow/packaging/iphone/repack_windows.py base/OpenFollow-Windows-x64.zip dist/OpenFollow-Windows-iPhone.zip --base-commit "$BASE_SHA"
+          cp openfollow/packaging/iphone/README.md dist/README-iPhone.md
+      - name: Upload the Windows and iPhone package
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenFollow-Windows-iPhone
+          path: dist
+          if-no-files-found: error
+      - name: Upload corresponding application source
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenFollow-Windows-iPhone-source
+          path: openfollow
+          if-no-files-found: error

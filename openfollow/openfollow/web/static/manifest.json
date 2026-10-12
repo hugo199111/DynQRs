@@ -1,0 +1,26 @@
+{
+  "id": "/",
+  "name": "OpenFollow",
+  "short_name": "OpenFollow",
+  "description": "View and control OpenFollow running on your PC.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#07130d",
+  "theme_color": "#07130d",
+  "icons": [
+    {
+      "src": "/assets/app-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/app-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

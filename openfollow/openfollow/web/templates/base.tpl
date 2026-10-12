@@ -2,7 +2,11 @@
 <html lang="en">
 <head>
  <meta charset="UTF-8">
- <meta name="viewport" content="width=device-width, initial-scale=1.0">
+ <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+ <meta name="theme-color" content="#07130d">
+ <meta name="apple-mobile-web-app-capable" content="yes">
+ <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+ <meta name="apple-mobile-web-app-title" content="OpenFollow">
  <title>{{config.psn_system_name if defined('config') and config else 'OpenFollow'}} – Configuration</title>
  %# Cache-bust every bundled asset with a content fingerprint of the static
  %# dir so an app update always serves fresh JS/CSS. Without this, a browser
@@ -12,6 +16,8 @@
  % from openfollow.web.routes import asset_version
  % _asset_v = asset_version()
  <link rel="icon" type="image/svg+xml" href="/assets/icon.svg?v={{_asset_v}}">
+ <link rel="manifest" href="/assets/manifest.json?v={{_asset_v}}">
+ <link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png?v={{_asset_v}}">
  <script src="/assets/htmx.min.js?v={{_asset_v}}"></script>
  %# Embed canonical palette inline before any partial scripts to avoid
  %# first-paint flash; enables window.OpenFollow.nextUnusedColor in
@@ -2282,6 +2288,22 @@
  text-box: trim-both cap alphabetic;
  padding-block: calc((1lh - 1cap) / 2 + var(--pill-pad-y));
  }
+ }
+ body {
+ min-height: 100svh;
+ padding-top: calc(20px + env(safe-area-inset-top, 0px));
+ padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+ padding-left: env(safe-area-inset-left, 0px);
+ padding-right: env(safe-area-inset-right, 0px);
+ }
+ @media (max-width: 760px) {
+ body.help-open { padding-right: env(safe-area-inset-right, 0px); }
+ }
+ @media (max-width: 760px), (hover: none) and (pointer: coarse) {
+ input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), select, textarea {
+ font-size: 16px;
+ }
+ button, .btn-link { min-height: 44px; }
  }
  </style>
 </head>

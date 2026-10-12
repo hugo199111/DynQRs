@@ -1,64 +1,70 @@
-> Esta entrega se compila sin pruebas de funcionamiento, por petición del usuario.
-> GitHub Actions usa `-SkipRuntimeChecks`: no ejecuta la app ni genera captura o informe.
-> El paquete resultante queda sin probar.
-
 # OpenFollow para Windows 11 x64
 
-Esta adaptación conserva la ventana GTK, la superposición de vídeo y la interfaz
-web del proyecto original. No se ha compilado ni probado todavía en Windows.
-El entorno adjunto es Linux; los resultados de sus pruebas no verifican un `.exe`.
+El paquete contiene el ejecutable nativo `OpenFollow.exe`, GTK 3, GStreamer
+y las dependencias de la aplicación. Conserva la ventana y la interfaz web
+de OpenFollow. No necesita Python instalado ni WSL.
 
-La ruta más sencilla para obtener el ejecutable es subir este código a un
-repositorio propio y ejecutar **Actions → Build Windows → Run workflow**.
-El flujo usa un equipo Windows de GitHub y entrega el ZIP, una captura de la
-ventana real (`OpenFollow-running.png`) y la comprobación del paquete como
-artefactos. Comprueba la página web y un fotograma JPEG desde el ejecutable
-antes de empaquetar. El flujo está preparado, pero todavía no se ha ejecutado.
+## Abrir el programa
+
+Extrae el ZIP completo y abre `OpenFollow\OpenFollow.exe`. La carpeta
+`_internal` debe permanecer junto al ejecutable.
+
+La configuración se guarda en `%LOCALAPPDATA%\OpenFollow`, sin sobrescribir
+la configuración existente. El primer arranque utiliza el patrón de vídeo
+de prueba. «Open Web UI» abre la interfaz web en el navegador del PC.
+
+## Ver y controlar desde un iPhone
+
+1. Abre OpenFollow en el PC y conecta el iPhone a la misma red. El PC puede
+   usar Ethernet y el iPhone Wi-Fi del mismo router.
+2. En Safari, abre la dirección de red del PC con el puerto de la interfaz
+   web. El puerto inicial es 8080: `http://IP_DEL_PC:8080`. Sustituye
+   `IP_DEL_PC` por la dirección IPv4 del PC y usa el puerto que muestre
+   OpenFollow si es diferente. La dirección local del navegador del PC no
+   sirve en el teléfono.
+3. Pulsa Compartir, «Añadir a pantalla de inicio» y «Añadir». Si aparece
+   «Abrir como app web», actívalo. El nombre del icono es OpenFollow.
+4. Abre ese icono para acceder a la interfaz y los controles del PC.
+
+El PC debe permanecer encendido con OpenFollow abierto. No se necesita
+Internet ni una cuenta de desarrollador de Apple para esta conexión local.
+Si Windows solicita acceso a la red, permite OpenFollow en la red privada
+que uses para conectar ambos dispositivos.
 
 ## Compilar en Windows
 
-Requisitos: Windows 11 x64, Python 3.13 x64 con su lanzador `py`, Git,
-Visual Studio 2022 con «Desarrollo para el escritorio con C++» y Windows SDK,
-y MSYS2 en `C:\msys64`. En su terminal MSYS2 instala `patch` con
-`pacman -S --needed patch`. Se requiere acceso a Internet para descargar
-dependencias y compilar GTK 3 y GStreamer; la primera compilación puede tardar.
+GitHub Actions, en «Build Windows», compila el ejecutable y publica
+`OpenFollow-Windows-x64.zip` junto con el código fuente correspondiente.
+El flujo usa `-SkipRuntimeChecks`, por petición del usuario: no ejecuta
+la aplicación ni genera capturas o informes de funcionamiento.
 
-Desde PowerShell, en la raíz del código:
+Para compilar localmente se necesitan Windows x64, Python 3.13 x64, Git,
+Visual Studio 2022 con desarrollo de escritorio C++ y Windows SDK, y MSYS2
+en `C:\msys64` con el paquete `patch`. Desde la raíz de este código:
 
 ```powershell
-& .\packaging\windows\Build-Windows.ps1
+& .\packaging\windows\Build-Windows.ps1 -SkipRuntimeChecks
 ```
 
-`-NativePrefix C:\ruta\gtk` reutiliza una instalación compilada con GTK 3,
-GStreamer y las ruedas PyGObject/Pycairo para Python 3.13. `-Detection` incluye
-las dependencias opcionales de inferencia; los modelos se añaden por separado.
-El script conserva la comprobación TLS y los hashes de las descargas.
+El resultado se guarda en
+`%LOCALAPPDATA%\OpenFollow-build\dist\OpenFollow-Windows-x64.zip`.
+Las descargas de dependencias conservan la verificación TLS y de hashes.
 
-Si la compilación y la comprobación del paquete pasan, el resultado se escribe
-en `%LOCALAPPDATA%\OpenFollow-build\dist\OpenFollow-Windows-x64.zip`.
-Extrae la carpeta completa y abre `OpenFollow.exe`. Su carpeta `_internal`
-debe permanecer junto al ejecutable. No requiere WSL.
+El flujo «Package Windows for iPhone» reutiliza un ejecutable nativo ya
+compilado y añade las plantillas, los iconos y los recursos web actuales.
+Solo permite reutilizarlo si no han cambiado las fuentes del programa,
+las dependencias ni los scripts de compilación nativa.
 
-La configuración y los archivos de la aplicación se guardan en
-`%LOCALAPPDATA%\OpenFollow`, sin sobrescribir la configuración existente.
-El primer arranque utiliza el patrón de prueba para poder comprobar la imagen.
-«Open Web UI» abre el navegador de Windows; la interfaz web usa el puerto 8080.
+## Alcance de la entrega
 
-## Validación pendiente
+La compilación nativa se completó en Windows de GitHub Actions. No se han
+ejecutado pruebas de funcionamiento en Windows 11 ni en un iPhone, por
+petición del usuario. El vídeo real, los mandos, MIDI y los receptores
+PSN/OTP/OSC/RTTrPM necesitan sus respectivos equipos y configuración.
 
-La comprobación del paquete revisa importaciones, plantillas y plugins básicos.
-En Windows aún deben comprobarse la ventana, el vídeo real, los mandos, MIDI,
-y PSN/OTP/OSC/RTTrPM con sus equipos receptores. La prueba de la aplicación
-debe incluir una respuesta válida de la web y un fotograma JPEG real.
-
-NDI necesita su SDK y un plugin GStreamer NDI compatibles, igual que el original.
-La compilación incluye SRT y una entrada de cámara USB mediante GStreamer;
-ambas están pendientes de validación en Windows. No instala un SDK NDI.
-Las cámaras V4L2 y CSI, los servicios systemd y las actualizaciones `.deb`
-corresponden a Linux. Sus funciones del sistema deben gestionarse desde Windows;
-la equivalencia funcional requiere validar la aplicación con los equipos reales.
+La compilación incluye SRT y entrada de cámara USB mediante GStreamer.
+NDI requiere su SDK y un plugin GStreamer NDI compatibles, por separado.
+V4L2, CSI, systemd y las actualizaciones `.deb` son funciones de Linux.
 
 La licencia AGPL-3.0-or-later y los avisos originales acompañan al paquete.
-Si se distribuye una compilación modificada, debe ofrecerse también su código
-fuente completo correspondiente. Este archivo describe una preparación de
-compilación, no un ejecutable entregado ni una compatibilidad ya certificada.
+La distribución modificada incluye también su código fuente correspondiente.
