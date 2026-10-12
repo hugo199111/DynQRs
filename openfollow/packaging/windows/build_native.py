@@ -30,18 +30,30 @@ def main() -> None:
         debug = self.builder.opts.configuration == "debug"
         configuration = "Debug" if debug else "Release"
         filename = "vpxmdd.lib" if debug else "vpxmd.lib"
-        library = Path(self.build_dir) / architecture / configuration / filename
-        if not library.is_file():
-            msbuild_dir = Path(os.environ["OPENFOLLOW_MSBUILD"]).parent
-            try:
-                self.exec_msbuild(["vpx.vcxproj", "/m"], configuration=configuration, add_path=str(msbuild_dir))
-            except subprocess.CalledProcessError as exc:
-                output = exc.stdout or "MSBuild failed without captured output."
-                errors = [line for line in output.splitlines() if "error" in line.lower()]
-                detail = "\n".join(errors[-12:] or output.splitlines()[-20:])
-                annotation = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-                print(f"::error title=libvpx compiler error::{annotation}", flush=True)
-                raise RuntimeError(f"libvpx compiler failed:\n{detail}") from None
+        working = Path(self._get_working_dir())
+        try:
+            projects = list(working.rglob("vpx.vcxproj"))
+            if not projects:
+                self.exec_vs(
+                    ["make", "target=libs", "NO_LAUNCH_DEVENV=1", "vpx.vcxproj"],
+                    add_path=Project.get_tool_path("msys2"),
+                )
+                projects = list(working.rglob("vpx.vcxproj"))
+            if len(projects) != 1:
+                available = sorted(str(path.relative_to(working)) for path in working.rglob("*.vcxproj"))
+                raise RuntimeError(f"Expected one generated vpx project in {working}, found: {available}")
+            project = projects[0]
+            library = project.parent / architecture / configuration / filename
+            if not library.is_file():
+                msbuild_dir = Path(os.environ["OPENFOLLOW_MSBUILD"]).parent
+                self.exec_msbuild([str(project), "/m"], configuration=configuration, add_path=str(msbuild_dir))
+        except subprocess.CalledProcessError as exc:
+            output = exc.stdout or "libvpx build command failed without captured output."
+            errors = [line for line in output.splitlines() if "error" in line.lower()]
+            detail = "\n".join(errors[-12:] or output.splitlines()[-20:])
+            annotation = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"::error title=libvpx compiler error::{annotation}", flush=True)
+            raise RuntimeError(f"libvpx compiler failed:\n{detail}") from None
         if not library.is_file():
             raise RuntimeError(f"MSBuild did not produce the required libvpx library: {library}")
         shutil.copy2(library, Path(self.builder.gtk_dir) / "lib" / "vpx.lib")
