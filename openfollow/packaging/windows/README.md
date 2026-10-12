@@ -1,3 +1,7 @@
+> Esta entrega se compila sin pruebas de funcionamiento, por petición del usuario.
+> GitHub Actions usa `-SkipRuntimeChecks`: no ejecuta la app ni genera captura o informe.
+> El paquete resultante queda sin probar.
+
 # OpenFollow para Windows 11 x64
 
 Esta adaptación conserva la ventana GTK, la superposición de vídeo y la interfaz

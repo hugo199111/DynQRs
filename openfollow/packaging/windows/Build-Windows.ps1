@@ -6,7 +6,8 @@ param(
     [string]$NativePrefix = "",
     [string]$MsysRoot = "C:\msys64",
     [string]$PythonExecutable = "",
-    [switch]$Detection
+    [switch]$Detection,
+    [switch]$SkipRuntimeChecks
 )
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -54,7 +55,7 @@ try {
         $NativeRoot = Join-Path $BuildRoot "native-build"
         Write-Host "::notice title=OpenFollow build progress::Compiling native GTK and GStreamer libraries"
         Invoke-Checked $Python @(
-            "$PSScriptRoot\build_native.py", "build", "--capture-out", "--platform", "x64", "--configuration", "release",
+            "$PSScriptRoot\build_native.py", "build", "--capture-out", "--print-out", "--platform", "x64", "--configuration", "release",
             "--build-dir", $NativeRoot, "--msys-dir", $MsysRoot, "--enable-gi", "--py-wheel",
             "--extra-opts", "gst-plugins-good:-Dgtk3=enabled;-Djpeg=enabled;-Dpng=enabled",
             "--extra-opts", "gst-plugins-bad:-Dsrt=enabled",
@@ -88,25 +89,29 @@ try {
     Invoke-Checked $Python @("-m", "pip", "install", "--require-hashes", "-r", $Requirements)
     Invoke-Checked $Python @("-m", "pip", "install", "--no-deps", "-r", $Vcs)
     Invoke-Checked $Python @("-m", "pip", "install", "--no-deps", $Repo)
-    Invoke-Checked $Python @("-m", "pip", "check")
+    if (-not $SkipRuntimeChecks) { Invoke-Checked $Python @("-m", "pip", "check") }
     $Output = Join-Path $BuildRoot "dist"
     Write-Host "::notice title=OpenFollow build progress::Creating the Windows executable"
     Invoke-Checked $Python @("-m", "PyInstaller", "--noconfirm", "--distpath", $Output,
         "--workpath", (Join-Path $BuildRoot "freeze"), "$PSScriptRoot\openfollow.spec")
     $Executable = Join-Path $Output "OpenFollow\OpenFollow.exe"
-    $Report = Join-Path $BuildRoot "self-check.json"
-    if (Test-Path $Report) { Remove-Item $Report }
-    Write-Host "::notice title=OpenFollow build progress::Checking the bundled executable"
-    $Process = Start-Process -FilePath $Executable -ArgumentList @("--self-check", ('"' + $Report + '"')) -PassThru
-    if (-not $Process.WaitForExit(90000)) {
-        $Process.Kill()
-        throw "The bundled self-check did not finish within 90 seconds."
+    if (-not $SkipRuntimeChecks) {
+        $Report = Join-Path $BuildRoot "self-check.json"
+        if (Test-Path $Report) { Remove-Item $Report }
+        Write-Host "::notice title=OpenFollow build progress::Checking the bundled executable"
+        $Process = Start-Process -FilePath $Executable -ArgumentList @("--self-check", ('"' + $Report + '"')) -PassThru
+        if (-not $Process.WaitForExit(90000)) {
+            $Process.Kill()
+            throw "The bundled self-check did not finish within 90 seconds."
+        }
+        if (-not (Test-Path $Report)) { throw "The executable did not produce a self-check report (exit $($Process.ExitCode))." }
+        $ReportText = Get-Content -Raw $Report
+        if ($Process.ExitCode -ne 0 -or -not ($ReportText | ConvertFrom-Json).ok) { throw "Bundled self-check failed: $ReportText" }
+        Write-Host "::notice title=OpenFollow build progress::Opening the application and capturing its window"
+        Invoke-Checked $Python @("$PSScriptRoot\smoke_gui.py", $Executable, (Join-Path $Output "OpenFollow-running.png"))
+    } else {
+        Write-Host "Runtime checks skipped as requested; this package has not been tested."
     }
-    if (-not (Test-Path $Report)) { throw "The executable did not produce a self-check report (exit $($Process.ExitCode))." }
-    $ReportText = Get-Content -Raw $Report
-    if ($Process.ExitCode -ne 0 -or -not ($ReportText | ConvertFrom-Json).ok) { throw "Bundled self-check failed: $ReportText" }
-    Write-Host "::notice title=OpenFollow build progress::Opening the application and capturing its window"
-    Invoke-Checked $Python @("$PSScriptRoot\smoke_gui.py", $Executable, (Join-Path $Output "OpenFollow-running.png"))
     foreach ($Notice in @("LICENSE", "THIRD_PARTY_NOTICES.md", "WRITTEN_OFFER.md")) {
         Copy-Item (Join-Path $Repo $Notice) (Join-Path $Output "OpenFollow\$Notice")
     }

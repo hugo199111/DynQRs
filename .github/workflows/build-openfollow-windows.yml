@@ -41,7 +41,7 @@ jobs:
             $MsysStatus = $LASTEXITCODE
             $MsysOutput | Write-Output
             if ($MsysStatus -ne 0) { throw "MSYS2 dependency installation failed: $($MsysOutput | Out-String)" }
-            & .\openfollow\packaging\windows\Build-Windows.ps1 -BuildRoot C:\of-build -PythonExecutable (Get-Command python).Source
+            & .\openfollow\packaging\windows\Build-Windows.ps1 -BuildRoot C:\of-build -PythonExecutable (Get-Command python).Source -SkipRuntimeChecks
           } catch {
             $Summary = ($_ | Out-String).Trim()
             if ($Summary.Length -gt 10000) { $Summary = $Summary.Substring($Summary.Length - 10000) }
@@ -49,20 +49,28 @@ jobs:
             Write-Host "::error title=Windows compilation error::$Annotation"
             throw
           }
+      - name: Upload native compiler diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenFollow-native-diagnostics
+          path: |
+            C:\of-build\native-build\build\x64\release\libvpx\config.mk
+            C:\of-build\native-build\build\x64\release\libvpx\config.log
+            C:\of-build\native-build\build\x64\release\libvpx\libs-*.mk
+          if-no-files-found: warn
       - name: Retain native dependencies after build attempts
         if: ${{ always() && (steps.native_build.outcome == 'success' || steps.native_build.outcome == 'failure') }}
         uses: actions/cache/save@v6
         with:
           path: C:\of-build\native-build
           key: windows-2022-py313-gvs2026.8-${{ hashFiles('openfollow/packaging/windows/build_native.py', 'openfollow/packaging/windows/Build-Windows.ps1') }}-${{ github.run_id }}
-      - name: Upload build and verification results
+      - name: Upload Windows package
         uses: actions/upload-artifact@v7
         with:
           name: OpenFollow-Windows-x64
           path: |
             C:\of-build\dist\OpenFollow-Windows-x64.zip
-            C:\of-build\dist\OpenFollow-running.png
-            C:\of-build\self-check.json
           if-no-files-found: error
       - name: Upload corresponding application source
         uses: actions/upload-artifact@v7
