@@ -22,6 +22,29 @@ def main() -> None:
     from gvsbuild.utils.base_project import Project, project_add
     from gvsbuild.utils.builder import Builder
 
+    def msys_tools_first(method):
+        def wrapped(self):
+            # Git's bundled MSYS utilities can precede MSYS2 in the VS PATH.
+            # Mixing their runtimes corrupts heredoc append redirections in
+            # configure (the banner/TOOLCHAIN gets overwritten by later cat).
+            # Keep bash, cat, make and sed on the same MSYS2 runtime.
+            previous = self.builder.vs_env["PATH"]
+            msys = Project.get_tool_path("msys2")
+            self.builder.vs_env["PATH"] = str(msys) + ";" + previous
+            try:
+                return method(self)
+            finally:
+                self.builder.vs_env["PATH"] = previous
+
+        return wrapped
+
+    original_vpx_build = Libvpx.build
+
+    @msys_tools_first
+    def build_vpx(self):
+        original_vpx_build(self)
+
+    @msys_tools_first
     def install_vpx(self):
         # libvpx's generated Makefile silently skips MSBuild when `which`
         # cannot find it. Compile the generated project explicitly instead
@@ -58,6 +81,7 @@ def main() -> None:
             raise RuntimeError(f"MSBuild did not produce the required libvpx library: {library}")
         shutil.copy2(library, Path(self.builder.gtk_dir) / "lib" / "vpx.lib")
 
+    Libvpx.build = build_vpx
     Libvpx.post_install = install_vpx
 
     @project_add
