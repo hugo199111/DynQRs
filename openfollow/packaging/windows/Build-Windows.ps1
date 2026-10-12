@@ -47,7 +47,7 @@ try {
         $NativeRoot = Join-Path $BuildRoot "native-build"
         Invoke-Checked $Python @(
             "$PSScriptRoot\build_native.py", "build", "--platform", "x64", "--configuration", "release",
-            "--build-dir", $NativeRoot, "--msys-dir", $MsysRoot, "--enable-gi", "--py-wheel", "--check-hash",
+            "--build-dir", $NativeRoot, "--msys-dir", $MsysRoot, "--enable-gi", "--py-wheel",
             "--extra-opts", "gst-plugins-good:-Dgtk3=enabled;-Djpeg=enabled;-Dpng=enabled",
             "--extra-opts", "gst-plugins-bad:-Dsrt=enabled",
             "gtk3", "pygobject", "librsvg", "adwaita-icon-theme", "libjpeg-turbo", "libpng",

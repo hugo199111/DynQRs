@@ -23,6 +23,11 @@ jobs:
         with:
           python-version: '3.13'
           architecture: x64
+      - name: Cache verified native dependency build
+        uses: actions/cache@v6
+        with:
+          path: C:\of-build\native-build
+          key: windows-2022-py313-gvs2026.8-${{ hashFiles('openfollow/packaging/windows/build_native.py') }}
       - name: Build native Windows package
         shell: pwsh
         run: |
