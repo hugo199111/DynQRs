@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from openfollow.logging_setup import ThrottledExceptionLogger
@@ -107,7 +108,7 @@ class GtkNativeSinkWindow:
 
         gi.require_version("Gtk", "3.0")
         gi.require_version("Gdk", "3.0")
-        from gi.repository import Gdk, Gtk
+        from gi.repository import Gdk, GLib, Gtk
 
         Gtk.init(None)
 
@@ -116,6 +117,12 @@ class GtkNativeSinkWindow:
 
         self._window = Gtk.Window(title=title)
         self._window.set_default_size(width, height)
+        if sys.platform == "win32":
+            try:
+                icon = Path(__file__).parent / "web" / "static" / "app-icon-192.png"
+                self._window.set_icon_from_file(str(icon))
+            except GLib.Error:
+                logger.warning("Could not load the application window icon")
 
         self._box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self._window.add(self._box)

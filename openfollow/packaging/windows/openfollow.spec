@@ -42,5 +42,6 @@ a = Analysis(
     excludes=[], noarchive=False,
 )
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="OpenFollow", console=False, upx=False)
+exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="OpenFollow", console=False, upx=False,
+    icon=str(packaging / "OpenFollow.ico"))
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="OpenFollow")
