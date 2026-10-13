@@ -108,7 +108,7 @@ class GtkNativeSinkWindow:
 
         gi.require_version("Gtk", "3.0")
         gi.require_version("Gdk", "3.0")
-        from gi.repository import Gdk, GLib, Gtk
+        from gi.repository import Gdk, Gtk
 
         Gtk.init(None)
 
@@ -121,7 +121,7 @@ class GtkNativeSinkWindow:
             try:
                 icon = Path(__file__).parent / "web" / "static" / "app-icon-192.png"
                 self._window.set_icon_from_file(str(icon))
-            except GLib.Error:
+            except Exception:
                 logger.warning("Could not load the application window icon")
 
         self._box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
