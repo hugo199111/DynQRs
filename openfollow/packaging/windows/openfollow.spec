@@ -16,6 +16,7 @@ if not (prefix / "bin").is_dir():
 
 datas = collect_data_files("openfollow") + copy_metadata("openfollow")
 datas.append((str(packaging / "config.seed.toml"), "."))
+datas.append((os.environ["OPENFOLLOW_PIXBUF_CACHE"], "."))
 for directory in ("lib/girepository-1.0", "share", "etc"):
     path = prefix / directory
     if path.is_dir():

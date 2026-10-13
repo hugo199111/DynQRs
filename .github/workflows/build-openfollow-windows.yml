@@ -30,6 +30,7 @@ jobs:
           key: windows-2022-py313-gvs2026.8-${{ hashFiles('openfollow/packaging/windows/build_native.py', 'openfollow/packaging/windows/Build-Windows.ps1') }}-${{ github.run_id }}
           restore-keys: |
             windows-2022-py313-gvs2026.8-${{ hashFiles('openfollow/packaging/windows/build_native.py', 'openfollow/packaging/windows/Build-Windows.ps1') }}-
+            windows-2022-py313-gvs2026.8-2703ce25d4b9a672020397000bb119e5d6598d1c920082fec29b574c48ac40db-
             windows-2022-py313-gvs2026.8-e336bb1f72c610d674226fef6176b53165aba12dd29debc0060b0579ddca8a12-
             windows-2022-py313-gvs2026.8-d9f7e35feb9837bc7575a3eef37d319c19828afc0cedd2918bd0959266c48c6e-
             windows-2022-py313-gvs2026.8-644c488cc23b78119a64e68baf469ebc3a72adcdd81e3c2b05fa8c9508f8e4e7-

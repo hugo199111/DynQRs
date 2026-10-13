@@ -69,6 +69,9 @@ try {
     $env:OPENFOLLOW_NATIVE_PREFIX = $NativePrefix
     $env:PATH = "$NativePrefix\bin;" + $env:PATH
     $env:GI_TYPELIB_PATH = "$NativePrefix\lib\girepository-1.0"
+    $ImageCache = Join-Path $BuildRoot "pixbuf-loaders.json"
+    Invoke-Checked $Python @("$PSScriptRoot\build_image_cache.py", $NativePrefix, $ImageCache)
+    $env:OPENFOLLOW_PIXBUF_CACHE = $ImageCache
     $env:GST_PLUGIN_PATH_1_0 = "$NativePrefix\lib\gstreamer-1.0"
     $env:GST_REGISTRY_FORK = "no"
     $Wheels = @(Get-ChildItem -Path $NativePrefix -Filter "*.whl" -Recurse |
