@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 OpenFollow Project
+name: Upload OpenFollow direct downloads
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [openfollow-windows]
+    paths:
+      - '.github/workflows/publish-openfollow-downloads.yml'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: openfollow-windows-2026-10-13
+      SOURCE_COMMIT: 7e76b9a5e4abeebbeba05b0f4c2159075b11f52e
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Download the compiled applications
+        run: |
+          gh run download 38322572021 --repo "$GITHUB_REPOSITORY" --name OpenFollow-Windows-iPhone --dir windows
+          gh run download 38324186206 --repo "$GITHUB_REPOSITORY" --name OpenFollow-iPhone-native --dir iphone
+      - name: Prepare the Windows ZIP and corresponding source
+        run: |
+          mkdir downloads
+          cp windows/OpenFollow-Windows-iPhone.zip downloads/OpenFollow-Windows-x64.zip
+          cp iphone/OpenFollow-iPhone.ipa downloads/OpenFollow-iPhone.ipa
+          cp iphone/README-iPhone.md downloads/README-iPhone.md
+          git show "$SOURCE_COMMIT:openfollow/packaging/windows/README.md" > downloads/README-Windows.md
+          git archive --format=zip --prefix=OpenFollow-source/ -o downloads/OpenFollow-source.zip "$SOURCE_COMMIT"
+          cd downloads
+          sha256sum OpenFollow-Windows-x64.zip OpenFollow-iPhone.ipa OpenFollow-source.zip > SHA256SUMS.txt
+      - name: Upload files to the prepared release
+        run: |
+          gh release upload "$RELEASE_TAG" downloads/OpenFollow-Windows-x64.zip downloads/OpenFollow-iPhone.ipa downloads/OpenFollow-source.zip downloads/README-Windows.md downloads/README-iPhone.md downloads/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
