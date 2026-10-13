@@ -19,20 +19,20 @@ jobs:
     timeout-minutes: 15
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: openfollow-windows-2026-10-13
-      SOURCE_COMMIT: 7e76b9a5e4abeebbeba05b0f4c2159075b11f52e
+      RELEASE_TAG: openfollow-windows-6f8209e
+      SOURCE_COMMIT: 6f8209ed3e2c63d9e7ff89532f5416a21f0c2cf9
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Download the compiled applications
         run: |
-          gh run download 38322572021 --repo "$GITHUB_REPOSITORY" --name OpenFollow-Windows-iPhone --dir windows
+          gh run download 38422697527 --repo "$GITHUB_REPOSITORY" --name OpenFollow-Windows-x64 --dir windows
           gh run download 38324186206 --repo "$GITHUB_REPOSITORY" --name OpenFollow-iPhone-native --dir iphone
       - name: Prepare the Windows ZIP and corresponding source
         run: |
           mkdir downloads
-          cp windows/OpenFollow-Windows-iPhone.zip downloads/OpenFollow-Windows-x64.zip
+          cp windows/OpenFollow-Windows-x64.zip downloads/OpenFollow-Windows-x64.zip
           cp iphone/OpenFollow-iPhone.ipa downloads/OpenFollow-iPhone.ipa
           cp iphone/README-iPhone.md downloads/README-iPhone.md
           git show "$SOURCE_COMMIT:openfollow/packaging/windows/README.md" > downloads/README-Windows.md
