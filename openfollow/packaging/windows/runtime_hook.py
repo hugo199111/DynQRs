@@ -30,6 +30,8 @@ def configure(root: Path, cache: Path) -> None:
     os.environ["GSETTINGS_SCHEMA_DIR"] = str(native / "share" / "glib-2.0" / "schemas")
     os.environ["XDG_DATA_DIRS"] = str(native / "share")
     os.environ["GTK_EXE_PREFIX"] = str(native)
+    # Native Windows decorations bypass the canvas pointer handlers.
+    os.environ["GTK_CSD"] = "0"
     os.environ["FONTCONFIG_PATH"] = str(native / "etc" / "fonts")
     os.environ["OPENFOLLOW_NETWORK_BACKEND"] = "psutil"
     loader_dirs = list((native / "lib" / "gdk-pixbuf-2.0").glob("*/loaders"))
